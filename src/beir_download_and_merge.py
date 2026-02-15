@@ -7,8 +7,6 @@ from beir import util
 from beir.datasets.data_loader import GenericDataLoader
 
 CONFIG_PATH = "config.yaml"
-DATA_FOLDER = os.path.join("data", "datasets")
-OUTPUT_FOLDER = os.path.join("data", "beir_merged")
 
 def load_config():
     """Load configuration from config.yaml."""
@@ -81,26 +79,24 @@ def append_qrels_to_tsv(qrels_dict, filepath, dataset_prefix):
                 writer.writerow([new_q_id, new_doc_id, int(score)])
 
 def main():
-    # 1. Config & Setup
     config = load_config()
     datasets_to_merge = config.get("datasets", [])
-    
-    if not datasets_to_merge:
-        print("[ERROR] No datasets found in config.yaml")
-    config = load_config()
-    datasets_to_merge = config.get("datasets", [])
+    paths = config['paths']
     
     if not datasets_to_merge:
         print("Error: No datasets found in config.yaml")
         return
 
     print(f"Datasets to merge: {datasets_to_merge}")
-    ensure_dir(DATA_FOLDER)
-    ensure_dir(OUTPUT_FOLDER)
     
-    out_corpus = os.path.join(OUTPUT_FOLDER, "corpus.jsonl")
-    out_queries = os.path.join(OUTPUT_FOLDER, "queries.jsonl")
-    out_qrels = os.path.join(OUTPUT_FOLDER, "qrels", "test.tsv")
+    data_folder = paths['datasets_folder']
+    output_folder = paths['data_folder']
+    ensure_dir(data_folder)
+    ensure_dir(output_folder)
+    
+    out_corpus = paths['corpus']
+    out_queries = paths['queries']
+    out_qrels = paths['qrels']
     
     initialize_output_files(out_corpus, out_queries, out_qrels)
     
@@ -108,13 +104,13 @@ def main():
     
     for dataset_name in datasets_to_merge:
         print(f"\nProcessing: {dataset_name}")
-        dataset_path = os.path.join(DATA_FOLDER, dataset_name)
+        dataset_path = os.path.join(data_folder, dataset_name)
         
         if not os.path.exists(dataset_path):
             print(f"  Downloading {dataset_name}...")
             url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset_name}.zip"
             try:
-                util.download_and_unzip(url, DATA_FOLDER)
+                util.download_and_unzip(url, data_folder)
             except Exception as e:
                 print(f"  Error downloading {dataset_name}: {e}")
                 continue
@@ -152,7 +148,7 @@ def main():
         del qrels
         gc.collect() 
 
-    print(f"\nMerge complete. Output saved to: {OUTPUT_FOLDER}")
+    print(f"\nMerge complete. Output saved to: {output_folder}")
 
 if __name__ == "__main__":
     main()

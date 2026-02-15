@@ -1,8 +1,17 @@
+# Core dependencies
 beir
 pyyaml
+tqdm
 
-sentence-transformers
+# NLP and text processing
+nltk
+PyStemmer
+
+# Information retrieval
 rank_bm25
+
+# Machine learning and embeddings
+sentence-transformers
+torch
 numpy
 scipy
-torch

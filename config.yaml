@@ -1,6 +1,4 @@
-# --- DATASET CONFIGURATION ---
-# The list of BEIR datasets to download and merge.
-# (total ~500k docs).
+# Dataset configuration
 datasets:
   - scifact
   - nfcorpus
@@ -9,3 +7,19 @@ datasets:
   - arguana
   - scidocs
   - webis-touche2020
+
+# Paths
+paths:
+  data_folder: "data/beir_merged"
+  datasets_folder: "data/datasets"
+  indices_folder: "data/indices"
+  tokenized_corpus: "data/beir_merged/tokenized_corpus.jsonl"
+  corpus: "data/beir_merged/corpus.jsonl"
+  queries: "data/beir_merged/queries.jsonl"
+  qrels: "data/beir_merged/qrels/test.tsv"
+  freq_index: "data/indices/freq_index.pkl"
+  bm25_index: "data/indices/bm25_index.pkl"
+
+# Processing configuration
+preprocessing:
+  stemmer_language: "english"
