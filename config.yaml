@@ -19,7 +19,14 @@ paths:
   qrels: "data/beir_merged/qrels/test.tsv"
   freq_index: "data/indices/freq_index.pkl"
   bm25_index: "data/indices/bm25_index.pkl"
+  corpus_embeddings: "data/indices/corpus_embeddings.pt"
+  vector_doc_ids: "data/indices/vector_doc_ids.pkl"
 
 # Processing configuration
 preprocessing:
   stemmer_language: "english"
+
+# Embedding model configuration
+embeddings:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  batch_size: 64
