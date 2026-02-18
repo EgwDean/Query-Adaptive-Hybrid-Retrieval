@@ -1,17 +1,22 @@
-# Core dependencies
-beir
+# Core
 pyyaml
 tqdm
 
-# NLP and text processing
+# Dataset management
+beir
+
+# NLP
 nltk
-PyStemmer
 
 # Information retrieval
 rank_bm25
 
-# Machine learning and embeddings
+# Embeddings
 sentence-transformers
 torch
+
+# Scientific computing
 numpy
 scipy
+scikit-learn
+scikit-learn

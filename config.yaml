@@ -21,6 +21,12 @@ paths:
   bm25_index: "data/indices/bm25_index.pkl"
   corpus_embeddings: "data/indices/corpus_embeddings.pt"
   vector_doc_ids: "data/indices/vector_doc_ids.pkl"
+  tokenized_queries: "data/indices/tokenized_queries.pkl"
+  bm25_results: "data/indices/bm25_results.pkl"
+  dense_query_vectors: "data/indices/dense_query_vectors.pt"
+  dense_query_ids: "data/indices/dense_query_ids.pkl"
+  dense_results: "data/indices/dense_results.pkl"
+  results: "data/results.csv"
 
 # Processing configuration
 preprocessing:
@@ -30,3 +36,20 @@ preprocessing:
 embeddings:
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
   batch_size: 64
+
+# Dense search configuration
+dense_search:
+  query_chunk_size: 100
+  corpus_chunk_size: 50000
+
+# Retrieval configuration
+benchmark:
+  top_k: 100
+  ndcg_k: 10
+
+  rrf:
+    k: 60
+
+  sigmoid:
+    center: 0.15
+    slope: 10
