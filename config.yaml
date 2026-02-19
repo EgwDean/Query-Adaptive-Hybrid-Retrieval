@@ -1,6 +1,6 @@
 # Dataset configuration
 datasets:
-  - scifact
+  - nfcorpus
 
 # Paths
 paths:

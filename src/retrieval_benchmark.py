@@ -60,6 +60,7 @@ def main():
         ("JSD (0-1 Norm)", "jsd_normalized"),
         ("KLD (Sigmoid)", "kld_sigmoid"),
         ("KLD (0-1 Norm)", "kld_normalized"),
+        ("KLD (0-1 + Sigmoid)", "kld_normalized_sigmoid"),
     ]
 
     # Pre-compute divergence statistics for normalized methods
@@ -113,9 +114,15 @@ def main():
                 alpha_values.append(0.5)
 
             else:
-                use_sig = "sigmoid" in mode
-                use_norm = "normalized" in mode
-                metric = "kld" if "kld" in mode else "jsd"
+                # Handle different combinations of normalization and sigmoid
+                if mode == "kld_normalized_sigmoid":
+                    use_sig = True
+                    use_norm = True
+                    metric = "kld"
+                else:
+                    use_sig = "sigmoid" in mode
+                    use_norm = "normalized" in mode
+                    metric = "kld" if "kld" in mode else "jsd"
 
                 alpha = compute_divergence_alpha(
                     tokenized_queries[qid], freq_data, config,
@@ -148,12 +155,13 @@ def main():
 
     results_path = paths['results']
     ensure_dir(os.path.dirname(results_path))
-    file_exists = os.path.isfile(results_path)
+    
+    if os.path.isfile(results_path):
+        os.remove(results_path)
 
-    with open(results_path, 'a', newline='') as f:
+    with open(results_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=["Method", f"NDCG@{ndcg_k}", "Min_Alpha", "Max_Alpha", "Avg_Alpha"])
-        if not file_exists:
-            writer.writeheader()
+        writer.writeheader()
         writer.writerows(final_metrics)
 
     print(f"Results saved to {results_path}")
