@@ -1,10 +1,21 @@
+# ──────────────────────────────────────────────────────
 # Dataset configuration
+# Add / remove dataset names below and re-run the notebook.
+# The pipeline will automatically detect changes and only
+# rebuild the steps that need updating.
+#
+# Available BEIR datasets:
+#   nfcorpus, scifact, trec-covid, arguana,
+#   fiqa, scidocs, webis-touche2020
+# ──────────────────────────────────────────────────────
 datasets:
+  #- arguana
   #- nfcorpus
-  #- scifact
+  - scifact
   #- trec-covid
-  - arguana
-  #- touché-2020
+  #- fiqa
+  #- scidocs
+  #- webis-touche2020
 
 # Paths
 paths:
@@ -25,6 +36,7 @@ paths:
   dense_query_ids: "data/indices/dense_query_ids.pkl"
   dense_results: "data/indices/dense_results.pkl"
   results: "data/results.csv"
+  pipeline_state: "data/indices/pipeline_state.json"
 
 # Processing configuration
 preprocessing:
