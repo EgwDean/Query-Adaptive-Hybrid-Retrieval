@@ -64,6 +64,9 @@ def compute_divergence_alpha(query_tokens, freq_data, config, method="jsd", use_
         div_score = jensenshannon(p_q, p_c, base=2) ** 2
     elif "kld" in method:
         div_score = np.sum(p_q * np.log(p_q / p_c))
+    elif "crossentropy" in method or "ce" in method:
+        # Cross-entropy: H(P, Q) = -∑ P(x) * log(Q(x))
+        div_score = -np.sum(p_q * np.log(p_c))
     else:
         div_score = 0.5
 

@@ -1,6 +1,10 @@
 # Dataset configuration
 datasets:
-  - nfcorpus
+  #- nfcorpus
+  #- scifact
+  #- trec-covid
+  - arguana
+  #- touché-2020
 
 # Paths
 paths:
