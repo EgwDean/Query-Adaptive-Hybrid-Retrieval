@@ -1,51 +1,301 @@
+"""
+utils.py -- Shared utilities for the RAG-LLM hybrid retrieval pipeline.
+
+Contains helpers for:
+  - Configuration loading
+  - File / directory management
+  - Pickle serialization
+  - Data loaders (queries, qrels, corpus batches)
+  - BEIR dataset download and loading
+  - Corpus / query / qrel append routines for the merged mode
+"""
+
 import os
 import csv
 import json
 import pickle
+
 import yaml
 
+
+# ============================================================
+# Path to the project-level configuration file.
+# The pipeline always runs from the project root, so a
+# relative path is fine here.
+# ============================================================
 CONFIG_PATH = "config.yaml"
 
+
+# ============================================================
+# Configuration
+# ============================================================
+
 def load_config():
-    """Load configuration from config.yaml."""
+    """Read and return the YAML configuration dictionary.
+
+    Raises FileNotFoundError if config.yaml is missing.
+    """
     if not os.path.exists(CONFIG_PATH):
-        raise FileNotFoundError(f"Configuration file not found at: {os.path.abspath(CONFIG_PATH)}")
-    with open(CONFIG_PATH, "r") as f:
+        raise FileNotFoundError(
+            f"Configuration file not found at: {os.path.abspath(CONFIG_PATH)}"
+        )
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+
+# ============================================================
+# File / directory helpers
+# ============================================================
+
 def ensure_dir(path):
-    """Create directory if it doesn't exist."""
-    if not os.path.exists(path):
-        os.makedirs(path)
+    """Create *path* and all intermediate directories if they do not exist."""
+    if path:
+        os.makedirs(path, exist_ok=True)
 
-def load_queries(filepath):
-    """Load queries from a JSONL file into a {query_id: text} dictionary."""
-    queries = {}
-    with open(filepath, 'r', encoding='utf-8') as f:
-        for line in f:
-            d = json.loads(line)
-            queries[d['_id']] = d['text']
-    return queries
 
-def load_qrels(filepath):
-    """Load relevance judgments from a TSV file into a nested dictionary."""
-    qrels = {}
-    with open(filepath, 'r') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
-            qid = row['query-id']
-            if qid not in qrels:
-                qrels[qid] = {}
-            qrels[qid][row['corpus-id']] = int(row['score'])
-    return qrels
+def count_lines(filepath):
+    """Return the number of lines in *filepath* (binary mode for speed)."""
+    count = 0
+    with open(filepath, "rb") as f:
+        for _ in f:
+            count += 1
+    return count
+
+
+def file_exists(path):
+    """Return True if *path* points to an existing file."""
+    return os.path.isfile(path)
+
+
+# ============================================================
+# Pickle serialization
+# ============================================================
 
 def save_pickle(data, filepath):
-    """Serialize data to a pickle file, creating parent directories as needed."""
+    """Serialize *data* to *filepath*, creating parent directories as needed."""
     ensure_dir(os.path.dirname(filepath))
-    with open(filepath, 'wb') as f:
+    with open(filepath, "wb") as f:
         pickle.dump(data, f)
 
+
 def load_pickle(filepath):
-    """Deserialize data from a pickle file."""
-    with open(filepath, 'rb') as f:
+    """Deserialize and return the object stored in *filepath*."""
+    with open(filepath, "rb") as f:
         return pickle.load(f)
+
+
+# ============================================================
+# Data loaders
+# ============================================================
+
+def load_queries(filepath):
+    """Load queries from a JSONL file.
+
+    Returns a dict  {query_id: query_text}.
+    """
+    queries = {}
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            d = json.loads(line)
+            queries[d["_id"]] = d["text"]
+    return queries
+
+
+def load_qrels(filepath):
+    """Load relevance judgments from a TSV file.
+
+    Returns a nested dict  {query_id: {doc_id: int_score}}.
+    """
+    qrels = {}
+    with open(filepath, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            qid = row["query-id"]
+            if qid not in qrels:
+                qrels[qid] = {}
+            qrels[qid][row["corpus-id"]] = int(row["score"])
+    return qrels
+
+
+def load_corpus_batch_generator(filepath, batch_size):
+    """Yield (doc_ids, texts) batches from a JSONL corpus file.
+
+    Each document's title and text are concatenated into a single
+    string before being returned.  Malformed JSON lines are silently
+    skipped.
+    """
+    batch_ids, batch_texts = [], []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                doc = json.loads(line)
+                full_text = (doc.get("title", "") + " " + doc.get("text", "")).strip()
+                batch_ids.append(doc["_id"])
+                batch_texts.append(full_text)
+                if len(batch_texts) >= batch_size:
+                    yield batch_ids, batch_texts
+                    batch_ids, batch_texts = [], []
+            except json.JSONDecodeError:
+                continue
+    if batch_texts:
+        yield batch_ids, batch_texts
+
+
+# ============================================================
+# BEIR dataset download / load helpers
+# ============================================================
+
+def download_beir_dataset(dataset_name, datasets_folder):
+    """Download and unzip a BEIR dataset if not already present on disk.
+
+    Returns the path to the extracted dataset directory, or None on
+    failure.
+    """
+    from beir import util as beir_util  # imported here to keep startup fast
+
+    dataset_path = os.path.join(datasets_folder, dataset_name)
+    if os.path.exists(dataset_path):
+        return dataset_path
+
+    url = (
+        "https://public.ukp.informatik.tu-darmstadt.de/"
+        f"thakur/BEIR/datasets/{dataset_name}.zip"
+    )
+    try:
+        beir_util.download_and_unzip(url, datasets_folder)
+        return dataset_path
+    except Exception as exc:
+        print(f"  [ERROR] Download failed for {dataset_name}: {exc}")
+        return None
+
+
+def load_beir_dataset(dataset_path):
+    """Load a BEIR dataset from *dataset_path*.
+
+    Automatically selects the best available split by checking
+    for test -> train -> dev in the qrels directory.
+
+    Returns (corpus, queries, qrels, split_name) or (None, ...) on
+    failure.
+    """
+    from beir.datasets.data_loader import GenericDataLoader
+
+    loader = GenericDataLoader(dataset_path)
+
+    # Pick the first available split
+    split = None
+    for candidate in ["test", "dev", "train"]:
+        qrel_file = os.path.join(dataset_path, "qrels", f"{candidate}.tsv")
+        if os.path.exists(qrel_file):
+            split = candidate
+            break
+
+    if split is None:
+        print(f"  [ERROR] No valid qrels split found in {dataset_path}")
+        return None, None, None, None
+
+    try:
+        corpus, queries, qrels = loader.load(split=split)
+        return corpus, queries, qrels, split
+    except Exception as exc:
+        print(f"  [ERROR] Failed to load {dataset_path}: {exc}")
+        return None, None, None, None
+
+
+# ============================================================
+# Merge helpers (used when merge=true)
+# ============================================================
+
+def initialize_output_files(corpus_path, queries_path, qrels_path):
+    """Create empty output files and write the qrels TSV header.
+
+    Called once before appending data from multiple datasets.
+    """
+    open(corpus_path, "w", encoding="utf-8").close()
+    open(queries_path, "w", encoding="utf-8").close()
+    ensure_dir(os.path.dirname(qrels_path))
+    with open(qrels_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow(["query-id", "corpus-id", "score"])
+
+
+def append_corpus_to_jsonl(corpus_dict, filepath, dataset_prefix):
+    """Append corpus documents to a JSONL file, prefixing IDs
+    with *dataset_prefix* to avoid collisions across datasets.
+    """
+    if not corpus_dict:
+        return
+    with open(filepath, "a", encoding="utf-8") as f:
+        for doc_id, doc in corpus_dict.items():
+            entry = {
+                "_id": f"{dataset_prefix}_{doc_id}",
+                "title": doc.get("title", ""),
+                "text": doc.get("text", ""),
+            }
+            json.dump(entry, f)
+            f.write("\n")
+
+
+def append_queries_to_jsonl(queries_dict, filepath, dataset_prefix):
+    """Append queries to a JSONL file, prefixing IDs."""
+    if not queries_dict:
+        return
+    with open(filepath, "a", encoding="utf-8") as f:
+        for q_id, q_text in queries_dict.items():
+            entry = {"_id": f"{dataset_prefix}_{q_id}", "text": q_text}
+            json.dump(entry, f)
+            f.write("\n")
+
+
+def append_qrels_to_tsv(qrels_dict, filepath, dataset_prefix):
+    """Append relevance judgments to a TSV file, prefixing IDs."""
+    if not qrels_dict:
+        return
+    with open(filepath, "a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        for q_id, doc_map in qrels_dict.items():
+            for doc_id, score in doc_map.items():
+                writer.writerow([
+                    f"{dataset_prefix}_{q_id}",
+                    f"{dataset_prefix}_{doc_id}",
+                    int(score),
+                ])
+
+
+# ============================================================
+# Single-dataset helpers
+# ============================================================
+
+def write_corpus_jsonl(corpus_dict, filepath):
+    """Write corpus documents to a JSONL file (no ID prefixing)."""
+    ensure_dir(os.path.dirname(filepath))
+    with open(filepath, "w", encoding="utf-8") as f:
+        for doc_id, doc in corpus_dict.items():
+            entry = {
+                "_id": str(doc_id),
+                "title": doc.get("title", ""),
+                "text": doc.get("text", ""),
+            }
+            json.dump(entry, f)
+            f.write("\n")
+
+
+def write_queries_jsonl(queries_dict, filepath):
+    """Write queries to a JSONL file (no ID prefixing)."""
+    ensure_dir(os.path.dirname(filepath))
+    with open(filepath, "w", encoding="utf-8") as f:
+        for q_id, q_text in queries_dict.items():
+            entry = {"_id": str(q_id), "text": q_text}
+            json.dump(entry, f)
+            f.write("\n")
+
+
+def write_qrels_tsv(qrels_dict, filepath):
+    """Write relevance judgments to a TSV file (no ID prefixing)."""
+    ensure_dir(os.path.dirname(filepath))
+    with open(filepath, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter="\t")
+        writer.writerow(["query-id", "corpus-id", "score"])
+        for q_id, doc_map in qrels_dict.items():
+            for doc_id, score in doc_map.items():
+                writer.writerow([str(q_id), str(doc_id), int(score)])

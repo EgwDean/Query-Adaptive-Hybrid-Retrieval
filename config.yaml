@@ -1,55 +1,102 @@
+# ============================================================
+# RAG-LLM Hybrid Retrieval Pipeline -- Configuration
+# ============================================================
+#
+# This file controls every tunable aspect of the pipeline.
+# Edit the settings below, then run:
+#     python src/pipeline.py
+#
+# The pipeline automatically detects which processing steps
+# have already been completed and skips them.  If you change
+# the dataset list or the embedding model, all cached
+# artifacts for the affected dataset(s) are rebuilt.
+# ============================================================
+
+# ------------------------------------------------------------
+# Mode: MERGE
+# ------------------------------------------------------------
+# true  -> all uncommented datasets are merged into one corpus
+#          and results are saved under  results/<model>/merged/
+# false -> each uncommented dataset is processed independently
+#          and results are saved under  results/<model>/<dataset>/
+#          (this is the recommended mode for benchmarking)
+merge: false
+
+# ------------------------------------------------------------
+# Datasets
+# ------------------------------------------------------------
+# Uncomment the datasets you want to use.
+# Stats: (test queries | corpus docs | avg relevant docs per query)
+#
+# -- Small (fast) ------------------------------------------------
+#   scifact            300 queries  |    5 084 docs |  1.1 avg
+#   nfcorpus           323 queries  |    3 633 docs | 38.2 avg
+#   arguana          1 406 queries  |    8 674 docs |  1.0 avg
+#
+# -- Medium -------------------------------------------------------
+#   fiqa               648 queries  |   57 638 docs |  2.6 avg
+#   scidocs          1 000 queries  |   25 657 docs |  4.9 avg
+#   webis-touche2020    49 queries  |  382 545 docs | 19.0 avg
+#   trec-covid          50 queries  |  171 332 docs |493.5 avg
+#
+# -- Large (slow, high memory) ------------------------------------
+#   nq               3 452 queries  |    2.68M docs |  1.2 avg
+#   quora            10 000 queries |  522 931 docs |  1.6 avg  (split: dev)
+#   climate-fever     1 535 queries |    5.42M docs |  3.0 avg
+#   hotpotqa          7 405 queries |    5.23M docs |  2.0 avg
+#   fever             6 666 queries |    5.42M docs |  1.2 avg
+#   dbpedia-entity      400 queries |    4.63M docs | 38.2 avg  (split: dev)
+#   msmarco           6 980 queries |    8.84M docs |  1.1 avg  (split: dev)
+# -----------------------------------------------------------------
 datasets:
-  #- scifact          # 300 queries  |   5 084 docs | 1.1 avg
-  - nfcorpus       # 323 queries  |   3 633 docs | 38.2 avg
-  #- arguana        # 1 406 queries |   8 674 docs | 1.0 avg
-  #- webis-touche2020 # 49 queries  | 382 545 docs | 19.0 avg
-  #- fiqa           # 648 queries   |  57 638 docs | 2.6 avg
-  #- scidocs        # 1 000 queries |  25 657 docs | 4.9 avg
-  #- trec-covid     # 50 queries    | 171 332 docs | 493.5 avg
-  #- climate-fever  # 1 535 queries |   5.42M docs | 3.0 avg
-  #- nq             # 3 452 queries |   2.68M docs | 1.2 avg
-  #- hotpotqa       # 7 405 queries |   5.23M docs | 2.0 avg
-  #- fever          # 6 666 queries |   5.42M docs | 1.2 avg
-  #- quora          # 10 000 queries| 522 931 docs | 1.6 avg  (eval split: dev)
-  #- dbpedia-entity # 400 queries   |   4.63M docs | 38.2 avg (eval split: dev)
-  #- msmarco        # 6 980 queries |   8.84M docs | 1.1 avg  (eval split: dev)
+  - scifact
+  #- nfcorpus
+  #- arguana
+  #- fiqa
+  #- scidocs
+  #- webis-touche2020
+  #- trec-covid
+  #- nq
+  #- quora
+  #- climate-fever
+  #- hotpotqa
+  #- fever
+  #- dbpedia-entity
+  #- msmarco
 
-# Paths
+# ------------------------------------------------------------
+# Paths (relative to the project root)
+# ------------------------------------------------------------
+# These are base directories; per-dataset sub-paths are built
+# at runtime by the pipeline.
 paths:
-  data_folder: "data/beir_merged"
   datasets_folder: "data/datasets"
-  indices_folder: "data/indices"
-  tokenized_corpus: "data/beir_merged/tokenized_corpus.jsonl"
-  corpus: "data/beir_merged/corpus.jsonl"
-  queries: "data/beir_merged/queries.jsonl"
-  qrels: "data/beir_merged/qrels/test.tsv"
-  freq_index: "data/indices/freq_index.pkl"
-  bm25_index: "data/indices/bm25_index.pkl"
-  corpus_embeddings: "data/indices/corpus_embeddings.pt"
-  vector_doc_ids: "data/indices/vector_doc_ids.pkl"
-  tokenized_queries: "data/indices/tokenized_queries.pkl"
-  bm25_results: "data/indices/bm25_results.pkl"
-  dense_query_vectors: "data/indices/dense_query_vectors.pt"
-  dense_query_ids: "data/indices/dense_query_ids.pkl"
-  dense_results: "data/indices/dense_results.pkl"
-  results: "data/results.csv"
-  pipeline_state: "data/indices/pipeline_state.json"
+  results_folder:  "data/results"
 
-# Processing configuration
+# ------------------------------------------------------------
+# Preprocessing
+# ------------------------------------------------------------
 preprocessing:
   stemmer_language: "english"
 
-# Embedding model configuration
+# ------------------------------------------------------------
+# Embedding model
+# ------------------------------------------------------------
 embeddings:
+  # model_name: "BAAI/bge-m3"
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
   batch_size: 64
 
-# Dense search configuration
+# ------------------------------------------------------------
+# Dense search
+# ------------------------------------------------------------
 dense_search:
   query_chunk_size: 100
   corpus_chunk_size: 50000
 
-# Retrieval configuration
+# ------------------------------------------------------------
+# Benchmark / evaluation
+# ------------------------------------------------------------
 benchmark:
   top_k: 100
   ndcg_k: 10

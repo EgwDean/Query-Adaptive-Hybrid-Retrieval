@@ -1,3 +1,15 @@
-__pycache__
-.venv/*
-data/*
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Downloaded datasets and generated results
+data/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

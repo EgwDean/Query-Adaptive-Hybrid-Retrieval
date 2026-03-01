@@ -1,0 +1,963 @@
+"""
+pipeline.py -- Single entry point for the RAG-LLM hybrid retrieval benchmark.
+
+Usage:
+    python src/pipeline.py              # run with default config.yaml
+    python src/pipeline.py --config my_config.yaml
+
+The pipeline performs the following steps for every dataset
+listed in config.yaml:
+  1. Download / verify the BEIR dataset
+  2. (Optional) Merge multiple datasets into one combined corpus
+  3. Preprocess (stem & tokenize) the corpus for BM25
+  4. Build a word-frequency index (term -> doc_ids)
+  5. Build the BM25 index (rank_bm25.BM25Okapi)
+  6. Encode the corpus with a sentence-transformer model
+  7. Tokenize queries for BM25
+  8. Compute BM25 retrieval results
+  9. Encode queries with the same sentence-transformer
+ 10. Compute dense retrieval results
+ 11. Run all fusion methods and evaluate NDCG@k
+ 12. Save CSV results + bar chart to the results folder
+
+Intermediate artifacts (pickles, embeddings) are cached in
+  data/results/<model_short_name>/<dataset_name>/
+so re-running the script skips whatever is already on disk.
+"""
+
+import argparse
+import csv
+import math
+import os
+import sys
+import time
+
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend; works on headless servers
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from nltk.stem.snowball import SnowballStemmer
+from rank_bm25 import BM25Okapi
+from scipy.special import softmax
+from sentence_transformers import SentenceTransformer, util as st_util
+from tqdm import tqdm
+
+# Make sure the project root is on sys.path so that
+# "from utils import ..." works regardless of CWD.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+os.chdir(PROJECT_ROOT)
+
+from src.utils import (
+    load_config,
+    ensure_dir,
+    count_lines,
+    save_pickle,
+    load_pickle,
+    file_exists,
+    load_queries,
+    load_qrels,
+    load_corpus_batch_generator,
+    download_beir_dataset,
+    load_beir_dataset,
+    initialize_output_files,
+    append_corpus_to_jsonl,
+    append_queries_to_jsonl,
+    append_qrels_to_tsv,
+    write_corpus_jsonl,
+    write_queries_jsonl,
+    write_qrels_tsv,
+)
+
+
+# ============================================================
+# 0. Shared math / scoring functions used by the fusion step
+# ============================================================
+
+def sigmoid(x, center, slope):
+    """Standard sigmoid shifted by *center* with adjustable *slope*."""
+    return 1.0 / (1.0 + math.exp(-slope * (x - center)))
+
+
+def get_query_distribution(scores_dict):
+    """Convert raw retrieval scores to a probability distribution.
+
+    The scores are shifted so the minimum is zero, then normalised
+    to sum to one.  If every score is the same the uniform
+    distribution is returned.
+    """
+    ids = list(scores_dict.keys())
+    raw = np.array([scores_dict[i] for i in ids], dtype=np.float64)
+    shifted = raw - raw.min()
+    total = shifted.sum()
+    if total == 0:
+        probs = np.ones_like(shifted) / len(shifted)
+    else:
+        probs = shifted / total
+    return ids, probs
+
+
+def compute_divergence_alpha(
+    bm25_scores, dense_scores, mode, sig_center, sig_slope
+):
+    """Compute a per-query mixing weight (alpha) using an
+    information-theoretic divergence between BM25 and dense score
+    distributions.
+
+    Supported *mode* values:
+      jsd_linear             -- Jensen-Shannon divergence, linear alpha
+      jsd_sigmoid            -- Jensen-Shannon divergence, sigmoid alpha
+      kld_normalized         -- KL divergence, 0-1 normalised alpha
+      kld_normalized_sigmoid -- KL divergence, normalised then sigmoid
+      ce_normalized          -- cross-entropy, 0-1 normalised alpha
+      ce_normalized_sigmoid  -- cross-entropy, normalised then sigmoid
+    """
+    common_ids = set(bm25_scores.keys()) & set(dense_scores.keys())
+    if not common_ids:
+        return 0.5  # no overlap, equal weighting
+
+    # Probability distributions over the overlapping document set
+    bm25_sub = {i: bm25_scores[i] for i in common_ids}
+    dense_sub = {i: dense_scores[i] for i in common_ids}
+    ids_b, p_bm25 = get_query_distribution(bm25_sub)
+    ids_d, p_dense = get_query_distribution(dense_sub)
+
+    # Reorder dense probs to match BM25 id order
+    id2idx_d = {i: idx for idx, i in enumerate(ids_d)}
+    p_dense_aligned = np.array([p_dense[id2idx_d[i]] for i in ids_b])
+    p_bm25 = p_bm25
+    p_dense = p_dense_aligned
+
+    eps = 1e-10
+    p_bm25 = np.clip(p_bm25, eps, None)
+    p_dense = np.clip(p_dense, eps, None)
+
+    # ----------------------------------------------------------
+    if mode.startswith("jsd"):
+        m = 0.5 * (p_bm25 + p_dense)
+        kl_bm25_m = np.sum(p_bm25 * np.log(p_bm25 / m))
+        kl_dense_m = np.sum(p_dense * np.log(p_dense / m))
+        jsd = 0.5 * kl_bm25_m + 0.5 * kl_dense_m
+        if "sigmoid" in mode:
+            return sigmoid(jsd, sig_center, sig_slope)
+        return jsd  # linear
+
+    # ----------------------------------------------------------
+    if mode.startswith("kld"):
+        kld = np.sum(p_bm25 * np.log(p_bm25 / p_dense))
+        # Will be normalised externally (min-max across all queries)
+        if "sigmoid" in mode:
+            return ("kld_raw_for_sigmoid", kld)
+        return ("kld_raw", kld)
+
+    # ----------------------------------------------------------
+    if mode.startswith("ce"):
+        ce = -np.sum(p_bm25 * np.log(p_dense))
+        if "sigmoid" in mode:
+            return ("ce_raw_for_sigmoid", ce)
+        return ("ce_raw", ce)
+
+    # Fallback
+    return 0.5
+
+
+def normalize_divergence_alphas(raw_pairs, apply_sigmoid, sig_center, sig_slope):
+    """Min-max normalise a list of (query_id, raw_value) pairs to [0, 1].
+
+    If *apply_sigmoid* is True the normalised value is further
+    passed through a sigmoid.
+    """
+    values = [v for _, v in raw_pairs]
+    lo, hi = min(values), max(values)
+    spread = hi - lo if hi != lo else 1.0
+    result = {}
+    for qid, v in raw_pairs:
+        normed = (v - lo) / spread
+        if apply_sigmoid:
+            normed = sigmoid(normed, sig_center, sig_slope)
+        result[qid] = normed
+    return result
+
+
+# ============================================================
+# 1. Fusion helpers
+# ============================================================
+
+def apply_rrf_fusion(bm25_results, dense_results, k=60):
+    """Reciprocal Rank Fusion (Cormack et al. 2009).
+
+    For each query, the document score is
+      1 / (k + rank_BM25) + 1 / (k + rank_Dense)
+
+    Returns {query_id: {doc_id: fused_score}}.
+    """
+    fused = {}
+    all_qids = set(bm25_results.keys()) | set(dense_results.keys())
+    for qid in all_qids:
+        doc_scores = {}
+        for rank, (doc_id, _) in enumerate(bm25_results.get(qid, []), start=1):
+            doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        for rank, (doc_id, _) in enumerate(dense_results.get(qid, []), start=1):
+            doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        fused[qid] = doc_scores
+    return fused
+
+
+def apply_wrrf_fusion(bm25_results, dense_results, alpha_map, k=60):
+    """Weighted RRF: alpha * BM25_rrf + (1 - alpha) * Dense_rrf.
+
+    *alpha_map* is {query_id: float in [0,1]}.
+    """
+    fused = {}
+    all_qids = set(bm25_results.keys()) | set(dense_results.keys())
+    for qid in all_qids:
+        alpha = alpha_map.get(qid, 0.5)
+        doc_scores = {}
+        for rank, (doc_id, _) in enumerate(bm25_results.get(qid, []), start=1):
+            doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + alpha / (k + rank)
+        for rank, (doc_id, _) in enumerate(dense_results.get(qid, []), start=1):
+            doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + (1.0 - alpha) / (k + rank)
+        fused[qid] = doc_scores
+    return fused
+
+
+def get_sorted_docs(scores_dict, top_k):
+    """Sort *scores_dict* {doc_id: score} descending, return top-k as list of tuples."""
+    return sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+
+# ============================================================
+# 2. NDCG evaluation
+# ============================================================
+
+def calculate_ndcg_at_k(fused_results, qrels, top_k):
+    """Compute average NDCG@k across all queries in *qrels*.
+
+    *fused_results* is {query_id: {doc_id: score}}.
+    """
+    ndcg_scores = []
+    for qid, rels in qrels.items():
+        if qid not in fused_results:
+            ndcg_scores.append(0.0)
+            continue
+        ranked = get_sorted_docs(fused_results[qid], top_k)
+        dcg = 0.0
+        for rank, (doc_id, _) in enumerate(ranked, start=1):
+            rel = rels.get(doc_id, 0)
+            dcg += rel / math.log2(rank + 1)
+        # Ideal DCG
+        ideal_rels = sorted(rels.values(), reverse=True)[:top_k]
+        idcg = sum(r / math.log2(i + 2) for i, r in enumerate(ideal_rels))
+        ndcg_scores.append(dcg / idcg if idcg > 0 else 0.0)
+    return float(np.mean(ndcg_scores)) if ndcg_scores else 0.0
+
+
+# ============================================================
+# 3. Preprocessing (stemming / tokenization for BM25)
+# ============================================================
+
+def stem_and_tokenize(text, stemmer):
+    """Lowercase, split on whitespace, and stem each token."""
+    return [stemmer.stem(w) for w in text.lower().split()]
+
+
+def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
+    """Read a raw corpus JSONL, stem-tokenize every document, and write
+    a tokenized version to *output_jsonl*.
+
+    Each output line is {"_id": ..., "tokens": [...]}.
+    """
+    stemmer = SnowballStemmer(stemmer_lang)
+    total = count_lines(corpus_jsonl)
+    ensure_dir(os.path.dirname(output_jsonl))
+    with open(output_jsonl, "w", encoding="utf-8") as out:
+        for batch_ids, batch_texts in tqdm(
+            load_corpus_batch_generator(corpus_jsonl, batch_size),
+            total=math.ceil(total / batch_size),
+            desc="  Preprocessing corpus",
+        ):
+            for doc_id, text in zip(batch_ids, batch_texts):
+                tokens = stem_and_tokenize(text, stemmer)
+                out.write(json.dumps({"_id": doc_id, "tokens": tokens}) + "\n")
+
+
+# ============================================================
+# 4. BM25 index construction
+# ============================================================
+
+def build_bm25_index(tokenized_corpus_jsonl):
+    """Build and return a BM25Okapi index and the ordered list of
+    document IDs from a tokenized corpus JSONL.
+    """
+    doc_ids = []
+    tokenized_docs = []
+    total = count_lines(tokenized_corpus_jsonl)
+    with open(tokenized_corpus_jsonl, "r", encoding="utf-8") as f:
+        for line in tqdm(f, total=total, desc="  Loading tokenized corpus"):
+            d = json.loads(line)
+            doc_ids.append(d["_id"])
+            tokenized_docs.append(d["tokens"])
+    print(f"  Building BM25 index over {len(doc_ids):,} documents ...")
+    bm25 = BM25Okapi(tokenized_docs)
+    return bm25, doc_ids
+
+
+# ============================================================
+# 5. BM25 retrieval
+# ============================================================
+
+def run_bm25_retrieval(bm25, doc_ids, queries, stemmer_lang, top_k):
+    """Run BM25 queries and return {query_id: [(doc_id, score), ...]}."""
+    stemmer = SnowballStemmer(stemmer_lang)
+    results = {}
+    for qid, qtext in tqdm(queries.items(), desc="  BM25 retrieval"):
+        tokens = stem_and_tokenize(qtext, stemmer)
+        scores = bm25.get_scores(tokens)
+        top_idx = np.argsort(scores)[::-1][:top_k]
+        results[qid] = [(doc_ids[i], float(scores[i])) for i in top_idx]
+    return results
+
+
+# ============================================================
+# 6. Dense embeddings
+# ============================================================
+
+def build_corpus_embeddings(corpus_jsonl, model, batch_size, device):
+    """Encode every document in *corpus_jsonl* and return a stacked
+    tensor of embeddings plus the ordered list of doc IDs.
+    """
+    all_ids, all_embs = [], []
+    total = count_lines(corpus_jsonl)
+    for batch_ids, batch_texts in tqdm(
+        load_corpus_batch_generator(corpus_jsonl, batch_size),
+        total=math.ceil(total / batch_size),
+        desc="  Encoding corpus",
+    ):
+        embs = model.encode(
+            batch_texts,
+            convert_to_tensor=True,
+            show_progress_bar=False,
+            device=device,
+        )
+        all_ids.extend(batch_ids)
+        all_embs.append(embs.cpu())
+    return torch.cat(all_embs, dim=0), all_ids
+
+
+# ============================================================
+# 7. Dense retrieval
+# ============================================================
+
+def build_dense_query_vectors(queries, model, batch_size, device):
+    """Encode all queries and return a tensor plus the ordered query IDs."""
+    qids = list(queries.keys())
+    qtexts = [queries[q] for q in qids]
+    all_embs = []
+    for i in tqdm(range(0, len(qtexts), batch_size), desc="  Encoding queries"):
+        batch = qtexts[i : i + batch_size]
+        emb = model.encode(
+            batch, convert_to_tensor=True, show_progress_bar=False, device=device
+        )
+        all_embs.append(emb.cpu())
+    return torch.cat(all_embs, dim=0), qids
+
+
+def run_dense_retrieval(
+    query_vectors, query_ids, corpus_vectors, corpus_ids, top_k,
+    corpus_chunk_size,
+):
+    """Cosine-similarity search over pre-computed embeddings.
+
+    Returns {query_id: [(doc_id, score), ...]}.
+    """
+    results = {}
+    n_queries = len(query_ids)
+    # Process queries in chunks to limit memory usage
+    qchunk = 256
+    for q_start in tqdm(
+        range(0, n_queries, qchunk), desc="  Dense retrieval"
+    ):
+        q_end = min(q_start + qchunk, n_queries)
+        q_batch = query_vectors[q_start:q_end]
+        hits = st_util.semantic_search(
+            q_batch, corpus_vectors, top_k=top_k,
+            corpus_chunk_size=corpus_chunk_size,
+        )
+        for idx, hit_list in enumerate(hits):
+            qid = query_ids[q_start + idx]
+            results[qid] = [
+                (corpus_ids[h["corpus_id"]], float(h["score"])) for h in hit_list
+            ]
+    return results
+
+
+# ============================================================
+# 8. Benchmark evaluation -- run all 9 methods
+# ============================================================
+
+# The 9 retrieval methods we evaluate:
+METHODS = [
+    "BM25 Only",
+    "Dense Only",
+    "Naive RRF",
+    "JSD (Linear)",
+    "JSD (Sigmoid)",
+    "KLD (0-1 Norm)",
+    "KLD (0-1 + Sigmoid)",
+    "Cross-Entropy (0-1 Norm)",
+    "Cross-Entropy (0-1 + Sigmoid)",
+]
+
+
+def evaluate_all_methods(bm25_results, dense_results, qrels, cfg_benchmark):
+    """Run every fusion strategy and return a list of (method_name, ndcg_score).
+
+    *cfg_benchmark* is the ``benchmark`` sub-dict from config.yaml.
+    """
+    top_k = cfg_benchmark["top_k"]
+    ndcg_k = cfg_benchmark["ndcg_k"]
+    rrf_k = cfg_benchmark["rrf"]["k"]
+    sig_center = cfg_benchmark["sigmoid"]["center"]
+    sig_slope = cfg_benchmark["sigmoid"]["slope"]
+
+    scores = []
+
+    # -- 1. BM25 Only -----------------------------------------------
+    bm25_fused = {
+        qid: {doc: s for doc, s in docs}
+        for qid, docs in bm25_results.items()
+    }
+    scores.append(("BM25 Only", calculate_ndcg_at_k(bm25_fused, qrels, ndcg_k)))
+
+    # -- 2. Dense Only ----------------------------------------------
+    dense_fused = {
+        qid: {doc: s for doc, s in docs}
+        for qid, docs in dense_results.items()
+    }
+    scores.append(("Dense Only", calculate_ndcg_at_k(dense_fused, qrels, ndcg_k)))
+
+    # -- 3. Naive RRF -----------------------------------------------
+    rrf_fused = apply_rrf_fusion(bm25_results, dense_results, k=rrf_k)
+    scores.append(("Naive RRF", calculate_ndcg_at_k(rrf_fused, qrels, ndcg_k)))
+
+    # -- Helper: convert results to score dicts for divergence ------
+    bm25_score_dicts = {
+        qid: {doc: s for doc, s in docs}
+        for qid, docs in bm25_results.items()
+    }
+    dense_score_dicts = {
+        qid: {doc: s for doc, s in docs}
+        for qid, docs in dense_results.items()
+    }
+
+    # Divergence-based weighted RRF for the remaining 6 methods.
+    divergence_modes = [
+        ("JSD (Linear)",               "jsd_linear"),
+        ("JSD (Sigmoid)",              "jsd_sigmoid"),
+        ("KLD (0-1 Norm)",             "kld_normalized"),
+        ("KLD (0-1 + Sigmoid)",        "kld_normalized_sigmoid"),
+        ("Cross-Entropy (0-1 Norm)",   "ce_normalized"),
+        ("Cross-Entropy (0-1 + Sigmoid)", "ce_normalized_sigmoid"),
+    ]
+
+    for method_label, mode in divergence_modes:
+        # Phase 1: compute raw divergences per query
+        raw_pairs = []  # only for modes that need normalization
+        alpha_map = {}
+        for qid in qrels:
+            b = bm25_score_dicts.get(qid, {})
+            d = dense_score_dicts.get(qid, {})
+            result = compute_divergence_alpha(b, d, mode, sig_center, sig_slope)
+            if isinstance(result, tuple):
+                raw_pairs.append((qid, result[1]))
+            else:
+                alpha_map[qid] = result
+
+        # Phase 2: normalise if necessary (KLD and CE modes)
+        if raw_pairs:
+            needs_sigmoid = mode.endswith("_sigmoid")
+            alpha_map = normalize_divergence_alphas(
+                raw_pairs, needs_sigmoid, sig_center, sig_slope
+            )
+
+        wrrf_fused = apply_wrrf_fusion(bm25_results, dense_results, alpha_map, k=rrf_k)
+        ndcg = calculate_ndcg_at_k(wrrf_fused, qrels, ndcg_k)
+        scores.append((method_label, ndcg))
+
+    return scores
+
+
+# ============================================================
+# 9. Results output (CSV + bar chart)
+# ============================================================
+
+def save_results_csv(scores, output_path):
+    """Write the benchmark results as a CSV file.
+
+    Any existing file at *output_path* is overwritten.
+    """
+    ensure_dir(os.path.dirname(output_path))
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Method", "NDCG@10"])
+        for method, ndcg in scores:
+            writer.writerow([method, f"{ndcg:.4f}"])
+    print(f"  Results saved to {output_path}")
+
+
+def save_results_chart(scores, output_path, dataset_label, model_label):
+    """Draw a horizontal bar chart of NDCG@10 scores and save as PNG."""
+    ensure_dir(os.path.dirname(output_path))
+    methods = [m for m, _ in scores]
+    values = [v for _, v in scores]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    y_pos = np.arange(len(methods))
+    bars = ax.barh(y_pos, values, color="#4a90d9")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(methods)
+    ax.invert_yaxis()
+    ax.set_xlabel("NDCG@10")
+    ax.set_title(f"Retrieval Benchmark -- {dataset_label} ({model_label})")
+    ax.set_xlim(0, max(values) * 1.15 if values else 1.0)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + 0.002,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.4f}",
+            va="center",
+            fontsize=9,
+        )
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Chart saved to {output_path}")
+
+
+# ============================================================
+# 10. Top-level pipeline orchestration
+# ============================================================
+
+import json  # needed inside preprocess_corpus (already imported at top)
+
+
+def model_short_name(full_name):
+    """Derive a filesystem-safe short name from a HuggingFace model path.
+
+    Examples:
+        'BAAI/bge-m3'                      -> 'bge-m3'
+        'sentence-transformers/all-MiniLM'  -> 'all-MiniLM'
+    """
+    return full_name.split("/")[-1]
+
+
+def run_pipeline_for_dataset(dataset_name, cfg, model, device):
+    """Execute every pipeline step for a single dataset.
+
+    Cached artifacts are stored under
+      <results_folder>/<model_short>/<dataset_name>/
+    so repeated runs skip completed steps automatically.
+    """
+    short_model = model_short_name(cfg["embeddings"]["model_name"])
+    ds_dir = os.path.join(
+        cfg["paths"]["results_folder"], short_model, dataset_name
+    )
+    ensure_dir(ds_dir)
+
+    datasets_folder = cfg["paths"]["datasets_folder"]
+    stemmer_lang = cfg["preprocessing"]["stemmer_language"]
+    emb_batch_size = cfg["embeddings"]["batch_size"]
+    top_k = cfg["benchmark"]["top_k"]
+    dense_cfg = cfg["dense_search"]
+
+    # Paths for intermediate artifacts
+    corpus_jsonl = os.path.join(ds_dir, "corpus.jsonl")
+    queries_jsonl = os.path.join(ds_dir, "queries.jsonl")
+    qrels_tsv = os.path.join(ds_dir, "qrels.tsv")
+    tokenized_jsonl = os.path.join(ds_dir, "tokenized_corpus.jsonl")
+    bm25_pkl = os.path.join(ds_dir, "bm25_index.pkl")
+    bm25_docids_pkl = os.path.join(ds_dir, "bm25_doc_ids.pkl")
+    corpus_emb_pt = os.path.join(ds_dir, "corpus_embeddings.pt")
+    corpus_ids_pkl = os.path.join(ds_dir, "corpus_ids.pkl")
+    bm25_results_pkl = os.path.join(ds_dir, "bm25_results.pkl")
+    query_vectors_pt = os.path.join(ds_dir, "query_vectors.pt")
+    query_ids_pkl = os.path.join(ds_dir, "query_ids.pkl")
+    dense_results_pkl = os.path.join(ds_dir, "dense_results.pkl")
+    results_csv = os.path.join(ds_dir, "results.csv")
+    results_png = os.path.join(ds_dir, "results.png")
+
+    print(f"\n{'=' * 60}")
+    print(f"  Dataset: {dataset_name}")
+    print(f"  Output : {ds_dir}")
+    print(f"{'=' * 60}")
+
+    # ----------------------------------------------------------
+    # Step 1 -- Download the BEIR dataset
+    # ----------------------------------------------------------
+    print("\n[Step 1/10] Downloading / verifying dataset ...")
+    dataset_path = download_beir_dataset(dataset_name, datasets_folder)
+    if dataset_path is None:
+        print("  SKIPPED (download failed). Aborting this dataset.")
+        return
+
+    # ----------------------------------------------------------
+    # Step 2 -- Load dataset and write local copies of corpus / queries / qrels
+    # ----------------------------------------------------------
+    if file_exists(corpus_jsonl) and file_exists(queries_jsonl) and file_exists(qrels_tsv):
+        print("[Step 2/10] Corpus / queries / qrels already cached. Loading ...")
+        queries = load_queries(queries_jsonl)
+        qrels = load_qrels(qrels_tsv)
+    else:
+        print("[Step 2/10] Loading BEIR data and writing local copies ...")
+        corpus, queries, qrels, split = load_beir_dataset(dataset_path)
+        if corpus is None:
+            print("  SKIPPED (failed to load). Aborting this dataset.")
+            return
+        print(f"  Split: {split} | Corpus: {len(corpus):,} | Queries: {len(queries):,}")
+        write_corpus_jsonl(corpus, corpus_jsonl)
+        write_queries_jsonl(queries, queries_jsonl)
+        write_qrels_tsv(qrels, qrels_tsv)
+        del corpus  # free memory
+
+    # ----------------------------------------------------------
+    # Step 3 -- Preprocess (stem + tokenize) the corpus for BM25
+    # ----------------------------------------------------------
+    if file_exists(tokenized_jsonl):
+        print("[Step 3/10] Tokenized corpus already exists. Skipping.")
+    else:
+        print("[Step 3/10] Preprocessing corpus (stemming + tokenization) ...")
+        preprocess_corpus(corpus_jsonl, tokenized_jsonl, stemmer_lang)
+
+    # ----------------------------------------------------------
+    # Step 4 -- Build the BM25 index
+    # ----------------------------------------------------------
+    if file_exists(bm25_pkl) and file_exists(bm25_docids_pkl):
+        print("[Step 4/10] BM25 index already exists. Loading ...")
+        bm25 = load_pickle(bm25_pkl)
+        bm25_doc_ids = load_pickle(bm25_docids_pkl)
+    else:
+        print("[Step 4/10] Building BM25 index ...")
+        bm25, bm25_doc_ids = build_bm25_index(tokenized_jsonl)
+        save_pickle(bm25, bm25_pkl)
+        save_pickle(bm25_doc_ids, bm25_docids_pkl)
+
+    # ----------------------------------------------------------
+    # Step 5 -- Encode the corpus with the embedding model
+    # ----------------------------------------------------------
+    if file_exists(corpus_emb_pt) and file_exists(corpus_ids_pkl):
+        print("[Step 5/10] Corpus embeddings already exist. Loading ...")
+        corpus_embeddings = torch.load(corpus_emb_pt, weights_only=True)
+        corpus_ids = load_pickle(corpus_ids_pkl)
+    else:
+        print("[Step 5/10] Encoding corpus with embedding model ...")
+        corpus_embeddings, corpus_ids = build_corpus_embeddings(
+            corpus_jsonl, model, emb_batch_size, device
+        )
+        torch.save(corpus_embeddings, corpus_emb_pt)
+        save_pickle(corpus_ids, corpus_ids_pkl)
+
+    # ----------------------------------------------------------
+    # Step 6 -- BM25 retrieval
+    # ----------------------------------------------------------
+    if file_exists(bm25_results_pkl):
+        print("[Step 6/10] BM25 results already exist. Loading ...")
+        bm25_results = load_pickle(bm25_results_pkl)
+    else:
+        print("[Step 6/10] Running BM25 retrieval ...")
+        if not queries:
+            queries = load_queries(queries_jsonl)
+        bm25_results = run_bm25_retrieval(
+            bm25, bm25_doc_ids, queries, stemmer_lang, top_k
+        )
+        save_pickle(bm25_results, bm25_results_pkl)
+
+    # Free the BM25 index -- it is no longer needed
+    del bm25, bm25_doc_ids
+
+    # ----------------------------------------------------------
+    # Step 7 -- Encode queries with the embedding model
+    # ----------------------------------------------------------
+    if file_exists(query_vectors_pt) and file_exists(query_ids_pkl):
+        print("[Step 7/10] Query vectors already exist. Loading ...")
+        query_vectors = torch.load(query_vectors_pt, weights_only=True)
+        query_ids = load_pickle(query_ids_pkl)
+    else:
+        print("[Step 7/10] Encoding queries ...")
+        if not queries:
+            queries = load_queries(queries_jsonl)
+        query_vectors, query_ids = build_dense_query_vectors(
+            queries, model, emb_batch_size, device
+        )
+        torch.save(query_vectors, query_vectors_pt)
+        save_pickle(query_ids, query_ids_pkl)
+
+    # ----------------------------------------------------------
+    # Step 8 -- Dense retrieval
+    # ----------------------------------------------------------
+    if file_exists(dense_results_pkl):
+        print("[Step 8/10] Dense results already exist. Loading ...")
+        dense_results = load_pickle(dense_results_pkl)
+    else:
+        print("[Step 8/10] Running dense retrieval ...")
+        dense_results = run_dense_retrieval(
+            query_vectors, query_ids, corpus_embeddings, corpus_ids, top_k,
+            dense_cfg["corpus_chunk_size"],
+        )
+        save_pickle(dense_results, dense_results_pkl)
+
+    # Free embeddings
+    del corpus_embeddings, query_vectors
+
+    # ----------------------------------------------------------
+    # Step 9 -- Evaluate all fusion methods
+    # ----------------------------------------------------------
+    print("[Step 9/10] Evaluating fusion methods ...")
+    if not qrels:
+        qrels = load_qrels(qrels_tsv)
+    method_scores = evaluate_all_methods(
+        bm25_results, dense_results, qrels, cfg["benchmark"]
+    )
+
+    # Print a quick summary table to stdout
+    print(f"\n  {'Method':<32s} {'NDCG@10':>8s}")
+    print(f"  {'-'*32} {'-'*8}")
+    for method, ndcg in method_scores:
+        print(f"  {method:<32s} {ndcg:>8.4f}")
+
+    # ----------------------------------------------------------
+    # Step 10 -- Save results (CSV + chart)
+    # ----------------------------------------------------------
+    print("\n[Step 10/10] Saving results ...")
+    save_results_csv(method_scores, results_csv)
+    save_results_chart(
+        method_scores, results_png, dataset_name, short_model
+    )
+
+    print(f"\n  Finished {dataset_name}.")
+
+
+def run_pipeline_merged(datasets, cfg, model, device):
+    """Merge all specified datasets into one corpus, then run the
+    benchmark once over the combined data.
+
+    Merged artifacts go to  results/<model>/merged/
+    """
+    short_model = model_short_name(cfg["embeddings"]["model_name"])
+    merged_dir = os.path.join(
+        cfg["paths"]["results_folder"], short_model, "merged"
+    )
+    ensure_dir(merged_dir)
+    datasets_folder = cfg["paths"]["datasets_folder"]
+
+    corpus_jsonl = os.path.join(merged_dir, "corpus.jsonl")
+    queries_jsonl = os.path.join(merged_dir, "queries.jsonl")
+    qrels_tsv = os.path.join(merged_dir, "qrels.tsv")
+
+    print(f"\n{'=' * 60}")
+    print(f"  MERGE MODE -- combining {len(datasets)} datasets")
+    print(f"  Output : {merged_dir}")
+    print(f"{'=' * 60}")
+
+    # ----------------------------------------------------------
+    # Download + merge all datasets
+    # ----------------------------------------------------------
+    if file_exists(corpus_jsonl) and file_exists(queries_jsonl) and file_exists(qrels_tsv):
+        print("\n[Merge] Merged files already exist. Skipping merge step.")
+    else:
+        initialize_output_files(corpus_jsonl, queries_jsonl, qrels_tsv)
+        for ds_name in tqdm(datasets, desc="  Downloading & merging"):
+            ds_path = download_beir_dataset(ds_name, datasets_folder)
+            if ds_path is None:
+                continue
+            corpus, queries, qrels, split = load_beir_dataset(ds_path)
+            if corpus is None:
+                continue
+            print(f"    {ds_name}: {len(corpus):,} docs, {len(queries):,} queries (split: {split})")
+            append_corpus_to_jsonl(corpus, corpus_jsonl, ds_name)
+            append_queries_to_jsonl(queries, queries_jsonl, ds_name)
+            append_qrels_to_tsv(qrels, qrels_tsv, ds_name)
+            del corpus, queries, qrels
+
+    # Now hand off to the normal per-dataset pipeline which will
+    # pick up the already-written corpus/queries/qrels.
+    # We create a temporary config override so it reads from merged_dir.
+    _run_benchmark_steps(merged_dir, cfg, model, device, label="merged")
+
+
+def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
+    """Execute steps 3-10 (preprocess through evaluation) given that
+    corpus.jsonl, queries.jsonl, and qrels.tsv already exist in *ds_dir*.
+
+    This is shared by both the per-dataset and merged code paths.
+    """
+    stemmer_lang = cfg["preprocessing"]["stemmer_language"]
+    emb_batch_size = cfg["embeddings"]["batch_size"]
+    top_k = cfg["benchmark"]["top_k"]
+    dense_cfg = cfg["dense_search"]
+    short_model = model_short_name(cfg["embeddings"]["model_name"])
+
+    corpus_jsonl = os.path.join(ds_dir, "corpus.jsonl")
+    queries_jsonl = os.path.join(ds_dir, "queries.jsonl")
+    qrels_tsv = os.path.join(ds_dir, "qrels.tsv")
+    tokenized_jsonl = os.path.join(ds_dir, "tokenized_corpus.jsonl")
+    bm25_pkl = os.path.join(ds_dir, "bm25_index.pkl")
+    bm25_docids_pkl = os.path.join(ds_dir, "bm25_doc_ids.pkl")
+    corpus_emb_pt = os.path.join(ds_dir, "corpus_embeddings.pt")
+    corpus_ids_pkl = os.path.join(ds_dir, "corpus_ids.pkl")
+    bm25_results_pkl = os.path.join(ds_dir, "bm25_results.pkl")
+    query_vectors_pt = os.path.join(ds_dir, "query_vectors.pt")
+    query_ids_pkl = os.path.join(ds_dir, "query_ids.pkl")
+    dense_results_pkl = os.path.join(ds_dir, "dense_results.pkl")
+    results_csv = os.path.join(ds_dir, "results.csv")
+    results_png = os.path.join(ds_dir, "results.png")
+
+    queries = load_queries(queries_jsonl)
+    qrels = load_qrels(qrels_tsv)
+
+    # Preprocessing
+    if file_exists(tokenized_jsonl):
+        print("[Step 3] Tokenized corpus exists. Skipping.")
+    else:
+        print("[Step 3] Preprocessing corpus ...")
+        preprocess_corpus(corpus_jsonl, tokenized_jsonl, stemmer_lang)
+
+    # BM25 index
+    if file_exists(bm25_pkl) and file_exists(bm25_docids_pkl):
+        print("[Step 4] BM25 index exists. Loading ...")
+        bm25 = load_pickle(bm25_pkl)
+        bm25_doc_ids = load_pickle(bm25_docids_pkl)
+    else:
+        print("[Step 4] Building BM25 index ...")
+        bm25, bm25_doc_ids = build_bm25_index(tokenized_jsonl)
+        save_pickle(bm25, bm25_pkl)
+        save_pickle(bm25_doc_ids, bm25_docids_pkl)
+
+    # Corpus embeddings
+    if file_exists(corpus_emb_pt) and file_exists(corpus_ids_pkl):
+        print("[Step 5] Corpus embeddings exist. Loading ...")
+        corpus_embeddings = torch.load(corpus_emb_pt, weights_only=True)
+        corpus_ids = load_pickle(corpus_ids_pkl)
+    else:
+        print("[Step 5] Encoding corpus ...")
+        corpus_embeddings, corpus_ids = build_corpus_embeddings(
+            corpus_jsonl, model, emb_batch_size, device
+        )
+        torch.save(corpus_embeddings, corpus_emb_pt)
+        save_pickle(corpus_ids, corpus_ids_pkl)
+
+    # BM25 retrieval
+    if file_exists(bm25_results_pkl):
+        print("[Step 6] BM25 results exist. Loading ...")
+        bm25_results = load_pickle(bm25_results_pkl)
+    else:
+        print("[Step 6] Running BM25 retrieval ...")
+        bm25_results = run_bm25_retrieval(bm25, bm25_doc_ids, queries, stemmer_lang, top_k)
+        save_pickle(bm25_results, bm25_results_pkl)
+
+    del bm25, bm25_doc_ids
+
+    # Query embeddings
+    if file_exists(query_vectors_pt) and file_exists(query_ids_pkl):
+        print("[Step 7] Query vectors exist. Loading ...")
+        query_vectors = torch.load(query_vectors_pt, weights_only=True)
+        query_ids = load_pickle(query_ids_pkl)
+    else:
+        print("[Step 7] Encoding queries ...")
+        query_vectors, query_ids = build_dense_query_vectors(
+            queries, model, emb_batch_size, device
+        )
+        torch.save(query_vectors, query_vectors_pt)
+        save_pickle(query_ids, query_ids_pkl)
+
+    # Dense retrieval
+    if file_exists(dense_results_pkl):
+        print("[Step 8] Dense results exist. Loading ...")
+        dense_results = load_pickle(dense_results_pkl)
+    else:
+        print("[Step 8] Running dense retrieval ...")
+        dense_results = run_dense_retrieval(
+            query_vectors, query_ids, corpus_embeddings, corpus_ids, top_k,
+            dense_cfg["corpus_chunk_size"],
+        )
+        save_pickle(dense_results, dense_results_pkl)
+
+    del corpus_embeddings, query_vectors
+
+    # Evaluation
+    print("[Step 9] Evaluating fusion methods ...")
+    method_scores = evaluate_all_methods(bm25_results, dense_results, qrels, cfg["benchmark"])
+
+    print(f"\n  {'Method':<32s} {'NDCG@10':>8s}")
+    print(f"  {'-'*32} {'-'*8}")
+    for method, ndcg in method_scores:
+        print(f"  {method:<32s} {ndcg:>8.4f}")
+
+    # Save outputs
+    print("\n[Step 10] Saving results ...")
+    save_results_csv(method_scores, results_csv)
+    save_results_chart(method_scores, results_png, label, short_model)
+    print(f"\n  Finished {label}.")
+
+
+# ============================================================
+# Entry point
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="RAG-LLM Hybrid Retrieval Benchmark Pipeline"
+    )
+    parser.add_argument(
+        "--config", default="config.yaml",
+        help="Path to the YAML configuration file (default: config.yaml)"
+    )
+    args = parser.parse_args()
+
+    # Override the module-level config path if the user supplied one
+    import src.utils as _u
+    _u.CONFIG_PATH = args.config
+
+    cfg = load_config()
+
+    datasets = cfg.get("datasets", [])
+    if not datasets:
+        print("No datasets specified in config.yaml. Nothing to do.")
+        sys.exit(0)
+
+    merge_mode = cfg.get("merge", False)
+    model_name = cfg["embeddings"]["model_name"]
+
+    # Select compute device
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+    print(f"Device : {device}")
+    print(f"Model  : {model_name}")
+    print(f"Datasets ({len(datasets)}): {', '.join(datasets)}")
+    print(f"Mode   : {'MERGE' if merge_mode else 'PER-DATASET'}")
+
+    # Load the sentence-transformer model once
+    print("\nLoading embedding model ...")
+    start = time.time()
+    model = SentenceTransformer(model_name, device=device)
+    print(f"  Model loaded in {time.time() - start:.1f}s\n")
+
+    if merge_mode:
+        run_pipeline_merged(datasets, cfg, model, device)
+    else:
+        for ds_name in datasets:
+            run_pipeline_for_dataset(ds_name, cfg, model, device)
+
+    print("\n" + "=" * 60)
+    print("  All done.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

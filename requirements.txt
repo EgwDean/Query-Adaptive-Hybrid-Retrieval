@@ -4,8 +4,6 @@ tqdm
 
 # Dataset management
 beir
-datasets
-ir-datasets
 
 # NLP
 nltk
@@ -13,21 +11,16 @@ nltk
 # Information retrieval
 rank_bm25
 
-# Embeddings
+# Embeddings & deep learning
 sentence-transformers
 torch
 
 # Scientific computing
 numpy
 scipy
-scikit-learn
-pandas
 
 # Visualization
 matplotlib
-
-# Notebook
-jupyter
 ipykernel
 ipywidgets
 nbconvert
