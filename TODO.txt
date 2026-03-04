@@ -1,4 +1,3 @@
-Read and edit code
-Study and modify the math
+Run the all-MiniLM-L6-v2 model in a few docs
 Run the BGE-M3 model in a few docs
 Ready the repo for the benchmarking

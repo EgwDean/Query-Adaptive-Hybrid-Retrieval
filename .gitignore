@@ -13,3 +13,4 @@ data/
 Thumbs.db
 *.swp
 *.swo
+.vscode/

@@ -107,3 +107,6 @@ benchmark:
   sigmoid:
     center: 0.5
     slope: 10
+
+  smoothing:
+    laplace_alpha: 1

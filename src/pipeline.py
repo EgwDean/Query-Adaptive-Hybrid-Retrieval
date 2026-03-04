@@ -27,11 +27,11 @@ so re-running the script skips whatever is already on disk.
 
 import argparse
 import csv
+import json
 import math
 import os
 import sys
 import time
-
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend; works on headless servers
 import matplotlib.pyplot as plt
@@ -39,7 +39,6 @@ import numpy as np
 import torch
 from nltk.stem.snowball import SnowballStemmer
 from rank_bm25 import BM25Okapi
-from scipy.special import softmax
 from sentence_transformers import SentenceTransformer, util as st_util
 from tqdm import tqdm
 
@@ -82,86 +81,77 @@ def sigmoid(x, center, slope):
     return 1.0 / (1.0 + math.exp(-slope * (x - center)))
 
 
-def get_query_distribution(scores_dict):
-    """Convert raw retrieval scores to a probability distribution.
+def compute_query_metrics(query_tokens, global_counts, total_corpus_tokens,
+                         laplace_alpha=1):
+    """Compute CE, KLD and JSD between a query's word distribution and
+    the global corpus word distribution.
 
-    The scores are shifted so the minimum is zero, then normalised
-    to sum to one.  If every score is the same the uniform
-    distribution is returned.
+    Parameters
+    ----------
+    query_tokens : list[str]
+        Pre-stemmed tokens of the query (may contain duplicates).
+    global_counts : dict[str, int]
+        Mapping from every stemmed token in the corpus to its raw
+        occurrence count across the entire corpus.
+    total_corpus_tokens : int
+        Sum of all token occurrences in the corpus
+        (i.e. ``sum(global_counts.values())``).
+    laplace_alpha : float
+        Smoothing parameter for the corpus distribution.  The default
+        Add-1 (Laplace) smoothing uses ``alpha = 1``.
+
+    Returns
+    -------
+    dict with keys ``'ce'``, ``'kld'``, ``'jsd'`` (all floats).
+
+    Notes
+    -----
+    * **P(w|Q)** -- frequency of token *w* in the query divided by the
+      total number of query tokens.
+    * **P(w|C)** -- global frequency of token *w* in the corpus divided
+      by the total number of corpus tokens.  Laplace smoothing with
+      parameter *laplace_alpha* is applied so that query words absent
+      from the corpus still receive a non-zero probability.
+    * CE   = -Σ P(w|Q) · log₂ P(w|C)
+    * KLD  =  Σ P(w|Q) · log₂( P(w|Q) / P(w|C) )
+    * JSD  = 0.5·KL(P||M) + 0.5·KL(Q||M)  where M = 0.5·(P+Q),
+      computed in base 2.
     """
-    ids = list(scores_dict.keys())
-    raw = np.array([scores_dict[i] for i in ids], dtype=np.float64)
-    shifted = raw - raw.min()
-    total = shifted.sum()
-    if total == 0:
-        probs = np.ones_like(shifted) / len(shifted)
-    else:
-        probs = shifted / total
-    return ids, probs
+    if not query_tokens:
+        return {"ce": 0.0, "kld": 0.0, "jsd": 0.0}
 
+    # -- Build P(w|Q) ------------------------------------------------
+    token_freq = {}
+    for t in query_tokens:
+        token_freq[t] = token_freq.get(t, 0) + 1
+    unique_tokens = list(token_freq.keys())
+    n_query = len(query_tokens)
 
-def compute_divergence_alpha(
-    bm25_scores, dense_scores, mode, sig_center, sig_slope
-):
-    """Compute a per-query mixing weight (alpha) using an
-    information-theoretic divergence between BM25 and dense score
-    distributions.
+    p_q = np.array([token_freq[t] / n_query for t in unique_tokens],
+                    dtype=np.float64)
 
-    Supported *mode* values:
-      jsd_linear             -- Jensen-Shannon divergence, linear alpha
-      jsd_sigmoid            -- Jensen-Shannon divergence, sigmoid alpha
-      kld_normalized         -- KL divergence, 0-1 normalised alpha
-      kld_normalized_sigmoid -- KL divergence, normalised then sigmoid
-      ce_normalized          -- cross-entropy, 0-1 normalised alpha
-      ce_normalized_sigmoid  -- cross-entropy, normalised then sigmoid
-    """
-    common_ids = set(bm25_scores.keys()) & set(dense_scores.keys())
-    if not common_ids:
-        return 0.5  # no overlap, equal weighting
+    # -- Build P(w|C) with Laplace smoothing --------------------------
+    vocab_size = len(global_counts)
+    smoothed_total = total_corpus_tokens + laplace_alpha * vocab_size
+    p_c = np.array(
+        [(global_counts.get(t, 0) + laplace_alpha) / smoothed_total
+         for t in unique_tokens],
+        dtype=np.float64,
+    )
 
-    # Probability distributions over the overlapping document set
-    bm25_sub = {i: bm25_scores[i] for i in common_ids}
-    dense_sub = {i: dense_scores[i] for i in common_ids}
-    ids_b, p_bm25 = get_query_distribution(bm25_sub)
-    ids_d, p_dense = get_query_distribution(dense_sub)
+    # -- Cross-Entropy ------------------------------------------------
+    ce = -np.sum(p_q * np.log2(p_c))
 
-    # Reorder dense probs to match BM25 id order
-    id2idx_d = {i: idx for idx, i in enumerate(ids_d)}
-    p_dense_aligned = np.array([p_dense[id2idx_d[i]] for i in ids_b])
-    p_bm25 = p_bm25
-    p_dense = p_dense_aligned
+    # -- KL Divergence (P(w|Q) || P(w|C)) ----------------------------
+    kld = np.sum(p_q * np.log2(p_q / p_c))
 
-    eps = 1e-10
-    p_bm25 = np.clip(p_bm25, eps, None)
-    p_dense = np.clip(p_dense, eps, None)
+    # -- Jensen-Shannon Divergence (base 2) ---------------------------
+    m = 0.5 * (p_q + p_c)
+    kl_q_m = np.sum(p_q * np.log2(p_q / m))
+    kl_c_m = np.sum(p_c * np.log2(p_c / m))
+    jsd = 0.5 * kl_q_m + 0.5 * kl_c_m
 
-    # ----------------------------------------------------------
-    if mode.startswith("jsd"):
-        m = 0.5 * (p_bm25 + p_dense)
-        kl_bm25_m = np.sum(p_bm25 * np.log(p_bm25 / m))
-        kl_dense_m = np.sum(p_dense * np.log(p_dense / m))
-        jsd = 0.5 * kl_bm25_m + 0.5 * kl_dense_m
-        if "sigmoid" in mode:
-            return sigmoid(jsd, sig_center, sig_slope)
-        return jsd  # linear
-
-    # ----------------------------------------------------------
-    if mode.startswith("kld"):
-        kld = np.sum(p_bm25 * np.log(p_bm25 / p_dense))
-        # Will be normalised externally (min-max across all queries)
-        if "sigmoid" in mode:
-            return ("kld_raw_for_sigmoid", kld)
-        return ("kld_raw", kld)
-
-    # ----------------------------------------------------------
-    if mode.startswith("ce"):
-        ce = -np.sum(p_bm25 * np.log(p_dense))
-        if "sigmoid" in mode:
-            return ("ce_raw_for_sigmoid", ce)
-        return ("ce_raw", ce)
-
-    # Fallback
-    return 0.5
+    return {"ce": float(ce), "kld": float(kld), "jsd": float(jsd)}
 
 
 def normalize_divergence_alphas(raw_pairs, apply_sigmoid, sig_center, sig_slope):
@@ -288,21 +278,40 @@ def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
 # 4. BM25 index construction
 # ============================================================
 
-def build_bm25_index(tokenized_corpus_jsonl):
-    """Build and return a BM25Okapi index and the ordered list of
-    document IDs from a tokenized corpus JSONL.
+def build_bm25_and_word_freq_index(tokenized_corpus_jsonl):
+    """Build BM25 index and corpus-wide word frequency index in a
+    single pass over the tokenized corpus.
+
+    Returns
+    -------
+    bm25 : BM25Okapi
+        The BM25 index ready for querying.
+    doc_ids : list[str]
+        Ordered document IDs matching the BM25 index.
+    global_counts : dict[str, int]
+        Mapping from each stemmed token to its total occurrence count.
+    total_tokens : int
+        Sum of all token occurrences (``sum(global_counts.values())``).
     """
     doc_ids = []
     tokenized_docs = []
-    total = count_lines(tokenized_corpus_jsonl)
+    global_counts = {}
+    total_tokens = 0
+    num_lines = count_lines(tokenized_corpus_jsonl)
     with open(tokenized_corpus_jsonl, "r", encoding="utf-8") as f:
-        for line in tqdm(f, total=total, desc="  Loading tokenized corpus"):
+        for line in tqdm(f, total=num_lines, desc="  Loading tokenized corpus"):
             d = json.loads(line)
             doc_ids.append(d["_id"])
-            tokenized_docs.append(d["tokens"])
+            tokens = d["tokens"]
+            tokenized_docs.append(tokens)
+            for t in tokens:
+                global_counts[t] = global_counts.get(t, 0) + 1
+            total_tokens += len(tokens)
     print(f"  Building BM25 index over {len(doc_ids):,} documents ...")
     bm25 = BM25Okapi(tokenized_docs)
-    return bm25, doc_ids
+    print(f"  Vocabulary size: {len(global_counts):,} unique tokens, "
+          f"{total_tokens:,} total occurrences.")
+    return bm25, doc_ids, global_counts, total_tokens
 
 
 # ============================================================
@@ -412,10 +421,25 @@ METHODS = [
 ]
 
 
-def evaluate_all_methods(bm25_results, dense_results, qrels, cfg_benchmark):
+def evaluate_all_methods(
+    bm25_results, dense_results, qrels, cfg_benchmark,
+    queries, stemmer_lang, global_counts, total_corpus_tokens,
+):
     """Run every fusion strategy and return a list of (method_name, ndcg_score).
 
-    *cfg_benchmark* is the ``benchmark`` sub-dict from config.yaml.
+    The divergence-based alpha is computed from **word-level**
+    distributions (P(w|Q) vs P(w|C)), not from retrieval scores.
+
+    Parameters
+    ----------
+    queries : dict[str, str]
+        Raw query texts keyed by query id (used to build P(w|Q)).
+    stemmer_lang : str
+        Language for the Snowball stemmer.
+    global_counts : dict[str, int]
+        Corpus-wide token frequency index.
+    total_corpus_tokens : int
+        Total token occurrences in the corpus.
     """
     top_k = cfg_benchmark["top_k"]
     ndcg_k = cfg_benchmark["ndcg_k"]
@@ -443,45 +467,43 @@ def evaluate_all_methods(bm25_results, dense_results, qrels, cfg_benchmark):
     rrf_fused = apply_rrf_fusion(bm25_results, dense_results, k=rrf_k)
     scores.append(("Naive RRF", calculate_ndcg_at_k(rrf_fused, qrels, ndcg_k)))
 
-    # -- Helper: convert results to score dicts for divergence ------
-    bm25_score_dicts = {
-        qid: {doc: s for doc, s in docs}
-        for qid, docs in bm25_results.items()
-    }
-    dense_score_dicts = {
-        qid: {doc: s for doc, s in docs}
-        for qid, docs in dense_results.items()
-    }
+    laplace_alpha = cfg_benchmark.get("smoothing", {}).get("laplace_alpha", 1)
+
+    # -- Pre-compute per-query metrics from word distributions ------
+    stemmer = SnowballStemmer(stemmer_lang)
+    query_metrics = {}  # qid -> {'ce': float, 'kld': float, 'jsd': float}
+    for qid, qtext in queries.items():
+        tokens = stem_and_tokenize(qtext, stemmer)
+        query_metrics[qid] = compute_query_metrics(
+            tokens, global_counts, total_corpus_tokens, laplace_alpha
+        )
 
     # Divergence-based weighted RRF for the remaining 6 methods.
+    # Each mode picks one of the three raw metrics: jsd, kld, or ce.
     divergence_modes = [
-        ("JSD (Linear)",               "jsd_linear"),
-        ("JSD (Sigmoid)",              "jsd_sigmoid"),
-        ("KLD (0-1 Norm)",             "kld_normalized"),
-        ("KLD (0-1 + Sigmoid)",        "kld_normalized_sigmoid"),
-        ("Cross-Entropy (0-1 Norm)",   "ce_normalized"),
-        ("Cross-Entropy (0-1 + Sigmoid)", "ce_normalized_sigmoid"),
+        ("JSD (Linear)",                  "jsd",  False, False),
+        ("JSD (Sigmoid)",                 "jsd",  False, True),
+        ("KLD (0-1 Norm)",                "kld",  True,  False),
+        ("KLD (0-1 + Sigmoid)",           "kld",  True,  True),
+        ("Cross-Entropy (0-1 Norm)",      "ce",   True,  False),
+        ("Cross-Entropy (0-1 + Sigmoid)", "ce",   True,  True),
     ]
 
-    for method_label, mode in divergence_modes:
-        # Phase 1: compute raw divergences per query
-        raw_pairs = []  # only for modes that need normalization
-        alpha_map = {}
-        for qid in qrels:
-            b = bm25_score_dicts.get(qid, {})
-            d = dense_score_dicts.get(qid, {})
-            result = compute_divergence_alpha(b, d, mode, sig_center, sig_slope)
-            if isinstance(result, tuple):
-                raw_pairs.append((qid, result[1]))
-            else:
-                alpha_map[qid] = result
+    for method_label, metric_key, needs_norm, needs_sigmoid in divergence_modes:
+        raw_pairs = [(qid, query_metrics[qid][metric_key]) for qid in qrels]
 
-        # Phase 2: normalise if necessary (KLD and CE modes)
-        if raw_pairs:
-            needs_sigmoid = mode.endswith("_sigmoid")
+        if needs_norm:
             alpha_map = normalize_divergence_alphas(
                 raw_pairs, needs_sigmoid, sig_center, sig_slope
             )
+        elif needs_sigmoid:
+            alpha_map = {
+                qid: sigmoid(val, sig_center, sig_slope)
+                for qid, val in raw_pairs
+            }
+        else:
+            # Linear (raw value used directly as alpha)
+            alpha_map = {qid: val for qid, val in raw_pairs}
 
         wrrf_fused = apply_wrrf_fusion(bm25_results, dense_results, alpha_map, k=rrf_k)
         ndcg = calculate_ndcg_at_k(wrrf_fused, qrels, ndcg_k)
@@ -543,8 +565,6 @@ def save_results_chart(scores, output_path, dataset_label, model_label):
 # 10. Top-level pipeline orchestration
 # ============================================================
 
-import json  # needed inside preprocess_corpus (already imported at top)
-
 
 def model_short_name(full_name):
     """Derive a filesystem-safe short name from a HuggingFace model path.
@@ -585,6 +605,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     corpus_emb_pt = os.path.join(ds_dir, "corpus_embeddings.pt")
     corpus_ids_pkl = os.path.join(ds_dir, "corpus_ids.pkl")
     bm25_results_pkl = os.path.join(ds_dir, "bm25_results.pkl")
+    word_freq_pkl = os.path.join(ds_dir, "word_freq_index.pkl")
     query_vectors_pt = os.path.join(ds_dir, "query_vectors.pt")
     query_ids_pkl = os.path.join(ds_dir, "query_ids.pkl")
     dense_results_pkl = os.path.join(ds_dir, "dense_results.pkl")
@@ -634,17 +655,25 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         preprocess_corpus(corpus_jsonl, tokenized_jsonl, stemmer_lang)
 
     # ----------------------------------------------------------
-    # Step 4 -- Build the BM25 index
+    # Step 4 -- Build the BM25 index and word frequency index
     # ----------------------------------------------------------
-    if file_exists(bm25_pkl) and file_exists(bm25_docids_pkl):
-        print("[Step 4/10] BM25 index already exists. Loading ...")
+    all_indices_cached = (
+        file_exists(bm25_pkl) and file_exists(bm25_docids_pkl)
+        and file_exists(word_freq_pkl)
+    )
+    if all_indices_cached:
+        print("[Step 4/10] BM25 & word-freq indices already exist. Loading ...")
         bm25 = load_pickle(bm25_pkl)
         bm25_doc_ids = load_pickle(bm25_docids_pkl)
+        global_counts, total_corpus_tokens = load_pickle(word_freq_pkl)
     else:
-        print("[Step 4/10] Building BM25 index ...")
-        bm25, bm25_doc_ids = build_bm25_index(tokenized_jsonl)
+        print("[Step 4/10] Building BM25 index & word frequency index ...")
+        bm25, bm25_doc_ids, global_counts, total_corpus_tokens = (
+            build_bm25_and_word_freq_index(tokenized_jsonl)
+        )
         save_pickle(bm25, bm25_pkl)
         save_pickle(bm25_doc_ids, bm25_docids_pkl)
+        save_pickle((global_counts, total_corpus_tokens), word_freq_pkl)
 
     # ----------------------------------------------------------
     # Step 5 -- Encode the corpus with the embedding model
@@ -719,8 +748,11 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     print("[Step 9/10] Evaluating fusion methods ...")
     if not qrels:
         qrels = load_qrels(qrels_tsv)
+    if not queries:
+        queries = load_queries(queries_jsonl)
     method_scores = evaluate_all_methods(
-        bm25_results, dense_results, qrels, cfg["benchmark"]
+        bm25_results, dense_results, qrels, cfg["benchmark"],
+        queries, stemmer_lang, global_counts, total_corpus_tokens,
     )
 
     # Print a quick summary table to stdout
@@ -810,6 +842,7 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
     corpus_emb_pt = os.path.join(ds_dir, "corpus_embeddings.pt")
     corpus_ids_pkl = os.path.join(ds_dir, "corpus_ids.pkl")
     bm25_results_pkl = os.path.join(ds_dir, "bm25_results.pkl")
+    word_freq_pkl = os.path.join(ds_dir, "word_freq_index.pkl")
     query_vectors_pt = os.path.join(ds_dir, "query_vectors.pt")
     query_ids_pkl = os.path.join(ds_dir, "query_ids.pkl")
     dense_results_pkl = os.path.join(ds_dir, "dense_results.pkl")
@@ -826,16 +859,24 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         print("[Step 3] Preprocessing corpus ...")
         preprocess_corpus(corpus_jsonl, tokenized_jsonl, stemmer_lang)
 
-    # BM25 index
-    if file_exists(bm25_pkl) and file_exists(bm25_docids_pkl):
-        print("[Step 4] BM25 index exists. Loading ...")
+    # BM25 index + word frequency index (single pass)
+    all_indices_cached = (
+        file_exists(bm25_pkl) and file_exists(bm25_docids_pkl)
+        and file_exists(word_freq_pkl)
+    )
+    if all_indices_cached:
+        print("[Step 4] BM25 & word-freq indices exist. Loading ...")
         bm25 = load_pickle(bm25_pkl)
         bm25_doc_ids = load_pickle(bm25_docids_pkl)
+        global_counts, total_corpus_tokens = load_pickle(word_freq_pkl)
     else:
-        print("[Step 4] Building BM25 index ...")
-        bm25, bm25_doc_ids = build_bm25_index(tokenized_jsonl)
+        print("[Step 4] Building BM25 index & word frequency index ...")
+        bm25, bm25_doc_ids, global_counts, total_corpus_tokens = (
+            build_bm25_and_word_freq_index(tokenized_jsonl)
+        )
         save_pickle(bm25, bm25_pkl)
         save_pickle(bm25_doc_ids, bm25_docids_pkl)
+        save_pickle((global_counts, total_corpus_tokens), word_freq_pkl)
 
     # Corpus embeddings
     if file_exists(corpus_emb_pt) and file_exists(corpus_ids_pkl):
@@ -890,7 +931,10 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
 
     # Evaluation
     print("[Step 9] Evaluating fusion methods ...")
-    method_scores = evaluate_all_methods(bm25_results, dense_results, qrels, cfg["benchmark"])
+    method_scores = evaluate_all_methods(
+        bm25_results, dense_results, qrels, cfg["benchmark"],
+        queries, stemmer_lang, global_counts, total_corpus_tokens,
+    )
 
     print(f"\n  {'Method':<32s} {'NDCG@10':>8s}")
     print(f"  {'-'*32} {'-'*8}")
