@@ -298,3 +298,58 @@ def write_qrels_tsv(qrels_dict, filepath):
         for q_id, doc_map in qrels_dict.items():
             for doc_id, score in doc_map.items():
                 writer.writerow([str(q_id), str(doc_id), int(score)])
+
+
+# ============================================================
+# Text processing helpers
+# ============================================================
+
+def model_short_name(full_name):
+    """Derive a filesystem-safe short name from a HuggingFace model path.
+
+    Examples:
+        'BAAI/bge-m3'                      -> 'bge-m3'
+        'sentence-transformers/all-MiniLM'  -> 'all-MiniLM'
+    """
+    return full_name.split("/")[-1]
+
+
+def stem_and_tokenize(text, stemmer):
+    """Lowercase, split on whitespace, and stem each token."""
+    return [stemmer.stem(w) for w in text.lower().split()]
+
+
+def stem_batch_worker(args):
+    """Multiprocessing worker: stem-tokenize a batch of documents.
+
+    Imports SnowballStemmer lazily so that worker processes do *not*
+    need to import heavyweight libraries (torch, sentence-transformers).
+    Returns a list of JSON-encoded strings ready to be written.
+    """
+    from nltk.stem.snowball import SnowballStemmer
+
+    batch_ids, batch_texts, stemmer_lang = args
+    stemmer = SnowballStemmer(stemmer_lang)
+    results = []
+    for doc_id, text in zip(batch_ids, batch_texts):
+        tokens = [stemmer.stem(w) for w in text.lower().split()]
+        results.append(json.dumps({"_id": doc_id, "tokens": tokens}))
+    return results
+
+
+# ============================================================
+# Results output
+# ============================================================
+
+def save_results_csv(scores, output_path):
+    """Write benchmark results as a CSV file.
+
+    *scores* is a list of ``(method_name, ndcg_score)`` tuples.
+    Any existing file at *output_path* is overwritten.
+    """
+    ensure_dir(os.path.dirname(output_path))
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Method", "NDCG@10"])
+        for method, ndcg in scores:
+            writer.writerow([method, f"{ndcg:.4f}"])

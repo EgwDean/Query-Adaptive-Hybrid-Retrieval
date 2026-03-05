@@ -16,9 +16,9 @@ listed in config.yaml:
   7. Tokenize queries for BM25
   8. Compute BM25 retrieval results
   9. Encode queries with the same sentence-transformer
- 10. Compute dense retrieval results
- 11. Run all fusion methods and evaluate NDCG@k
- 12. Save CSV results + bar chart to the results folder
+  10. Compute dense retrieval results
+  11. Run all fusion methods and evaluate NDCG@k
+  12. Save CSV results + bar chart to the results folder
 
 Intermediate artifacts (pickles, embeddings) are cached in
   data/results/<model_short_name>/<dataset_name>/
@@ -26,12 +26,14 @@ so re-running the script skips whatever is already on disk.
 """
 
 import argparse
-import csv
 import json
 import math
 import os
 import sys
 import time
+import logging
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend; works on headless servers
 import matplotlib.pyplot as plt
@@ -41,6 +43,17 @@ from nltk.stem.snowball import SnowballStemmer
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer, util as st_util
 from tqdm import tqdm
+
+# ── Silence noisy HF / tokenizer download bars that overlap own tqdm bars
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
+# ── Maximise CPU parallelism for PyTorch / NumPy ──
+_N_CORES = os.cpu_count() or 4
+torch.set_num_threads(_N_CORES)
+torch.set_num_interop_threads(1)   # sequential pipeline — inter-op unused
 
 # Make sure the project root is on sys.path so that
 # "from utils import ..." works regardless of CWD.
@@ -69,6 +82,10 @@ from src.utils import (
     write_corpus_jsonl,
     write_queries_jsonl,
     write_qrels_tsv,
+    model_short_name,
+    stem_and_tokenize,
+    stem_batch_worker,
+    save_results_csv,
 )
 
 
@@ -249,29 +266,48 @@ def calculate_ndcg_at_k(fused_results, qrels, top_k):
 # 3. Preprocessing (stemming / tokenization for BM25)
 # ============================================================
 
-def stem_and_tokenize(text, stemmer):
-    """Lowercase, split on whitespace, and stem each token."""
-    return [stemmer.stem(w) for w in text.lower().split()]
-
-
 def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
     """Read a raw corpus JSONL, stem-tokenize every document, and write
     a tokenized version to *output_jsonl*.
 
     Each output line is {"_id": ..., "tokens": [...]}.
+    Uses multiprocessing to parallelise stemming across CPU cores.
+
+    Futures are drained in FIFO order via a bounded deque so that:
+      - output document order matches the input (reproducible BM25 indices)
+      - memory stays bounded even for multi-million-document corpora
     """
-    stemmer = SnowballStemmer(stemmer_lang)
-    total = count_lines(corpus_jsonl)
     ensure_dir(os.path.dirname(output_jsonl))
+    n_workers = max(1, _N_CORES - 1)
+    max_pending = n_workers * 3          # bound in-flight futures
+    total_batches = math.ceil(count_lines(corpus_jsonl) / batch_size)
+
     with open(output_jsonl, "w", encoding="utf-8") as out:
-        for batch_ids, batch_texts in tqdm(
-            load_corpus_batch_generator(corpus_jsonl, batch_size),
-            total=math.ceil(total / batch_size),
-            desc="  Preprocessing corpus",
-        ):
-            for doc_id, text in zip(batch_ids, batch_texts):
-                tokens = stem_and_tokenize(text, stemmer)
-                out.write(json.dumps({"_id": doc_id, "tokens": tokens}) + "\n")
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            pending = deque()
+            pbar = tqdm(total=total_batches,
+                        desc="  Preprocessing corpus", dynamic_ncols=True)
+
+            for batch_ids, batch_texts in load_corpus_batch_generator(
+                corpus_jsonl, batch_size
+            ):
+                pending.append(
+                    pool.submit(stem_batch_worker,
+                                (batch_ids, batch_texts, stemmer_lang))
+                )
+                # Drain head of queue when buffer is full (FIFO order)
+                while len(pending) >= max_pending:
+                    for line in pending.popleft().result():
+                        out.write(line + "\n")
+                    pbar.update(1)
+
+            # Flush remaining futures
+            while pending:
+                for line in pending.popleft().result():
+                    out.write(line + "\n")
+                pbar.update(1)
+
+            pbar.close()
 
 
 # ============================================================
@@ -299,7 +335,8 @@ def build_bm25_and_word_freq_index(tokenized_corpus_jsonl):
     total_tokens = 0
     num_lines = count_lines(tokenized_corpus_jsonl)
     with open(tokenized_corpus_jsonl, "r", encoding="utf-8") as f:
-        for line in tqdm(f, total=num_lines, desc="  Loading tokenized corpus"):
+        for line in tqdm(f, total=num_lines, desc="  Loading tokenized corpus",
+                         dynamic_ncols=True):
             d = json.loads(line)
             doc_ids.append(d["_id"])
             tokens = d["tokens"]
@@ -322,7 +359,8 @@ def run_bm25_retrieval(bm25, doc_ids, queries, stemmer_lang, top_k):
     """Run BM25 queries and return {query_id: [(doc_id, score), ...]}."""
     stemmer = SnowballStemmer(stemmer_lang)
     results = {}
-    for qid, qtext in tqdm(queries.items(), desc="  BM25 retrieval"):
+    for qid, qtext in tqdm(queries.items(), desc="  BM25 retrieval",
+                            dynamic_ncols=True):
         tokens = stem_and_tokenize(qtext, stemmer)
         scores = bm25.get_scores(tokens)
         top_idx = np.argsort(scores)[::-1][:top_k]
@@ -344,6 +382,7 @@ def build_corpus_embeddings(corpus_jsonl, model, batch_size, device):
         load_corpus_batch_generator(corpus_jsonl, batch_size),
         total=math.ceil(total / batch_size),
         desc="  Encoding corpus",
+        dynamic_ncols=True,
     ):
         embs = model.encode(
             batch_texts,
@@ -365,7 +404,8 @@ def build_dense_query_vectors(queries, model, batch_size, device):
     qids = list(queries.keys())
     qtexts = [queries[q] for q in qids]
     all_embs = []
-    for i in tqdm(range(0, len(qtexts), batch_size), desc="  Encoding queries"):
+    for i in tqdm(range(0, len(qtexts), batch_size), desc="  Encoding queries",
+                  dynamic_ncols=True):
         batch = qtexts[i : i + batch_size]
         emb = model.encode(
             batch, convert_to_tensor=True, show_progress_bar=False, device=device
@@ -376,7 +416,7 @@ def build_dense_query_vectors(queries, model, batch_size, device):
 
 def run_dense_retrieval(
     query_vectors, query_ids, corpus_vectors, corpus_ids, top_k,
-    corpus_chunk_size,
+    corpus_chunk_size, query_chunk_size=100,
 ):
     """Cosine-similarity search over pre-computed embeddings.
 
@@ -385,11 +425,11 @@ def run_dense_retrieval(
     results = {}
     n_queries = len(query_ids)
     # Process queries in chunks to limit memory usage
-    qchunk = 256
     for q_start in tqdm(
-        range(0, n_queries, qchunk), desc="  Dense retrieval"
+        range(0, n_queries, query_chunk_size), desc="  Dense retrieval",
+        dynamic_ncols=True,
     ):
-        q_end = min(q_start + qchunk, n_queries)
+        q_end = min(q_start + query_chunk_size, n_queries)
         q_batch = query_vectors[q_start:q_end]
         hits = st_util.semantic_search(
             q_batch, corpus_vectors, top_k=top_k,
@@ -406,20 +446,6 @@ def run_dense_retrieval(
 # ============================================================
 # 8. Benchmark evaluation -- run all 9 methods
 # ============================================================
-
-# The 9 retrieval methods we evaluate:
-METHODS = [
-    "BM25 Only",
-    "Dense Only",
-    "Naive RRF",
-    "JSD (Linear)",
-    "JSD (Sigmoid)",
-    "KLD (0-1 Norm)",
-    "KLD (0-1 + Sigmoid)",
-    "Cross-Entropy (0-1 Norm)",
-    "Cross-Entropy (0-1 + Sigmoid)",
-]
-
 
 def evaluate_all_methods(
     bm25_results, dense_results, qrels, cfg_benchmark,
@@ -441,7 +467,6 @@ def evaluate_all_methods(
     total_corpus_tokens : int
         Total token occurrences in the corpus.
     """
-    top_k = cfg_benchmark["top_k"]
     ndcg_k = cfg_benchmark["ndcg_k"]
     rrf_k = cfg_benchmark["rrf"]["k"]
     sig_center = cfg_benchmark["sigmoid"]["center"]
@@ -516,20 +541,6 @@ def evaluate_all_methods(
 # 9. Results output (CSV + bar chart)
 # ============================================================
 
-def save_results_csv(scores, output_path):
-    """Write the benchmark results as a CSV file.
-
-    Any existing file at *output_path* is overwritten.
-    """
-    ensure_dir(os.path.dirname(output_path))
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Method", "NDCG@10"])
-        for method, ndcg in scores:
-            writer.writerow([method, f"{ndcg:.4f}"])
-    print(f"  Results saved to {output_path}")
-
-
 def save_results_chart(scores, output_path, dataset_label, model_label):
     """Draw a horizontal bar chart of NDCG@10 scores and save as PNG."""
     ensure_dir(os.path.dirname(output_path))
@@ -564,16 +575,6 @@ def save_results_chart(scores, output_path, dataset_label, model_label):
 # ============================================================
 # 10. Top-level pipeline orchestration
 # ============================================================
-
-
-def model_short_name(full_name):
-    """Derive a filesystem-safe short name from a HuggingFace model path.
-
-    Examples:
-        'BAAI/bge-m3'                      -> 'bge-m3'
-        'sentence-transformers/all-MiniLM'  -> 'all-MiniLM'
-    """
-    return full_name.split("/")[-1]
 
 
 def run_pipeline_for_dataset(dataset_name, cfg, model, device):
@@ -736,6 +737,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         dense_results = run_dense_retrieval(
             query_vectors, query_ids, corpus_embeddings, corpus_ids, top_k,
             dense_cfg["corpus_chunk_size"],
+            dense_cfg.get("query_chunk_size", 100),
         )
         save_pickle(dense_results, dense_results_pkl)
 
@@ -766,6 +768,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     # ----------------------------------------------------------
     print("\n[Step 10/10] Saving results ...")
     save_results_csv(method_scores, results_csv)
+    print(f"  Results saved to {results_csv}")
     save_results_chart(
         method_scores, results_png, dataset_name, short_model
     )
@@ -802,7 +805,8 @@ def run_pipeline_merged(datasets, cfg, model, device):
         print("\n[Merge] Merged files already exist. Skipping merge step.")
     else:
         initialize_output_files(corpus_jsonl, queries_jsonl, qrels_tsv)
-        for ds_name in tqdm(datasets, desc="  Downloading & merging"):
+        for ds_name in tqdm(datasets, desc="  Downloading & merging",
+                            dynamic_ncols=True):
             ds_path = download_beir_dataset(ds_name, datasets_folder)
             if ds_path is None:
                 continue
@@ -924,6 +928,7 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         dense_results = run_dense_retrieval(
             query_vectors, query_ids, corpus_embeddings, corpus_ids, top_k,
             dense_cfg["corpus_chunk_size"],
+            dense_cfg.get("query_chunk_size", 100),
         )
         save_pickle(dense_results, dense_results_pkl)
 
@@ -944,6 +949,7 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
     # Save outputs
     print("\n[Step 10] Saving results ...")
     save_results_csv(method_scores, results_csv)
+    print(f"  Results saved to {results_csv}")
     save_results_chart(method_scores, results_png, label, short_model)
     print(f"\n  Finished {label}.")
 
@@ -986,11 +992,17 @@ def main():
     print(f"Datasets ({len(datasets)}): {', '.join(datasets)}")
     print(f"Mode   : {'MERGE' if merge_mode else 'PER-DATASET'}")
 
-    # Load the sentence-transformer model once
+    # Load the sentence-transformer model once.
+    # HF download bars are suppressed (env var set above) to prevent
+    # overlapping with our own progress indicators.
     print("\nLoading embedding model ...")
     start = time.time()
     model = SentenceTransformer(model_name, device=device)
-    print(f"  Model loaded in {time.time() - start:.1f}s\n")
+    elapsed = time.time() - start
+    print(f"  Model loaded in {elapsed:.1f}s")
+    print(f"  CPU threads (torch)     : {torch.get_num_threads()}")
+    print(f"  CPU inter-op threads    : {torch.get_num_interop_threads()}")
+    print(f"  Workers (preprocessing) : {max(1, _N_CORES - 1)}\n")
 
     if merge_mode:
         run_pipeline_merged(datasets, cfg, model, device)

@@ -1,2 +1,3 @@
-Run the BGE-M3 model in a few docs
+Study/modify the math
+Run BGE-M3 on nfcorpus
 Ready the repo for the benchmarking
