@@ -1,5 +1,0 @@
-Review the code
-Update the requirements.txt
-Update the README.md
-Run BGE-M3 on nfcorpus
-Ready the repo for the benchmarking

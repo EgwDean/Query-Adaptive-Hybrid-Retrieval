@@ -15,6 +15,10 @@ import csv
 import json
 import pickle
 import yaml
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 # ============================================================
@@ -319,20 +323,33 @@ def stem_and_tokenize(text, stemmer):
     return [stemmer.stem(w) for w in text.lower().split()]
 
 
-def stem_batch_worker(args):
-    """Multiprocessing worker: stem-tokenize a batch of documents.
+# Module-level stemmer used by each worker process (set via _init_worker).
+_worker_stemmer = None
 
-    Imports SnowballStemmer lazily so that worker processes do *not*
-    need to import heavyweight libraries (torch, sentence-transformers).
-    Returns a list of JSON-encoded strings ready to be written.
+
+def _init_worker(stemmer_lang):
+    """ProcessPoolExecutor initializer: construct one SnowballStemmer per
+    worker process so it is reused across all batches assigned to that
+    worker instead of being recreated on every call.
     """
     from nltk.stem.snowball import SnowballStemmer
 
-    batch_ids, batch_texts, stemmer_lang = args
-    stemmer = SnowballStemmer(stemmer_lang)
+    global _worker_stemmer
+    _worker_stemmer = SnowballStemmer(stemmer_lang)
+
+
+def stem_batch_worker(args):
+    """Multiprocessing worker: stem-tokenize a batch of documents.
+
+    Relies on *_worker_stemmer* being initialised by _init_worker so
+    the stemmer object is shared across all calls within the same
+    worker process.
+    Returns a list of JSON-encoded strings ready to be written.
+    """
+    batch_ids, batch_texts = args
     results = []
     for doc_id, text in zip(batch_ids, batch_texts):
-        tokens = [stemmer.stem(w) for w in text.lower().split()]
+        tokens = [_worker_stemmer.stem(w) for w in text.lower().split()]
         results.append(json.dumps({"_id": doc_id, "tokens": tokens}))
     return results
 
@@ -353,3 +370,51 @@ def save_results_csv(scores, output_path):
         writer.writerow(["Method", "NDCG@10"])
         for method, ndcg in scores:
             writer.writerow([method, f"{ndcg:.4f}"])
+
+
+def save_results_chart(scores, output_path, dataset_label, model_label):
+    """Draw a horizontal bar chart of NDCG@10 scores and save as PNG."""
+    ensure_dir(os.path.dirname(output_path))
+    methods = [m for m, _ in scores]
+    values = [v for _, v in scores]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    y_pos = np.arange(len(methods))
+    bars = ax.barh(y_pos, values, color="#4a90d9")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(methods)
+    ax.invert_yaxis()
+    ax.set_xlabel("NDCG@10")
+    ax.set_title(f"Retrieval Benchmark -- {dataset_label} ({model_label})")
+    ax.set_xlim(0, max(values) * 1.15 if values else 1.0)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + 0.002,
+            bar.get_y() + bar.get_height() / 2,
+            f"{val:.4f}",
+            va="center",
+            fontsize=9,
+        )
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"  Chart saved to {output_path}")
+
+
+def save_timing_csv(timings, output_path):
+    """Write per-step timing data as a CSV file.
+
+    *timings* is a list of ``(step_label, seconds)`` tuples.
+    A final row with the total elapsed time is appended automatically.
+    Any existing file at *output_path* is overwritten.
+    """
+    ensure_dir(os.path.dirname(output_path))
+    total = sum(t for _, t in timings)
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Step", "Time (s)"])
+        for label, secs in timings:
+            writer.writerow([label, f"{secs:.2f}"])
+        writer.writerow(["Total", f"{total:.2f}"])

@@ -8,21 +8,22 @@ Usage:
 The pipeline performs the following steps for every dataset
 listed in config.yaml:
   1. Download / verify the BEIR dataset
-  2. (Optional) Merge multiple datasets into one combined corpus
+  2. Load dataset and write local copies of corpus / queries / qrels
   3. Preprocess (stem & tokenize) the corpus for BM25
-  4. Build a word-frequency index (term -> doc_ids)
-  5. Build the BM25 index (rank_bm25.BM25Okapi)
-  6. Encode the corpus with a sentence-transformer model
-  7. Tokenize queries for BM25
-  8. Compute BM25 retrieval results
-  9. Encode queries with the same sentence-transformer
-  10. Compute dense retrieval results
-  11. Run all fusion methods and evaluate NDCG@k
-  12. Save CSV results + bar chart to the results folder
+  4. Build the BM25 index and word-frequency index (single pass)
+  5. Encode the corpus with a sentence-transformer model
+  6. Run BM25 retrieval for all queries
+  7. Encode queries with the same sentence-transformer
+  8. Run dense retrieval for all queries
+  9. Evaluate all fusion methods (BM25-only, Dense-only, RRF, 6×WRRF)
+  10. Save CSV results and bar chart to the output folder
 
 Intermediate artifacts (pickles, embeddings) are cached in
   data/results/<model_short_name>/<dataset_name>/
-so re-running the script skips whatever is already on disk.
+so re-running the script skips completed steps automatically.
+
+A separate --merge mode concatenates multiple BEIR datasets into a
+single combined corpus and runs the same pipeline on the merged data.
 """
 
 import argparse
@@ -34,9 +35,6 @@ import time
 import logging
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend; works on headless servers
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from nltk.stem.snowball import SnowballStemmer
@@ -85,7 +83,10 @@ from src.utils import (
     model_short_name,
     stem_and_tokenize,
     stem_batch_worker,
+    _init_worker,
     save_results_csv,
+    save_results_chart,
+    save_timing_csv,
 )
 
 
@@ -99,7 +100,7 @@ def sigmoid(x, center, slope):
 
 
 def compute_query_metrics(query_tokens, global_counts, total_corpus_tokens,
-                         laplace_alpha=1):
+                         laplace_alpha):
     """Compute CE, KLD and JSD between a query's word distribution and
     the global corpus word distribution.
 
@@ -283,7 +284,11 @@ def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
     total_batches = math.ceil(count_lines(corpus_jsonl) / batch_size)
 
     with open(output_jsonl, "w", encoding="utf-8") as out:
-        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker,
+            initargs=(stemmer_lang,),
+        ) as pool:
             pending = deque()
             pbar = tqdm(total=total_batches,
                         desc="  Preprocessing corpus", dynamic_ncols=True)
@@ -292,8 +297,7 @@ def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
                 corpus_jsonl, batch_size
             ):
                 pending.append(
-                    pool.submit(stem_batch_worker,
-                                (batch_ids, batch_texts, stemmer_lang))
+                    pool.submit(stem_batch_worker, (batch_ids, batch_texts))
                 )
                 # Drain head of queue when buffer is full (FIFO order)
                 while len(pending) >= max_pending:
@@ -363,7 +367,9 @@ def run_bm25_retrieval(bm25, doc_ids, queries, stemmer_lang, top_k):
                             dynamic_ncols=True):
         tokens = stem_and_tokenize(qtext, stemmer)
         scores = bm25.get_scores(tokens)
-        top_idx = np.argsort(scores)[::-1][:top_k]
+        k = min(top_k, len(scores))
+        top_idx = np.argpartition(scores, -k)[-k:]
+        top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
         results[qid] = [(doc_ids[i], float(scores[i])) for i in top_idx]
     return results
 
@@ -416,11 +422,16 @@ def build_dense_query_vectors(queries, model, batch_size, device):
 
 def run_dense_retrieval(
     query_vectors, query_ids, corpus_vectors, corpus_ids, top_k,
-    corpus_chunk_size, query_chunk_size=100,
+    corpus_chunk_size, device, query_chunk_size=100,
 ):
     """Cosine-similarity search over pre-computed embeddings.
 
-    Returns {query_id: [(doc_id, score), ...]}.
+    Query chunks are moved to *device* before calling semantic_search so
+    that the dot-product runs on the GPU when one is available.  The
+    corpus tensor stays on CPU; sentence-transformers transfers corpus
+    chunks to the same device as the query internally.
+
+    Returns {query_id: [(doc_id, score), :]}.
     """
     results = {}
     n_queries = len(query_ids)
@@ -430,7 +441,7 @@ def run_dense_retrieval(
         dynamic_ncols=True,
     ):
         q_end = min(q_start + query_chunk_size, n_queries)
-        q_batch = query_vectors[q_start:q_end]
+        q_batch = query_vectors[q_start:q_end].to(device)
         hits = st_util.semantic_search(
             q_batch, corpus_vectors, top_k=top_k,
             corpus_chunk_size=corpus_chunk_size,
@@ -538,42 +549,7 @@ def evaluate_all_methods(
 
 
 # ============================================================
-# 9. Results output (CSV + bar chart)
-# ============================================================
-
-def save_results_chart(scores, output_path, dataset_label, model_label):
-    """Draw a horizontal bar chart of NDCG@10 scores and save as PNG."""
-    ensure_dir(os.path.dirname(output_path))
-    methods = [m for m, _ in scores]
-    values = [v for _, v in scores]
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    y_pos = np.arange(len(methods))
-    bars = ax.barh(y_pos, values, color="#4a90d9")
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(methods)
-    ax.invert_yaxis()
-    ax.set_xlabel("NDCG@10")
-    ax.set_title(f"Retrieval Benchmark -- {dataset_label} ({model_label})")
-    ax.set_xlim(0, max(values) * 1.15 if values else 1.0)
-
-    for bar, val in zip(bars, values):
-        ax.text(
-            bar.get_width() + 0.002,
-            bar.get_y() + bar.get_height() / 2,
-            f"{val:.4f}",
-            va="center",
-            fontsize=9,
-        )
-
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
-    print(f"  Chart saved to {output_path}")
-
-
-# ============================================================
-# 10. Top-level pipeline orchestration
+# 9. Top-level pipeline orchestration
 # ============================================================
 
 
@@ -618,11 +594,16 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     print(f"  Output : {ds_dir}")
     print(f"{'=' * 60}")
 
+    timings = []           # (step_label, elapsed_seconds)
+    timing_csv = os.path.join(ds_dir, "timing.csv")
+
     # ----------------------------------------------------------
     # Step 1 -- Download the BEIR dataset
     # ----------------------------------------------------------
     print("\n[Step 1/10] Downloading / verifying dataset ...")
+    t0 = time.time()
     dataset_path = download_beir_dataset(dataset_name, datasets_folder)
+    timings.append(("Step 1: Download / verify dataset", time.time() - t0))
     if dataset_path is None:
         print("  SKIPPED (download failed). Aborting this dataset.")
         return
@@ -630,6 +611,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     # ----------------------------------------------------------
     # Step 2 -- Load dataset and write local copies of corpus / queries / qrels
     # ----------------------------------------------------------
+    t0 = time.time()
     if file_exists(corpus_jsonl) and file_exists(queries_jsonl) and file_exists(qrels_tsv):
         print("[Step 2/10] Corpus / queries / qrels already cached. Loading ...")
         queries = load_queries(queries_jsonl)
@@ -645,19 +627,23 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         write_queries_jsonl(queries, queries_jsonl)
         write_qrels_tsv(qrels, qrels_tsv)
         del corpus  # free memory
+    timings.append(("Step 2: Load / write corpus, queries, qrels", time.time() - t0))
 
     # ----------------------------------------------------------
     # Step 3 -- Preprocess (stem + tokenize) the corpus for BM25
     # ----------------------------------------------------------
+    t0 = time.time()
     if file_exists(tokenized_jsonl):
         print("[Step 3/10] Tokenized corpus already exists. Skipping.")
     else:
         print("[Step 3/10] Preprocessing corpus (stemming + tokenization) ...")
         preprocess_corpus(corpus_jsonl, tokenized_jsonl, stemmer_lang)
+    timings.append(("Step 3: Preprocessing (stem + tokenize)", time.time() - t0))
 
     # ----------------------------------------------------------
     # Step 4 -- Build the BM25 index and word frequency index
     # ----------------------------------------------------------
+    t0 = time.time()
     all_indices_cached = (
         file_exists(bm25_pkl) and file_exists(bm25_docids_pkl)
         and file_exists(word_freq_pkl)
@@ -675,10 +661,12 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         save_pickle(bm25, bm25_pkl)
         save_pickle(bm25_doc_ids, bm25_docids_pkl)
         save_pickle((global_counts, total_corpus_tokens), word_freq_pkl)
+    timings.append(("Step 4: BM25 + word-freq index", time.time() - t0))
 
     # ----------------------------------------------------------
     # Step 5 -- Encode the corpus with the embedding model
     # ----------------------------------------------------------
+    t0 = time.time()
     if file_exists(corpus_emb_pt) and file_exists(corpus_ids_pkl):
         print("[Step 5/10] Corpus embeddings already exist. Loading ...")
         corpus_embeddings = torch.load(corpus_emb_pt, weights_only=True)
@@ -690,10 +678,12 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         )
         torch.save(corpus_embeddings, corpus_emb_pt)
         save_pickle(corpus_ids, corpus_ids_pkl)
+    timings.append(("Step 5: Corpus embeddings", time.time() - t0))
 
     # ----------------------------------------------------------
     # Step 6 -- BM25 retrieval
     # ----------------------------------------------------------
+    t0 = time.time()
     if file_exists(bm25_results_pkl):
         print("[Step 6/10] BM25 results already exist. Loading ...")
         bm25_results = load_pickle(bm25_results_pkl)
@@ -705,6 +695,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
             bm25, bm25_doc_ids, queries, stemmer_lang, top_k
         )
         save_pickle(bm25_results, bm25_results_pkl)
+    timings.append(("Step 6: BM25 retrieval", time.time() - t0))
 
     # Free the BM25 index -- it is no longer needed
     del bm25, bm25_doc_ids
@@ -712,6 +703,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     # ----------------------------------------------------------
     # Step 7 -- Encode queries with the embedding model
     # ----------------------------------------------------------
+    t0 = time.time()
     if file_exists(query_vectors_pt) and file_exists(query_ids_pkl):
         print("[Step 7/10] Query vectors already exist. Loading ...")
         query_vectors = torch.load(query_vectors_pt, weights_only=True)
@@ -725,10 +717,12 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         )
         torch.save(query_vectors, query_vectors_pt)
         save_pickle(query_ids, query_ids_pkl)
+    timings.append(("Step 7: Query embeddings", time.time() - t0))
 
     # ----------------------------------------------------------
     # Step 8 -- Dense retrieval
     # ----------------------------------------------------------
+    t0 = time.time()
     if file_exists(dense_results_pkl):
         print("[Step 8/10] Dense results already exist. Loading ...")
         dense_results = load_pickle(dense_results_pkl)
@@ -737,9 +731,11 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         dense_results = run_dense_retrieval(
             query_vectors, query_ids, corpus_embeddings, corpus_ids, top_k,
             dense_cfg["corpus_chunk_size"],
-            dense_cfg.get("query_chunk_size", 100),
+            device=device,
+            query_chunk_size=dense_cfg.get("query_chunk_size", 100),
         )
         save_pickle(dense_results, dense_results_pkl)
+    timings.append(("Step 8: Dense retrieval", time.time() - t0))
 
     # Free embeddings
     del corpus_embeddings, query_vectors
@@ -748,6 +744,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
     # Step 9 -- Evaluate all fusion methods
     # ----------------------------------------------------------
     print("[Step 9/10] Evaluating fusion methods ...")
+    t0 = time.time()
     if not qrels:
         qrels = load_qrels(qrels_tsv)
     if not queries:
@@ -756,6 +753,7 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         bm25_results, dense_results, qrels, cfg["benchmark"],
         queries, stemmer_lang, global_counts, total_corpus_tokens,
     )
+    timings.append(("Step 9: Evaluation (all fusion methods)", time.time() - t0))
 
     # Print a quick summary table to stdout
     print(f"\n  {'Method':<32s} {'NDCG@10':>8s}")
@@ -764,14 +762,29 @@ def run_pipeline_for_dataset(dataset_name, cfg, model, device):
         print(f"  {method:<32s} {ndcg:>8.4f}")
 
     # ----------------------------------------------------------
-    # Step 10 -- Save results (CSV + chart)
+    # Step 10 -- Save results (CSV + chart + timing)
     # ----------------------------------------------------------
     print("\n[Step 10/10] Saving results ...")
+    t0 = time.time()
     save_results_csv(method_scores, results_csv)
     print(f"  Results saved to {results_csv}")
     save_results_chart(
         method_scores, results_png, dataset_name, short_model
     )
+    timings.append(("Step 10: Save results", time.time() - t0))
+
+    # Write timing stats
+    save_timing_csv(timings, timing_csv)
+    print(f"  Timing saved to {timing_csv}")
+
+    # Print timing summary
+    print(f"\n  {'Step':<45s} {'Time (s)':>10s}")
+    print(f"  {'-'*45} {'-'*10}")
+    for label, secs in timings:
+        print(f"  {label:<45s} {secs:>10.2f}")
+    total_time = sum(t for _, t in timings)
+    print(f"  {'-'*45} {'-'*10}")
+    print(f"  {'Total':<45s} {total_time:>10.2f}")
 
     print(f"\n  Finished {dataset_name}.")
 
@@ -853,17 +866,23 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
     results_csv = os.path.join(ds_dir, "results.csv")
     results_png = os.path.join(ds_dir, "results.png")
 
+    timings = []           # (step_label, elapsed_seconds)
+    timing_csv = os.path.join(ds_dir, "timing.csv")
+
     queries = load_queries(queries_jsonl)
     qrels = load_qrels(qrels_tsv)
 
     # Preprocessing
+    t0 = time.time()
     if file_exists(tokenized_jsonl):
         print("[Step 3] Tokenized corpus exists. Skipping.")
     else:
         print("[Step 3] Preprocessing corpus ...")
         preprocess_corpus(corpus_jsonl, tokenized_jsonl, stemmer_lang)
+    timings.append(("Step 3: Preprocessing (stem + tokenize)", time.time() - t0))
 
     # BM25 index + word frequency index (single pass)
+    t0 = time.time()
     all_indices_cached = (
         file_exists(bm25_pkl) and file_exists(bm25_docids_pkl)
         and file_exists(word_freq_pkl)
@@ -881,8 +900,10 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         save_pickle(bm25, bm25_pkl)
         save_pickle(bm25_doc_ids, bm25_docids_pkl)
         save_pickle((global_counts, total_corpus_tokens), word_freq_pkl)
+    timings.append(("Step 4: BM25 + word-freq index", time.time() - t0))
 
     # Corpus embeddings
+    t0 = time.time()
     if file_exists(corpus_emb_pt) and file_exists(corpus_ids_pkl):
         print("[Step 5] Corpus embeddings exist. Loading ...")
         corpus_embeddings = torch.load(corpus_emb_pt, weights_only=True)
@@ -894,8 +915,10 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         )
         torch.save(corpus_embeddings, corpus_emb_pt)
         save_pickle(corpus_ids, corpus_ids_pkl)
+    timings.append(("Step 5: Corpus embeddings", time.time() - t0))
 
     # BM25 retrieval
+    t0 = time.time()
     if file_exists(bm25_results_pkl):
         print("[Step 6] BM25 results exist. Loading ...")
         bm25_results = load_pickle(bm25_results_pkl)
@@ -903,10 +926,12 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         print("[Step 6] Running BM25 retrieval ...")
         bm25_results = run_bm25_retrieval(bm25, bm25_doc_ids, queries, stemmer_lang, top_k)
         save_pickle(bm25_results, bm25_results_pkl)
+    timings.append(("Step 6: BM25 retrieval", time.time() - t0))
 
     del bm25, bm25_doc_ids
 
     # Query embeddings
+    t0 = time.time()
     if file_exists(query_vectors_pt) and file_exists(query_ids_pkl):
         print("[Step 7] Query vectors exist. Loading ...")
         query_vectors = torch.load(query_vectors_pt, weights_only=True)
@@ -918,8 +943,10 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         )
         torch.save(query_vectors, query_vectors_pt)
         save_pickle(query_ids, query_ids_pkl)
+    timings.append(("Step 7: Query embeddings", time.time() - t0))
 
     # Dense retrieval
+    t0 = time.time()
     if file_exists(dense_results_pkl):
         print("[Step 8] Dense results exist. Loading ...")
         dense_results = load_pickle(dense_results_pkl)
@@ -928,18 +955,22 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
         dense_results = run_dense_retrieval(
             query_vectors, query_ids, corpus_embeddings, corpus_ids, top_k,
             dense_cfg["corpus_chunk_size"],
-            dense_cfg.get("query_chunk_size", 100),
+            device=device,
+            query_chunk_size=dense_cfg.get("query_chunk_size", 100),
         )
         save_pickle(dense_results, dense_results_pkl)
+    timings.append(("Step 8: Dense retrieval", time.time() - t0))
 
     del corpus_embeddings, query_vectors
 
     # Evaluation
     print("[Step 9] Evaluating fusion methods ...")
+    t0 = time.time()
     method_scores = evaluate_all_methods(
         bm25_results, dense_results, qrels, cfg["benchmark"],
         queries, stemmer_lang, global_counts, total_corpus_tokens,
     )
+    timings.append(("Step 9: Evaluation (all fusion methods)", time.time() - t0))
 
     print(f"\n  {'Method':<32s} {'NDCG@10':>8s}")
     print(f"  {'-'*32} {'-'*8}")
@@ -948,9 +979,25 @@ def _run_benchmark_steps(ds_dir, cfg, model, device, label="dataset"):
 
     # Save outputs
     print("\n[Step 10] Saving results ...")
+    t0 = time.time()
     save_results_csv(method_scores, results_csv)
     print(f"  Results saved to {results_csv}")
     save_results_chart(method_scores, results_png, label, short_model)
+    timings.append(("Step 10: Save results", time.time() - t0))
+
+    # Write timing stats
+    save_timing_csv(timings, timing_csv)
+    print(f"  Timing saved to {timing_csv}")
+
+    # Print timing summary
+    print(f"\n  {'Step':<45s} {'Time (s)':>10s}")
+    print(f"  {'-'*45} {'-'*10}")
+    for label_t, secs in timings:
+        print(f"  {label_t:<45s} {secs:>10.2f}")
+    total_time = sum(t for _, t in timings)
+    print(f"  {'-'*45} {'-'*10}")
+    print(f"  {'Total':<45s} {total_time:>10.2f}")
+
     print(f"\n  Finished {label}.")
 
 

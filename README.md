@@ -31,11 +31,24 @@ src/
 data/
     datasets/           # BEIR datasets (auto-downloaded)
     results/            # generated per model + dataset
-        bge-m3/
-            scifact/
-                results.csv
-                results.png
-                ...           # cached intermediate artifacts
+        <model>/
+            <dataset>/
+                results.csv           # NDCG@10 scores for all 9 methods
+                results.png           # bar chart of the scores
+                timing.csv            # per-step wall-clock times
+                corpus.jsonl          # local copy of the corpus
+                queries.jsonl         # local copy of queries
+                qrels.tsv             # relevance judgments
+                tokenized_corpus.jsonl
+                bm25_index.pkl
+                bm25_doc_ids.pkl
+                word_freq_index.pkl
+                corpus_embeddings.pt
+                corpus_ids.pkl
+                bm25_results.pkl
+                query_vectors.pt
+                query_ids.pkl
+                dense_results.pkl
 ```
 
 ---
@@ -52,7 +65,6 @@ data/
 | `sentence-transformers` | Dense embedding models |
 | `torch` | Tensor operations, GPU acceleration |
 | `numpy` | Numerical computations |
-| `scipy` | Softmax (used internally) |
 | `matplotlib` | Bar-chart output |
 
 Python **3.10+** is required.  A CUDA-capable GPU is strongly recommended for the dense encoding steps.
@@ -96,7 +108,24 @@ datasets:
 # The embedding model to use
 embeddings:
   model_name: "BAAI/bge-m3"
-  # model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  batch_size: 32
+
+# Dense search chunking
+dense_search:
+  query_chunk_size: 100
+  corpus_chunk_size: 50000
+
+# Benchmark parameters
+benchmark:
+  top_k: 100
+  ndcg_k: 10
+  rrf:
+    k: 60                # RRF damping constant
+  sigmoid:
+    center: 0.5          # sigmoid center for WRRF alpha
+    slope: 10            # sigmoid slope for WRRF alpha
+  smoothing:
+    laplace_alpha: 1     # Laplace smoothing for corpus distribution
 ```
 
 See the comments inside config.yaml for the full list of BEIR datasets and their sizes.
@@ -119,10 +148,11 @@ python src/pipeline.py --config my_config.yaml
 
 1. Each dataset listed in config.yaml is downloaded (if not already present).
 2. The corpus is preprocessed (stemmed and tokenized for BM25).
-3. A BM25 index is built; the corpus is encoded with the dense model.
-4. BM25 and dense retrievals are performed.
-5. All 9 fusion methods are evaluated and scored with NDCG@10.
-6. A CSV table and a bar chart are saved to `data/results/<model>/<dataset>/`.
+3. A BM25 index and a corpus-wide word-frequency index are built in a single pass.
+4. The corpus is encoded with the sentence-transformer model.
+5. BM25 and dense retrievals are performed.
+6. All 9 fusion methods are evaluated and scored with NDCG@10.
+7. A CSV table, a bar chart, and a timing CSV are saved to `data/results/<model>/<dataset>/`.
 
 Every intermediate artifact (index, embeddings, retrieval results) is cached on disk.  If you re-run the pipeline, completed steps are detected and skipped automatically.
 
@@ -136,6 +166,9 @@ Mode   : PER-DATASET
 
 Loading embedding model ...
   Model loaded in 4.2s
+  CPU threads (torch)     : 12
+  CPU inter-op threads    : 1
+  Workers (preprocessing) : 11
 
 ============================================================
   Dataset: scifact
@@ -147,7 +180,7 @@ Loading embedding model ...
   Split: test | Corpus: 5,084 | Queries: 300
 [Step 3/10] Preprocessing corpus (stemming + tokenization) ...
   Preprocessing corpus: 100%|████████████| 10/10 [00:00<00:00]
-[Step 4/10] Building BM25 index ...
+[Step 4/10] Building BM25 index & word frequency index ...
 [Step 5/10] Encoding corpus with embedding model ...
   Encoding corpus: 100%|████████████| 80/80 [00:12<00:00]
 [Step 6/10] Running BM25 retrieval ...
@@ -170,6 +203,22 @@ Loading embedding model ...
 [Step 10/10] Saving results ...
   Results saved to data/results/bge-m3/scifact/results.csv
   Chart saved to data/results/bge-m3/scifact/results.png
+  Timing saved to data/results/bge-m3/scifact/timing.csv
+
+  Step                                          Time (s)
+  --------------------------------------------- ----------
+  Step 1: Download / verify dataset                  0.01
+  Step 2: Load / write corpus, queries, qrels        1.23
+  Step 3: Preprocessing (stem + tokenize)            0.45
+  Step 4: BM25 + word-freq index                     0.82
+  Step 5: Corpus embeddings                         12.34
+  Step 6: BM25 retrieval                             0.67
+  Step 7: Query embeddings                           0.31
+  Step 8: Dense retrieval                            0.18
+  Step 9: Evaluation (all fusion methods)            0.05
+  Step 10: Save results                              0.15
+  --------------------------------------------- ----------
+  Total                                             16.21
 
   Finished scifact.
 
@@ -178,7 +227,19 @@ Loading embedding model ...
 ============================================================
 ```
 
-*(The NDCG values above are illustrative.)*
+*(The NDCG values and timings above are illustrative.)*
+
+---
+
+## Output files
+
+Each run produces three result files in `data/results/<model>/<dataset>/`:
+
+| File | Contents |
+|------|----------|
+| `results.csv` | NDCG@10 score for each of the 9 retrieval methods |
+| `results.png` | Horizontal bar chart of the scores |
+| `timing.csv` | Wall-clock time (seconds) for each pipeline step, plus total |
 
 ---
 
@@ -194,10 +255,6 @@ Loading embedding model ...
 | nq | 2.7M docs | ~20 GB | ~6 GB |
 | msmarco | 8.8M docs | ~50 GB | ~8 GB |
 
-Estimates assume BAAI/bge-m3.  Using `all-MiniLM-L6-v2` uses roughly 3x less VRAM and RAM for embeddings.
+Estimates assume BAAI/bge-m3.  Using `all-MiniLM-L6-v2` uses roughly 3× less VRAM and RAM for embeddings.
 
 ---
-
-## License
-
-See LICENSE file.

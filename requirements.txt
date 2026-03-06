@@ -17,10 +17,6 @@ torch
 
 # Scientific computing
 numpy
-scipy
 
 # Visualization
 matplotlib
-ipykernel
-ipywidgets
-nbconvert

@@ -19,13 +19,11 @@
 #          and results are saved under  results/<model>/merged/
 # false -> each uncommented dataset is processed independently
 #          and results are saved under  results/<model>/<dataset>/
-#          (this is the recommended mode for benchmarking)
 merge: false
 
 # ------------------------------------------------------------
 # Datasets
 # ------------------------------------------------------------
-# Uncomment the datasets you want to use.
 # Stats: (test queries | corpus docs | avg relevant docs per query)
 #
 # -- Small (fast) ------------------------------------------------
@@ -49,8 +47,8 @@ merge: false
 #   msmarco           6 980 queries |    8.84M docs |  1.1 avg  (split: dev)
 # -----------------------------------------------------------------
 datasets:
-  - scifact
-  #- nfcorpus
+  #- scifact
+  - nfcorpus
   #- arguana
   #- fiqa
   #- scidocs
@@ -85,6 +83,7 @@ preprocessing:
 embeddings:
   model_name: "BAAI/bge-m3"
   # model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  # model_name: "text-embedding-3-small"
   batch_size: 32   # 32 is safe for CPU + large models; increase to 64-128 on GPU
 
 # ------------------------------------------------------------
@@ -100,13 +99,10 @@ dense_search:
 benchmark:
   top_k: 100
   ndcg_k: 10
-
   rrf:
-    k: 60
-
+    k: 60               # RRF damping constant (Cormack et al. 2009)
   sigmoid:
-    center: 0.5
-    slope: 10
-
+    center: 0.5          # center of the sigmoid for WRRF alpha mapping
+    slope: 10            # slope  of the sigmoid for WRRF alpha mapping
   smoothing:
-    laplace_alpha: 1
+    laplace_alpha: 1     # Laplace smoothing for corpus word distribution
