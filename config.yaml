@@ -83,8 +83,7 @@ preprocessing:
 embeddings:
   model_name: "BAAI/bge-m3"
   # model_name: "sentence-transformers/all-MiniLM-L6-v2"
-  # model_name: "text-embedding-3-small"
-  batch_size: 32   # 32 is safe for CPU + large models; increase to 64-128 on GPU
+  batch_size: 64   # 32 is safe for CPU + large models; increase to 64-128 on GPU
 
 # ------------------------------------------------------------
 # Dense search
