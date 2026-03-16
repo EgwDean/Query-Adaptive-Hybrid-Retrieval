@@ -17,6 +17,8 @@ import os
 import statistics
 from collections import Counter, defaultdict
 
+import yaml
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -55,6 +57,19 @@ def to_int(value, col_name):
         return int(float(value))
     except Exception as exc:
         raise ValueError(f"Could not parse '{value}' as int in column '{col_name}'.") from exc
+
+
+def load_config(config_path):
+    """Load YAML config used by the retrieval pipeline."""
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def model_short_name(full_name):
+    """Convert model path to filesystem folder name."""
+    return (full_name or "").split("/")[-1]
 
 
 def get_acronym(dataset_name):
@@ -260,13 +275,28 @@ def main():
         description="Analyze best dynamic params and produce zero-shot consensus + plots."
     )
     parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to YAML config file (default: config.yaml)",
+    )
+    parser.add_argument(
         "--model-name",
-        default="bge-m3",
-        help="Model folder name under data/results (default: bge-m3)",
+        default=None,
+        help="Optional model folder override under data/results. If omitted, uses config embeddings.model_name.",
     )
     args = parser.parse_args()
 
-    base_dir = os.path.join("data", "results", args.model_name)
+    cfg = load_config(args.config)
+    cfg_model_name = cfg.get("embeddings", {}).get("model_name")
+    if not cfg_model_name and args.model_name is None:
+        raise ValueError(
+            "Missing embeddings.model_name in config and no --model-name override was provided."
+        )
+
+    selected_model = args.model_name or model_short_name(cfg_model_name)
+    results_root = cfg.get("paths", {}).get("results_folder", "data/results")
+
+    base_dir = os.path.join(results_root, selected_model)
     csv_path = os.path.join(base_dir, "best_dynamic_params.csv")
     plot_path = os.path.join(base_dir, "parameter_distributions.png")
 
@@ -275,8 +305,9 @@ def main():
     save_distribution_plot(rows, plot_path)
 
     print(f"Loaded rows: {len(rows)}")
+    print(f"Selected model: {selected_model}")
     print(f"Saved plot : {plot_path}")
-    print_yaml_summary(args.model_name, consensus, rows)
+    print_yaml_summary(selected_model, consensus, rows)
 
 
 if __name__ == "__main__":
