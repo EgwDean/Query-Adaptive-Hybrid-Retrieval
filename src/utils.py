@@ -46,6 +46,36 @@ def load_config():
         return yaml.safe_load(f)
 
 
+def get_config_path(cfg, key, default_value):
+    """Read a path key from cfg['paths'] with a fallback default."""
+    paths_cfg = cfg.get("paths", {}) or {}
+    return paths_cfg.get(key, default_value)
+
+
+def get_processing_artifact_filenames():
+    """Return filenames considered preprocessing/cache artifacts.
+
+    These artifacts belong under processed_data rather than results.
+    """
+    return [
+        "corpus.jsonl",
+        "queries.jsonl",
+        "qrels.tsv",
+        "tokenized_corpus.jsonl",
+        "bm25_index.pkl",
+        "bm25_doc_ids.pkl",
+        "word_freq_index.pkl",
+        "corpus_embeddings.pt",
+        "corpus_ids.pkl",
+        "bm25_results.pkl",
+        "query_vectors.pt",
+        "query_ids.pkl",
+        "dense_results.pkl",
+        "tokenized_queries.jsonl",
+        "query_tokens.pkl",
+    ]
+
+
 # ============================================================
 # File / directory helpers
 # ============================================================

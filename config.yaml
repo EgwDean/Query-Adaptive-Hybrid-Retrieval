@@ -70,6 +70,7 @@ datasets:
 paths:
   datasets_folder: "data/datasets"
   results_folder:  "data/results"
+  processed_folder: "data/processed_data"
 
 # ------------------------------------------------------------
 # Preprocessing
