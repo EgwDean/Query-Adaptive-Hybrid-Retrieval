@@ -13,15 +13,6 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# Mode: MERGE
-# ------------------------------------------------------------
-# true  -> all uncommented datasets are merged into one corpus
-#          and results are saved under  results/<model>/merged/
-# false -> each uncommented dataset is processed independently
-#          and results are saved under  results/<model>/<dataset>/
-merge: false
-
-# ------------------------------------------------------------
 # Datasets
 # ------------------------------------------------------------
 # Stats: (test queries | corpus docs | avg relevant docs per query)
@@ -82,8 +73,8 @@ preprocessing:
 # Embedding model
 # ------------------------------------------------------------
 embeddings:
-  model_name: "BAAI/bge-m3"
-  # model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  # model_name: "BAAI/bge-m3"
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
   batch_size: 64   # lower to 8-16 for large models on GPU with long documents
   # max_seq_length: 512   # truncate docs to this many tokens before encoding.
 
@@ -102,8 +93,6 @@ benchmark:
   ndcg_k: 10
   rrf:
     k: 60               # RRF damping constant (Cormack et al. 2009)
-  sigmoid:
-    center: 0.5          # center of the sigmoid for WRRF alpha mapping
-    slope: 10            # slope  of the sigmoid for WRRF alpha mapping
-  smoothing:
-    laplace_alpha: 1     # Laplace smoothing for corpus word distribution
+  dynamic_wrrf:
+    max_df_values: [0.5, 0.8]
+    k_values: [1.0, 2.0, 3.0]
