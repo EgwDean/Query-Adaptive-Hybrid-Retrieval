@@ -95,5 +95,7 @@ benchmark:
     k: 60               # RRF damping constant (Cormack et al. 2009)
   dynamic_wrrf:
     max_df_values: [0.5, 0.8]
+    rrf_k_values: [10, 60, 100]
     k_values: [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
     center_values: [-1.0, -0.5, 0.0, 0.5, 1.0]
+    rrf_k_values: [10, 60, 100]

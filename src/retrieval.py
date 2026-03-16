@@ -316,7 +316,7 @@ def run_dynamic_grid_search(
     total_corpus_tokens,
     bm25_results,
     dense_results,
-    rrf_k,
+    rrf_k_values,
     ndcg_k,
     max_df_values,
     k_values,
@@ -355,6 +355,7 @@ def run_dynamic_grid_search(
         "jsd": {
             "metric": "JSD",
             "best_max_df": None,
+            "best_rrf_k": None,
             "best_k": None,
             "best_center": None,
             "best_ndcg": -1.0,
@@ -362,6 +363,7 @@ def run_dynamic_grid_search(
         "kld": {
             "metric": "KLD",
             "best_max_df": None,
+            "best_rrf_k": None,
             "best_k": None,
             "best_center": None,
             "best_ndcg": -1.0,
@@ -369,6 +371,7 @@ def run_dynamic_grid_search(
         "ce": {
             "metric": "CE",
             "best_max_df": None,
+            "best_rrf_k": None,
             "best_k": None,
             "best_center": None,
             "best_ndcg": -1.0,
@@ -377,22 +380,24 @@ def run_dynamic_grid_search(
 
     for max_df in max_df_values:
         metric_by_key = metric_cache[max_df]
-        for slope in k_values:
-            for center in center_values:
-                for metric_key in metric_keys:
-                    alpha_map = build_alpha_map(metric_by_key[metric_key], slope, center)
-                    fused = build_dynamic_wrrf(
-                        bm25_results,
-                        dense_results,
-                        alpha_map,
-                        rrf_k=rrf_k,
-                    )
-                    ndcg = calculate_ndcg_at_k(fused, qrels, ndcg_k)
-                    if ndcg > best_by_metric[metric_key]["best_ndcg"]:
-                        best_by_metric[metric_key]["best_ndcg"] = ndcg
-                        best_by_metric[metric_key]["best_max_df"] = max_df
-                        best_by_metric[metric_key]["best_k"] = slope
-                        best_by_metric[metric_key]["best_center"] = center
+        for rrf_k in rrf_k_values:
+            for slope in k_values:
+                for center in center_values:
+                    for metric_key in metric_keys:
+                        alpha_map = build_alpha_map(metric_by_key[metric_key], slope, center)
+                        fused = build_dynamic_wrrf(
+                            bm25_results,
+                            dense_results,
+                            alpha_map,
+                            rrf_k=rrf_k,
+                        )
+                        ndcg = calculate_ndcg_at_k(fused, qrels, ndcg_k)
+                        if ndcg > best_by_metric[metric_key]["best_ndcg"]:
+                            best_by_metric[metric_key]["best_ndcg"] = ndcg
+                            best_by_metric[metric_key]["best_max_df"] = max_df
+                            best_by_metric[metric_key]["best_rrf_k"] = rrf_k
+                            best_by_metric[metric_key]["best_k"] = slope
+                            best_by_metric[metric_key]["best_center"] = center
 
     return best_by_metric
 
@@ -418,13 +423,22 @@ def save_params_csv(param_rows, output_path):
     """Write best dynamic parameters per dataset and metric."""
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Dataset", "Metric", "Best max_df", "Best k", "Best center", "Best NDCG@10"])
+        writer.writerow([
+            "Dataset",
+            "Metric",
+            "Best max_df",
+            "Best rrf_k",
+            "Best k",
+            "Best center",
+            "Best NDCG@10",
+        ])
         for row in param_rows:
             writer.writerow(
                 [
                     row["dataset"],
                     row["metric"],
                     row["best_max_df"],
+                    row["best_rrf_k"],
                     row["best_k"],
                     row["best_center"],
                     f"{row['best_ndcg']:.4f}",
@@ -469,6 +483,7 @@ def evaluate_dataset(dataset_name, cfg, device):
     max_df_values = dynamic_cfg["max_df_values"]
     k_values = dynamic_cfg["k_values"]
     center_values = dynamic_cfg["center_values"]
+    rrf_k_values = dynamic_cfg.get("rrf_k_values", [10, 60, 100])
 
     short_model = model_short_name(cfg["embeddings"]["model_name"])
     processed_root = get_config_path(cfg, "processed_folder", "data/processed_data")
@@ -583,7 +598,7 @@ def evaluate_dataset(dataset_name, cfg, device):
         total_corpus_tokens,
         bm25_results,
         dense_results,
-        rrf_k,
+        rrf_k_values,
         ndcg_k,
         max_df_values,
         k_values,
@@ -598,15 +613,18 @@ def evaluate_dataset(dataset_name, cfg, device):
     print(f"  RRF          : {rrf_ndcg:.4f}")
     print(
         f"  Dynamic JSD  : {best_jsd['best_ndcg']:.4f}  "
-        f"(max_df={best_jsd['best_max_df']}, k={best_jsd['best_k']}, center={best_jsd['best_center']})"
+        f"(max_df={best_jsd['best_max_df']}, rrf_k={best_jsd['best_rrf_k']}, "
+        f"k={best_jsd['best_k']}, center={best_jsd['best_center']})"
     )
     print(
         f"  Dynamic KLD  : {best_kld['best_ndcg']:.4f}  "
-        f"(max_df={best_kld['best_max_df']}, k={best_kld['best_k']}, center={best_kld['best_center']})"
+        f"(max_df={best_kld['best_max_df']}, rrf_k={best_kld['best_rrf_k']}, "
+        f"k={best_kld['best_k']}, center={best_kld['best_center']})"
     )
     print(
         f"  Dynamic CE   : {best_ce['best_ndcg']:.4f}  "
-        f"(max_df={best_ce['best_max_df']}, k={best_ce['best_k']}, center={best_ce['best_center']})"
+        f"(max_df={best_ce['best_max_df']}, rrf_k={best_ce['best_rrf_k']}, "
+        f"k={best_ce['best_k']}, center={best_ce['best_center']})"
     )
 
     summary_row = {
@@ -626,6 +644,7 @@ def evaluate_dataset(dataset_name, cfg, device):
                 "dataset": dataset_name,
                 "metric": best["metric"],
                 "best_max_df": best["best_max_df"],
+                "best_rrf_k": best["best_rrf_k"],
                 "best_k": best["best_k"],
                 "best_center": best["best_center"],
                 "best_ndcg": best["best_ndcg"],
