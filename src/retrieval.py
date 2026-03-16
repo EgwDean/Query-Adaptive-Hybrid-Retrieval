@@ -190,6 +190,8 @@ def compute_query_metrics(clean_tokens, global_counts, total_corpus_tokens):
     m = 0.5 * (p_q + p_c)
     kl_q_m = np.sum(p_q * np.log2(p_q / m))
     kl_c_m = np.sum(p_c * np.log2(p_c / m))
+    
+    kl_c_m += (1.0 - np.sum(p_c))
     jsd = float(0.5 * kl_q_m + 0.5 * kl_c_m)
 
     # CE length-normalized by cleaned query length.
@@ -223,8 +225,7 @@ def build_alpha_map(metric_values, slope):
     return alpha_map
 
 
-def run_metric_grid_search(
-    metric_key,
+def run_dynamic_grid_search(
     queries,
     qrels,
     stemmer,
@@ -239,13 +240,16 @@ def run_metric_grid_search(
     max_df_values,
     k_values,
 ):
-    """Search the best (max_df, k) pair for one metric."""
-    cleaned_cache = {}
+    """Run one unified grid search for JSD, KLD, and CE.
+
+    For each max_df value, query cleaning and metric computation are done
+    exactly once and then reused for all metric/k combinations.
+    """
     metric_cache = {}
+    metric_keys = ("jsd", "kld", "ce")
 
     for max_df in max_df_values:
-        cleaned_by_qid = {}
-        metric_by_qid = {}
+        metric_by_key = {k: {} for k in metric_keys}
         for qid, qtext in queries.items():
             cleaned = clean_query_tokens(
                 qtext,
@@ -255,33 +259,35 @@ def run_metric_grid_search(
                 total_docs,
                 max_df,
             )
-            cleaned_by_qid[qid] = cleaned
-
             metrics = compute_query_metrics(cleaned, global_counts, total_corpus_tokens)
-            metric_by_qid[qid] = None if metrics is None else metrics[metric_key]
+            if metrics is None:
+                for key in metric_keys:
+                    metric_by_key[key][qid] = None
+            else:
+                for key in metric_keys:
+                    metric_by_key[key][qid] = metrics[key]
 
-        cleaned_cache[max_df] = cleaned_by_qid
-        metric_cache[max_df] = metric_by_qid
+        metric_cache[max_df] = metric_by_key
 
-    best = {
-        "metric": metric_key.upper(),
-        "best_max_df": None,
-        "best_k": None,
-        "best_ndcg": -1.0,
+    best_by_metric = {
+        "jsd": {"metric": "JSD", "best_max_df": None, "best_k": None, "best_ndcg": -1.0},
+        "kld": {"metric": "KLD", "best_max_df": None, "best_k": None, "best_ndcg": -1.0},
+        "ce": {"metric": "CE", "best_max_df": None, "best_k": None, "best_ndcg": -1.0},
     }
 
     for max_df in max_df_values:
-        metric_by_qid = metric_cache[max_df]
+        metric_by_key = metric_cache[max_df]
         for slope in k_values:
-            alpha_map = build_alpha_map(metric_by_qid, slope)
-            fused = build_weighted_score_fusion(norm_bm25, norm_dense, alpha_map)
-            ndcg = calculate_ndcg_at_k(fused, qrels, ndcg_k)
-            if ndcg > best["best_ndcg"]:
-                best["best_ndcg"] = ndcg
-                best["best_max_df"] = max_df
-                best["best_k"] = slope
+            for metric_key in metric_keys:
+                alpha_map = build_alpha_map(metric_by_key[metric_key], slope)
+                fused = build_weighted_score_fusion(norm_bm25, norm_dense, alpha_map)
+                ndcg = calculate_ndcg_at_k(fused, qrels, ndcg_k)
+                if ndcg > best_by_metric[metric_key]["best_ndcg"]:
+                    best_by_metric[metric_key]["best_ndcg"] = ndcg
+                    best_by_metric[metric_key]["best_max_df"] = max_df
+                    best_by_metric[metric_key]["best_k"] = slope
 
-    return best
+    return best_by_metric
 
 
 def save_summary_csv(summary_rows, output_path, ndcg_k):
@@ -459,8 +465,7 @@ def evaluate_dataset(dataset_name, cfg, device):
     stemmer = SnowballStemmer(stemmer_lang)
     stopword_stems = {stemmer.stem(w) for w in ensure_english_stopwords()}
 
-    best_jsd = run_metric_grid_search(
-        "jsd",
+    best_dynamic = run_dynamic_grid_search(
         queries,
         qrels,
         stemmer,
@@ -475,38 +480,9 @@ def evaluate_dataset(dataset_name, cfg, device):
         max_df_values,
         k_values,
     )
-    best_kld = run_metric_grid_search(
-        "kld",
-        queries,
-        qrels,
-        stemmer,
-        stopword_stems,
-        doc_freq,
-        total_docs,
-        global_counts,
-        total_corpus_tokens,
-        norm_bm25,
-        norm_dense,
-        ndcg_k,
-        max_df_values,
-        k_values,
-    )
-    best_ce = run_metric_grid_search(
-        "ce",
-        queries,
-        qrels,
-        stemmer,
-        stopword_stems,
-        doc_freq,
-        total_docs,
-        global_counts,
-        total_corpus_tokens,
-        norm_bm25,
-        norm_dense,
-        ndcg_k,
-        max_df_values,
-        k_values,
-    )
+    best_jsd = best_dynamic["jsd"]
+    best_kld = best_dynamic["kld"]
+    best_ce = best_dynamic["ce"]
 
     print(f"  BM25 Only    : {bm25_ndcg:.4f}")
     print(f"  Dense Only   : {dense_ndcg:.4f}")
