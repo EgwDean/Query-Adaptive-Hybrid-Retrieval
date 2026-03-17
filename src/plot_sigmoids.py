@@ -13,6 +13,8 @@ import math
 import os
 from collections import defaultdict
 
+import yaml
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -40,6 +42,19 @@ def centered_sigmoid(z_values, slope, center):
     alpha = 1 / (1 + exp(-k * (z - center)))
     """
     return 1.0 / (1.0 + np.exp(-slope * (z_values - center)))
+
+
+def load_config(config_path):
+    """Load YAML config used by the pipeline."""
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def model_short_name(full_name):
+    """Convert model path to the short folder name used in results paths."""
+    return (full_name or "").split("/")[-1]
 
 
 def read_best_params(csv_path):
@@ -139,13 +154,28 @@ def main():
         description="Plot per-dataset learned sigmoid routing curves from best_dynamic_params.csv"
     )
     parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to YAML config file (default: config.yaml)",
+    )
+    parser.add_argument(
         "--model-name",
-        default="bge-m3",
-        help="Model folder name under data/results (default: bge-m3)",
+        default=None,
+        help="Optional model folder override under data/results. If omitted, uses config embeddings.model_name.",
     )
     args = parser.parse_args()
 
-    base_dir = os.path.join("data", "results", args.model_name)
+    cfg = load_config(args.config)
+    cfg_model_name = cfg.get("embeddings", {}).get("model_name")
+    if not cfg_model_name and args.model_name is None:
+        raise ValueError(
+            "Missing embeddings.model_name in config and no --model-name override was provided."
+        )
+
+    selected_model = args.model_name or model_short_name(cfg_model_name)
+    results_root = cfg.get("paths", {}).get("results_folder", "data/results")
+
+    base_dir = os.path.join(results_root, selected_model)
     csv_path = os.path.join(base_dir, "best_dynamic_params.csv")
     output_path = os.path.join(base_dir, "dataset_sigmoid_curves.png")
 
@@ -153,6 +183,7 @@ def main():
     build_figure(by_dataset, output_path)
 
     print(f"Loaded datasets: {len(by_dataset)}")
+    print(f"Selected model : {selected_model}")
     print(f"Input CSV      : {csv_path}")
     print(f"Output PNG     : {output_path}")
 
