@@ -48,6 +48,52 @@ def get_config_path(cfg, key, default_value):
     return paths_cfg.get(key, default_value)
 
 
+def _format_bm25_float(value):
+    """Format BM25 float params for stable, human-readable cache keys."""
+    text = f"{float(value):.4f}".rstrip("0").rstrip(".")
+    if "." not in text:
+        text += ".0"
+    return text
+
+
+def get_bm25_params(cfg, override=None):
+    """Return BM25 params from config, optionally overridden by a dict."""
+    bm25_cfg = dict(cfg.get("bm25", {}) or {})
+    if override:
+        bm25_cfg.update(override)
+
+    k1 = float(bm25_cfg.get("k1", 1.5))
+    b = float(bm25_cfg.get("b", 0.75))
+    use_stemming = bool(bm25_cfg.get("use_stemming", True))
+    return {"k1": k1, "b": b, "use_stemming": use_stemming}
+
+
+def bm25_signature(k1, b, use_stemming):
+    """Build a filename-safe signature for BM25 cache artifacts."""
+    return (
+        f"bm25_k1_{_format_bm25_float(k1)}"
+        f"_b_{_format_bm25_float(b)}"
+        f"_stem_{1 if use_stemming else 0}"
+    )
+
+
+def bm25_artifact_paths(ds_dir, k1, b, use_stemming):
+    """Return sparse artifact paths for one dataset and BM25 config."""
+    sig = bm25_signature(k1, b, use_stemming)
+    stem_flag = f"stem_{1 if use_stemming else 0}"
+    return {
+        "tokenized_corpus_jsonl": os.path.join(ds_dir, f"tokenized_corpus_{stem_flag}.jsonl"),
+        "tokenized_queries_jsonl": os.path.join(ds_dir, f"tokenized_queries_{stem_flag}.jsonl"),
+        "query_tokens_pkl": os.path.join(ds_dir, f"query_tokens_{stem_flag}.pkl"),
+        "word_freq_pkl": os.path.join(ds_dir, f"word_freq_index_{stem_flag}.pkl"),
+        "doc_freq_pkl": os.path.join(ds_dir, f"doc_freq_index_{stem_flag}.pkl"),
+        "bm25_pkl": os.path.join(ds_dir, f"{sig}.pkl"),
+        "bm25_docids_pkl": os.path.join(ds_dir, f"{sig}_doc_ids.pkl"),
+        "bm25_results_pkl": os.path.join(ds_dir, f"{sig}_results.pkl"),
+        "bm25_signature": sig,
+    }
+
+
 # ============================================================
 # File / directory helpers
 # ============================================================
@@ -320,16 +366,19 @@ def model_short_name(full_name):
     return full_name.split("/")[-1]
 
 
-def stem_and_tokenize(text, stemmer):
-    """Lowercase, split on whitespace, and stem each token."""
-    return [stemmer.stem(w) for w in text.lower().split()]
+def stem_and_tokenize(text, stemmer=None):
+    """Lowercase and split, optionally applying stemming per token."""
+    tokens = text.lower().split()
+    if stemmer is None:
+        return tokens
+    return [stemmer.stem(w) for w in tokens]
 
 
 # Module-level stemmer used by each worker process (set via _init_worker).
 _worker_stemmer = None
 
 
-def _init_worker(stemmer_lang):
+def _init_worker(stemmer_lang, use_stemming=True):
     """ProcessPoolExecutor initializer: construct one SnowballStemmer per
     worker process so it is reused across all batches assigned to that
     worker instead of being recreated on every call.
@@ -337,7 +386,10 @@ def _init_worker(stemmer_lang):
     from nltk.stem.snowball import SnowballStemmer
 
     global _worker_stemmer
-    _worker_stemmer = SnowballStemmer(stemmer_lang)
+    if use_stemming:
+        _worker_stemmer = SnowballStemmer(stemmer_lang)
+    else:
+        _worker_stemmer = None
 
 
 def stem_batch_worker(args):
@@ -351,6 +403,9 @@ def stem_batch_worker(args):
     batch_ids, batch_texts = args
     results = []
     for doc_id, text in zip(batch_ids, batch_texts):
-        tokens = [_worker_stemmer.stem(w) for w in text.lower().split()]
+        if _worker_stemmer is None:
+            tokens = text.lower().split()
+        else:
+            tokens = [_worker_stemmer.stem(w) for w in text.lower().split()]
         results.append(json.dumps({"_id": doc_id, "tokens": tokens}))
     return results

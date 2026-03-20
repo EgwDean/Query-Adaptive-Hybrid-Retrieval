@@ -176,9 +176,9 @@ def apply_dynamic_wrrf(bm25_results, dense_results, alpha_map, rrf_k):
     return fused
 
 
-def run_bm25_retrieval(bm25, doc_ids, queries, stemmer_lang, top_k):
+def run_bm25_retrieval(bm25, doc_ids, queries, stemmer_lang, top_k, use_stemming):
     """Run BM25 retrieval and return {qid: [(doc_id, score), ...]} with top_k docs."""
-    stemmer = SnowballStemmer(stemmer_lang)
+    stemmer = SnowballStemmer(stemmer_lang) if use_stemming else None
     results = {}
 
     for qid, qtext in tqdm(queries.items(), desc="  BM25 retrieval", dynamic_ncols=True):
@@ -231,22 +231,30 @@ def prepare_dataset_inputs(dataset_name, cfg):
     short_model = model_short_name(cfg["embeddings"]["model_name"])
     processed_root = get_config_path(cfg, "processed_folder", "data/processed_data")
     ds_dir = os.path.join(processed_root, short_model, dataset_name)
+    bm25_params = u.get_bm25_params(cfg)
+    bm25_paths = u.bm25_artifact_paths(
+        ds_dir,
+        bm25_params["k1"],
+        bm25_params["b"],
+        bm25_params["use_stemming"],
+    )
 
     paths = {
         "dataset_dir": ds_dir,
         "queries_jsonl": os.path.join(ds_dir, "queries.jsonl"),
         "qrels_tsv": os.path.join(ds_dir, "qrels.tsv"),
-        "word_freq_pkl": os.path.join(ds_dir, "word_freq_index.pkl"),
-        "doc_freq_pkl": os.path.join(ds_dir, "doc_freq_index.pkl"),
-        "query_tokens_pkl": os.path.join(ds_dir, "query_tokens.pkl"),
-        "bm25_pkl": os.path.join(ds_dir, "bm25_index.pkl"),
-        "bm25_docids_pkl": os.path.join(ds_dir, "bm25_doc_ids.pkl"),
+        "word_freq_pkl": bm25_paths["word_freq_pkl"],
+        "doc_freq_pkl": bm25_paths["doc_freq_pkl"],
+        "query_tokens_pkl": bm25_paths["query_tokens_pkl"],
+        "bm25_pkl": bm25_paths["bm25_pkl"],
+        "bm25_docids_pkl": bm25_paths["bm25_docids_pkl"],
         "corpus_emb_pt": os.path.join(ds_dir, "corpus_embeddings.pt"),
         "corpus_ids_pkl": os.path.join(ds_dir, "corpus_ids.pkl"),
         "query_vectors_pt": os.path.join(ds_dir, "query_vectors.pt"),
         "query_ids_pkl": os.path.join(ds_dir, "query_ids.pkl"),
-        "bm25_results_pkl": os.path.join(ds_dir, "bm25_results.pkl"),
+        "bm25_results_pkl": bm25_paths["bm25_results_pkl"],
         "dense_results_pkl": os.path.join(ds_dir, "dense_results.pkl"),
+        "bm25_signature": bm25_paths["bm25_signature"],
     }
 
     missing = _missing_paths([
@@ -278,6 +286,14 @@ def ensure_retrieval_results_cached(dataset_name, cfg, device):
     top_k = cfg["benchmark"]["top_k"]
     stemmer_lang = cfg["preprocessing"]["stemmer_language"]
     dense_cfg = cfg.get("dense_search", {})
+    bm25_params = u.get_bm25_params(cfg)
+
+    print(
+        "  BM25 config: "
+        f"k1={bm25_params['k1']}, b={bm25_params['b']}, "
+        f"use_stemming={bm25_params['use_stemming']}"
+    )
+    print(f"  BM25 signature: {paths['bm25_signature']}")
 
     queries = load_queries(paths["queries_jsonl"])
 
@@ -288,7 +304,14 @@ def ensure_retrieval_results_cached(dataset_name, cfg, device):
         print("  Running BM25 retrieval and caching results ...")
         bm25 = load_pickle(paths["bm25_pkl"])
         bm25_doc_ids = load_pickle(paths["bm25_docids_pkl"])
-        bm25_results = run_bm25_retrieval(bm25, bm25_doc_ids, queries, stemmer_lang, top_k)
+        bm25_results = run_bm25_retrieval(
+            bm25,
+            bm25_doc_ids,
+            queries,
+            stemmer_lang,
+            top_k,
+            use_stemming=bm25_params["use_stemming"],
+        )
         save_pickle(bm25_results, paths["bm25_results_pkl"])
 
     if file_exists(paths["dense_results_pkl"]):
@@ -435,7 +458,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
 
     routing_cfg = cfg.get("supervised_routing", {})
     overlap_k = int(routing_cfg.get("overlap_k", 100))
-    epsilon = float(routing_cfg.get("epsilon", 1.0e-9))
+    epsilon = float(routing_cfg.get("epsilon", 1.0e-8))
     ce_smoothing_alpha = float(routing_cfg.get("ce_smoothing_alpha", 1.0))
     feature_workers = int(routing_cfg.get("feature_workers", max(1, (os.cpu_count() or 4) // 2)))
     ndcg_k = int(cfg["benchmark"].get("ndcg_k", 10))
@@ -450,6 +473,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
         "ndcg_k": ndcg_k,
         "top_k": int(cfg["benchmark"].get("top_k", 100)),
         "model": cfg["embeddings"]["model_name"],
+        "bm25": u.get_bm25_params(cfg),
     }
     signature = hashlib.md5(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -978,6 +1002,7 @@ def main():
             "heldout": heldout,
             "train_datasets": train_datasets,
             "feature_names": FEATURE_NAMES,
+            "bm25": u.get_bm25_params(cfg),
             "training_cfg": {
                 "regularization": routing_cfg.get("regularization", "l2"),
                 "C": routing_cfg.get("C", 1.0),

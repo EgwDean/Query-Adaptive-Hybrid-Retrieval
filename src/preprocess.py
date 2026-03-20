@@ -66,7 +66,13 @@ torch.set_num_interop_threads(1)
 _gpu_failed = False
 
 
-def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
+def preprocess_corpus(
+    corpus_jsonl,
+    output_jsonl,
+    stemmer_lang,
+    use_stemming,
+    batch_size=512,
+):
     """Stem-tokenize the corpus JSONL using multiprocessing and cache to disk."""
     ensure_dir(os.path.dirname(output_jsonl))
     n_workers = max(1, _N_CORES - 1)
@@ -77,7 +83,7 @@ def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
         with ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_init_worker,
-            initargs=(stemmer_lang,),
+            initargs=(stemmer_lang, use_stemming),
         ) as pool:
             pending = deque()
             pbar = tqdm(
@@ -101,7 +107,7 @@ def preprocess_corpus(corpus_jsonl, output_jsonl, stemmer_lang, batch_size=512):
             pbar.close()
 
 
-def build_bm25_and_word_freq_index(tokenized_corpus_jsonl):
+def build_bm25_and_word_freq_index(tokenized_corpus_jsonl, k1, b):
     """Build BM25 index plus corpus-wide token frequency index in one pass."""
     from rank_bm25 import BM25Okapi
 
@@ -122,7 +128,7 @@ def build_bm25_and_word_freq_index(tokenized_corpus_jsonl):
             total_tokens += len(tokens)
 
     print(f"  Building BM25 index over {len(doc_ids):,} documents ...")
-    bm25 = BM25Okapi(tokenized_docs)
+    bm25 = BM25Okapi(tokenized_docs, k1=k1, b=b)
     print(
         f"  Vocabulary size: {len(global_counts):,} unique tokens, "
         f"{total_tokens:,} total occurrences."
@@ -240,14 +246,20 @@ def build_dense_query_vectors(queries, model, batch_size, device):
     return torch.cat(all_embs, dim=0), qids
 
 
-def preprocess_queries(queries_jsonl, tokenized_queries_jsonl, query_tokens_pkl, stemmer_lang):
+def preprocess_queries(
+    queries_jsonl,
+    tokenized_queries_jsonl,
+    query_tokens_pkl,
+    stemmer_lang,
+    use_stemming,
+):
     """Tokenize/stem queries and cache both JSONL and dict-by-id forms."""
     if file_exists(tokenized_queries_jsonl) and file_exists(query_tokens_pkl):
         print("  Query preprocessing cache exists. Skipping.")
         return
 
     queries = load_queries(queries_jsonl)
-    stemmer = SnowballStemmer(stemmer_lang)
+    stemmer = SnowballStemmer(stemmer_lang) if use_stemming else None
     token_map = {}
 
     with open(tokenized_queries_jsonl, "w", encoding="utf-8") as out:
@@ -269,17 +281,24 @@ def run_for_dataset(dataset_name, cfg, model, device):
 
     stemmer_lang = cfg["preprocessing"]["stemmer_language"]
     emb_batch_size = cfg["embeddings"]["batch_size"]
+    bm25_params = u.get_bm25_params(cfg)
+    sparse_paths = u.bm25_artifact_paths(
+        ds_dir,
+        bm25_params["k1"],
+        bm25_params["b"],
+        bm25_params["use_stemming"],
+    )
 
     corpus_jsonl = os.path.join(ds_dir, "corpus.jsonl")
     queries_jsonl = os.path.join(ds_dir, "queries.jsonl")
     qrels_tsv = os.path.join(ds_dir, "qrels.tsv")
-    tokenized_corpus_jsonl = os.path.join(ds_dir, "tokenized_corpus.jsonl")
-    tokenized_queries_jsonl = os.path.join(ds_dir, "tokenized_queries.jsonl")
-    query_tokens_pkl = os.path.join(ds_dir, "query_tokens.pkl")
-    bm25_pkl = os.path.join(ds_dir, "bm25_index.pkl")
-    bm25_docids_pkl = os.path.join(ds_dir, "bm25_doc_ids.pkl")
-    word_freq_pkl = os.path.join(ds_dir, "word_freq_index.pkl")
-    doc_freq_pkl = os.path.join(ds_dir, "doc_freq_index.pkl")
+    tokenized_corpus_jsonl = sparse_paths["tokenized_corpus_jsonl"]
+    tokenized_queries_jsonl = sparse_paths["tokenized_queries_jsonl"]
+    query_tokens_pkl = sparse_paths["query_tokens_pkl"]
+    bm25_pkl = sparse_paths["bm25_pkl"]
+    bm25_docids_pkl = sparse_paths["bm25_docids_pkl"]
+    word_freq_pkl = sparse_paths["word_freq_pkl"]
+    doc_freq_pkl = sparse_paths["doc_freq_pkl"]
     corpus_emb_pt = os.path.join(ds_dir, "corpus_embeddings.pt")
     corpus_ids_pkl = os.path.join(ds_dir, "corpus_ids.pkl")
     query_vectors_pt = os.path.join(ds_dir, "query_vectors.pt")
@@ -288,6 +307,12 @@ def run_for_dataset(dataset_name, cfg, model, device):
     print(f"\n{'=' * 60}")
     print(f"Dataset: {dataset_name}")
     print(f"Processed output: {ds_dir}")
+    print(
+        "BM25 config: "
+        f"k1={bm25_params['k1']}, b={bm25_params['b']}, "
+        f"use_stemming={bm25_params['use_stemming']}"
+    )
+    print(f"BM25 signature: {sparse_paths['bm25_signature']}")
     print(f"{'=' * 60}")
 
     # 1) Ensure dataset is available locally
@@ -315,7 +340,12 @@ def run_for_dataset(dataset_name, cfg, model, device):
         print("[2/6] Tokenized corpus exists. Skipping.")
     else:
         print("[2/6] Tokenizing/stemming corpus ...")
-        preprocess_corpus(corpus_jsonl, tokenized_corpus_jsonl, stemmer_lang)
+        preprocess_corpus(
+            corpus_jsonl,
+            tokenized_corpus_jsonl,
+            stemmer_lang,
+            use_stemming=bm25_params["use_stemming"],
+        )
 
     print("[3/6] Preprocessing queries ...")
     preprocess_queries(
@@ -323,6 +353,7 @@ def run_for_dataset(dataset_name, cfg, model, device):
         tokenized_queries_jsonl,
         query_tokens_pkl,
         stemmer_lang,
+        bm25_params["use_stemming"],
     )
 
     # 4) BM25 + frequency indexes
@@ -337,7 +368,9 @@ def run_for_dataset(dataset_name, cfg, model, device):
     else:
         print("[4/6] Building BM25 + frequency indexes ...")
         bm25, bm25_doc_ids, global_counts, total_corpus_tokens = build_bm25_and_word_freq_index(
-            tokenized_corpus_jsonl
+            tokenized_corpus_jsonl,
+            k1=bm25_params["k1"],
+            b=bm25_params["b"],
         )
         doc_freq, total_docs = build_doc_freq_index(tokenized_corpus_jsonl)
         save_pickle(bm25, bm25_pkl)
