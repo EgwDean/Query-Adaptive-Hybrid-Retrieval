@@ -62,13 +62,15 @@ from src.utils import (
 FEATURE_NAMES = [
     "cross_entropy",
     "agreement",
+    "overlap_at_3",
     "query_length",
     "dense_confidence",
     "sparse_confidence",
-    "top_dense_score",
-    "top_sparse_score",
+    "confidence_gap",
     "average_idf",
     "max_idf",
+    "idf_std",
+    "rare_term_ratio",
     "stopword_ratio",
 ]
 
@@ -95,6 +97,23 @@ def ensure_english_stopwords():
 def _missing_paths(paths):
     """Return all paths that do not exist."""
     return [p for p in paths if not file_exists(p)]
+
+
+def normalize_scores_minmax(pairs, epsilon=1.0e-8):
+    """Min-max normalize one query result list while preserving rank order."""
+    if not pairs:
+        return []
+
+    scores = [float(score) for _, score in pairs]
+    min_score = min(scores)
+    max_score = max(scores)
+    score_range = max_score - min_score
+
+    if score_range < epsilon:
+        return [(doc_id, 0.0) for doc_id, _ in pairs]
+
+    denom = score_range + epsilon
+    return [(doc_id, float((float(score) - min_score) / denom)) for doc_id, score in pairs]
 
 
 def query_ndcg_at_k(ranked_pairs, rels, k):
@@ -375,6 +394,10 @@ def compute_feature_row_for_query(
     ndcg_k,
 ):
     """Compute one query row with features and soft label."""
+    # Keep raw rankings for labels/fusion, but normalize scores for routing features.
+    bm25_norm = normalize_scores_minmax(bm25_for_query, epsilon=epsilon)
+    dense_norm = normalize_scores_minmax(dense_for_query, epsilon=epsilon)
+
     total_tokens = len(query_tokens)
     if total_tokens == 0:
         stopword_ratio = 0.0
@@ -392,25 +415,24 @@ def compute_feature_row_for_query(
     top_dense = [doc_id for doc_id, _ in dense_for_query[:overlap_k]]
     overlap = len(set(top_sparse) & set(top_dense))
     agreement = float(overlap / max(1, overlap_k))
+    overlap_at_3 = float(len(set(top_sparse[:3]) & set(top_dense[:3])) / 3.0)
 
-    # Features: confidence margins from the top two scores.
-    if len(dense_for_query) >= 2:
-        dense_confidence = float(dense_for_query[0][1] - dense_for_query[1][1])
-    elif len(dense_for_query) == 1:
-        dense_confidence = float(dense_for_query[0][1])
+    # Score-derived features use normalized per-query score scales.
+    if len(dense_norm) >= 2:
+        dense_confidence = float(dense_norm[0][1] - dense_norm[1][1])
+    elif len(dense_norm) == 1:
+        dense_confidence = float(dense_norm[0][1])
     else:
         dense_confidence = 0.0
 
-    top_dense_score = float(dense_for_query[0][1]) if dense_for_query else 0.0
-
-    if len(bm25_for_query) >= 2:
-        sparse_confidence = float(bm25_for_query[0][1] - bm25_for_query[1][1])
-    elif len(bm25_for_query) == 1:
-        sparse_confidence = float(bm25_for_query[0][1])
+    if len(bm25_norm) >= 2:
+        sparse_confidence = float(bm25_norm[0][1] - bm25_norm[1][1])
+    elif len(bm25_norm) == 1:
+        sparse_confidence = float(bm25_norm[0][1])
     else:
         sparse_confidence = 0.0
 
-    top_sparse_score = float(bm25_for_query[0][1]) if bm25_for_query else 0.0
+    confidence_gap = float(dense_confidence - sparse_confidence)
 
     # Features requiring stopword-filtered tokens.
     vocab_size = max(1, len(word_freq))
@@ -420,6 +442,8 @@ def compute_feature_row_for_query(
         cross_entropy = 0.0
         average_idf = 0.0
         max_idf = 0.0
+        idf_std = 0.0
+        rare_term_ratio = 0.0
     else:
         ce_sum = 0.0
         idf_values = []
@@ -434,6 +458,11 @@ def compute_feature_row_for_query(
         cross_entropy = float(ce_sum / len(cleaned_tokens))
         average_idf = float(sum(idf_values) / len(idf_values))
         max_idf = float(max(idf_values))
+        idf_std = float(np.std(idf_values))
+
+        rare_threshold = average_idf + idf_std
+        n_rare = sum(1 for idf in idf_values if idf >= rare_threshold)
+        rare_term_ratio = float(n_rare / len(idf_values))
 
     # Soft label from sparse-only and dense-only query-level NDCG@k.
     sparse_q_ndcg = query_ndcg_at_k(bm25_for_query, qrels_for_query, ndcg_k)
@@ -447,13 +476,15 @@ def compute_feature_row_for_query(
         "features": {
             "cross_entropy": cross_entropy,
             "agreement": agreement,
+            "overlap_at_3": overlap_at_3,
             "query_length": query_length,
             "dense_confidence": dense_confidence,
             "sparse_confidence": sparse_confidence,
-            "top_dense_score": top_dense_score,
-            "top_sparse_score": top_sparse_score,
+            "confidence_gap": confidence_gap,
             "average_idf": average_idf,
             "max_idf": max_idf,
+            "idf_std": idf_std,
+            "rare_term_ratio": rare_term_ratio,
             "stopword_ratio": stopword_ratio,
         },
         "soft_label": label,
@@ -502,8 +533,12 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
 
     english_stopwords = ensure_english_stopwords()
     stemmer_lang = cfg["preprocessing"]["stemmer_language"]
-    stemmer = SnowballStemmer(stemmer_lang)
-    stopword_stems = {stemmer.stem(w) for w in english_stopwords}
+    use_stemming = u.get_bm25_params(cfg)["use_stemming"]
+    if use_stemming:
+        stemmer = SnowballStemmer(stemmer_lang)
+        stopword_stems = {stemmer.stem(w) for w in english_stopwords}
+    else:
+        stopword_stems = {w.lower() for w in english_stopwords}
 
     all_rows = []
     for dataset_name in datasets:
@@ -883,7 +918,7 @@ def save_plots(rows, alpha_rows, output_dir):
         values = [by_dataset[k] for k in labels]
 
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.boxplot(values, labels=labels, patch_artist=True)
+        ax.boxplot(values, tick_labels=labels, patch_artist=True)
         ax.set_title("Predicted Alpha Distribution per Held-Out Dataset")
         ax.set_ylabel("Predicted alpha (0=dense, 1=sparse)")
         ax.set_ylim(0.0, 1.0)
