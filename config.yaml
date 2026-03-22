@@ -126,6 +126,7 @@ within_dataset_evaluation:
 # ------------------------------------------------------------
 ablation:
   feature_inventory: "expanded"  # current | expanded
+  mode: "group_ablation"         # group_ablation | candidate_feature_sets
   compare_inventories: false
 
 # ------------------------------------------------------------

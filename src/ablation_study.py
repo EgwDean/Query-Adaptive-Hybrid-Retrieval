@@ -322,6 +322,48 @@ def build_experiments(feature_names, feature_groups):
     return experiments
 
 
+def _resolve_feature_set_from_groups(feature_names, feature_groups, group_names):
+    """Resolve a deterministic feature set by union of named groups."""
+    missing_groups = [g for g in group_names if g not in feature_groups]
+    if missing_groups:
+        raise ValueError(
+            "Candidate feature-set definition references missing groups: "
+            f"{missing_groups}. Selected inventory may be incompatible."
+        )
+
+    union = set()
+    for group_name in group_names:
+        union.update(feature_groups[group_name])
+
+    ordered = [f for f in feature_names if f in union]
+    if not ordered:
+        raise ValueError(f"Resolved candidate feature set is empty for groups={group_names}.")
+    return ordered
+
+
+def build_candidate_feature_sets(feature_names, feature_groups):
+    """Return fixed named candidate feature sets for focused comparison."""
+    candidates = {
+        "FULL": list(feature_names),
+        "CORE": _resolve_feature_set_from_groups(
+            feature_names,
+            feature_groups,
+            ["overlap", "confidence", "legacy_topscore"],
+        ),
+        "CORE_PLUS_QUERY": _resolve_feature_set_from_groups(
+            feature_names,
+            feature_groups,
+            ["overlap", "confidence", "legacy_topscore", "query"],
+        ),
+    }
+
+    for name, feats in candidates.items():
+        if not feats:
+            raise ValueError(f"Candidate feature set {name} resolved to empty list.")
+
+    return candidates
+
+
 def save_ablation_results(results, output_csv):
     """Save ablation study metrics to CSV."""
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
@@ -339,6 +381,39 @@ def save_ablation_results(results, output_csv):
                 "dynamic_wrrf_ndcg",
             ]
         )
+
+
+def save_candidate_feature_set_results(results, output_csv):
+    """Save focused candidate feature-set comparison metrics to CSV."""
+    with open(output_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "feature_set_name",
+                "model_type",
+                "feature_inventory",
+                "evaluation_mode",
+                "dense_ndcg",
+                "sparse_ndcg",
+                "static_rrf_ndcg",
+                "dynamic_wrrf_ndcg",
+                "num_features",
+            ]
+        )
+        for row in results:
+            writer.writerow(
+                [
+                    row["feature_set_name"],
+                    row["model_type"],
+                    row["feature_inventory"],
+                    row["evaluation_mode"],
+                    f"{row['dense']:.6f}",
+                    f"{row['sparse']:.6f}",
+                    f"{row['static']:.6f}",
+                    f"{row['dynamic']:.6f}",
+                    row["num_features"],
+                ]
+            )
         for row in results:
             writer.writerow(
                 [
@@ -402,6 +477,12 @@ def main():
         action="store_true",
         help="Run additional ALL-features comparison for both current and expanded inventories.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["group_ablation", "candidate_feature_sets"],
+        default=None,
+        help="Ablation execution mode override.",
+    )
     args = parser.parse_args()
 
     u.CONFIG_PATH = args.config
@@ -458,10 +539,22 @@ def main():
         if args.feature_inventory
         else str(ablation_cfg.get("feature_inventory", "current")).strip().lower()
     )
+    ablation_mode = (
+        args.mode
+        if args.mode
+        else str(ablation_cfg.get("mode", "group_ablation")).strip().lower()
+    )
     compare_inventories = bool(args.compare_inventories or ablation_cfg.get("compare_inventories", False))
+
+    if ablation_mode not in {"group_ablation", "candidate_feature_sets"}:
+        raise ValueError(
+            f"Unsupported ablation.mode={ablation_mode!r}. "
+            "Use 'group_ablation' or 'candidate_feature_sets'."
+        )
 
     feature_names, feature_groups = get_feature_inventory(selected_inventory)
 
+    print(f"Ablation mode: {ablation_mode}")
     print(f"Feature inventory: {selected_inventory}")
     print(f"Compare inventories: {compare_inventories}")
 
@@ -494,6 +587,50 @@ def main():
         rows_by_dataset[ds].sort(key=lambda r: r["query_id"])
 
     _validate_inventory_setup(selected_inventory, feature_names, feature_groups, rows_by_dataset)
+    if ablation_mode == "candidate_feature_sets":
+        print("\n[3/3] Running candidate feature set comparison ...")
+        candidate_sets = build_candidate_feature_sets(feature_names, feature_groups)
+        candidate_results = []
+
+        for set_name in ["FULL", "CORE", "CORE_PLUS_QUERY"]:
+            selected_features = candidate_sets[set_name]
+            ordered_features = ordered_feature_subset(selected_features)
+            print(f"\n[CANDIDATE] Mode={eval_mode} | Feature set={set_name}")
+            print(f"Resolved features ({len(ordered_features)}): {ordered_features}")
+
+            metrics = run_ablation_experiment(
+                rows_by_dataset=rows_by_dataset,
+                dataset_cache_map=dataset_cache_map,
+                selected_features=selected_features,
+                eval_mode=eval_mode,
+                cfg=cfg,
+                datasets=datasets,
+                device=device,
+                ndcg_k=ndcg_k,
+                rrf_k=rrf_k,
+            )
+            print(f"Final Dynamic NDCG@{ndcg_k}: {metrics['dynamic']:.4f}")
+
+            candidate_results.append(
+                {
+                    "feature_set_name": set_name,
+                    "model_type": model_type,
+                    "feature_inventory": selected_inventory,
+                    "evaluation_mode": eval_mode,
+                    "num_features": len(ordered_features),
+                    **metrics,
+                }
+            )
+
+        candidate_csv = os.path.join(out_dir, "candidate_feature_set_comparison.csv")
+        save_candidate_feature_set_results(candidate_results, candidate_csv)
+
+        print("\n" + "=" * 72)
+        print("Candidate feature set comparison completed.")
+        print(f"Results CSV: {candidate_csv}")
+        print(f"Feature inventory summary JSON: {feature_summary_json}")
+        print("=" * 72)
+        return
 
     print("\n[3/3] Running ablation experiments ...")
     experiments = build_experiments(feature_names, feature_groups)
