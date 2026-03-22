@@ -414,20 +414,6 @@ def save_candidate_feature_set_results(results, output_csv):
                     row["num_features"],
                 ]
             )
-        for row in results:
-            writer.writerow(
-                [
-                    row["experiment"],
-                    row["feature_set"],
-                    row["model_type"],
-                    row["feature_inventory"],
-                    row["evaluation_mode"],
-                    f"{row['dense']:.6f}",
-                    f"{row['sparse']:.6f}",
-                    f"{row['static']:.6f}",
-                    f"{row['dynamic']:.6f}",
-                ]
-            )
 
 
 def write_feature_inventory_summary(output_json, selected_inventory):
