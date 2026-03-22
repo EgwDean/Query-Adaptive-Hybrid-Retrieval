@@ -58,22 +58,18 @@ from src.utils import (
     save_pickle,
     stem_and_tokenize,
 )
+from src.feature_inventory import (
+    CURRENT_FEATURES,
+    EXPANDED_FEATURES,
+    FEATURE_SCHEMA_VERSION,
+)
 
 
-FEATURE_NAMES = [
-    "cross_entropy",
-    "agreement",
-    "overlap_at_3",
-    "query_length",
-    "dense_confidence",
-    "sparse_confidence",
-    "confidence_gap",
-    "average_idf",
-    "max_idf",
-    "idf_std",
-    "rare_term_ratio",
-    "stopword_ratio",
-]
+# Keep backward-compatible default training feature set.
+FEATURE_NAMES = list(CURRENT_FEATURES)
+
+# Master inventory computed/stored in cache for ablation and future tuning.
+ALL_COMPUTED_FEATURE_NAMES = list(EXPANDED_FEATURES)
 
 
 def set_global_seed(seed):
@@ -470,6 +466,11 @@ def compute_feature_row_for_query(
 
     confidence_gap = float(dense_confidence - sparse_confidence)
 
+    # Legacy score-shape features (normalized, per-query, retriever-specific).
+    top_dense_score = float(dense_norm[0][1]) if dense_norm else 0.0
+    top_sparse_score = float(bm25_norm[0][1]) if bm25_norm else 0.0
+    top_score_gap = float(top_dense_score - top_sparse_score)
+
     # Features requiring stopword-filtered tokens.
     vocab_size = max(1, len(word_freq))
     corpus_mass = total_corpus_tokens + ce_smoothing_alpha * vocab_size
@@ -517,6 +518,9 @@ def compute_feature_row_for_query(
             "dense_confidence": dense_confidence,
             "sparse_confidence": sparse_confidence,
             "confidence_gap": confidence_gap,
+            "top_dense_score": top_dense_score,
+            "top_sparse_score": top_sparse_score,
+            "top_score_gap": top_score_gap,
             "average_idf": average_idf,
             "max_idf": max_idf,
             "idf_std": idf_std,
@@ -545,7 +549,8 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
     datasets = sorted(dataset_cache_map.keys())
     signature_payload = {
         "datasets": datasets,
-        "feature_names": FEATURE_NAMES,
+        "feature_names": ALL_COMPUTED_FEATURE_NAMES,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "overlap_k": overlap_k,
         "epsilon": epsilon,
         "ce_smoothing_alpha": ce_smoothing_alpha,
@@ -625,7 +630,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
         writer.writerow([
             "dataset",
             "query_id",
-            *FEATURE_NAMES,
+            *ALL_COMPUTED_FEATURE_NAMES,
             "soft_label",
             "sparse_q_ndcg",
             "dense_q_ndcg",
@@ -634,7 +639,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
             writer.writerow([
                 row["dataset"],
                 row["query_id"],
-                *(row["features"][name] for name in FEATURE_NAMES),
+                *(row["features"][name] for name in ALL_COMPUTED_FEATURE_NAMES),
                 row["soft_label"],
                 row["sparse_q_ndcg"],
                 row["dense_q_ndcg"],

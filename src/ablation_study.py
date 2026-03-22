@@ -8,6 +8,7 @@ then evaluates the selected router model under different feature subsets.
 
 import argparse
 import csv
+import json
 import os
 import sys
 from copy import deepcopy
@@ -25,7 +26,7 @@ os.chdir(PROJECT_ROOT)
 
 import src.utils as u
 from src.retrieve_and_evaluate import (
-    FEATURE_NAMES,
+    ALL_COMPUTED_FEATURE_NAMES,
     apply_zscore,
     build_or_load_query_feature_cache,
     compute_zscore_stats,
@@ -41,17 +42,13 @@ from src.retrieve_and_evaluate import (
     split_rows_train_test,
     train_router_model,
 )
+from src.feature_inventory import (
+    FEATURE_GROUPS_CURRENT,
+    FEATURE_GROUPS_EXPANDED,
+    build_feature_catalog,
+    get_feature_inventory,
+)
 from src.utils import ensure_dir, get_config_path, load_config, model_short_name
-
-
-FEATURE_GROUPS = {
-    "overlap": ["agreement", "overlap_at_3"],
-    "confidence": ["dense_confidence", "sparse_confidence", "confidence_gap"],
-    "idf": ["average_idf", "max_idf", "idf_std", "rare_term_ratio"],
-    "query": ["query_length", "stopword_ratio"],
-    "entropy": ["cross_entropy"],
-}
-ALL_FEATURES = sum(FEATURE_GROUPS.values(), [])
 
 
 def filter_rows_by_features(rows, selected_features):
@@ -67,7 +64,7 @@ def filter_rows_by_features(rows, selected_features):
 
 def ordered_feature_subset(selected_features):
     """Return selected features ordered as they appear in FEATURE_NAMES."""
-    ordered_features = [f for f in FEATURE_NAMES if f in selected_features]
+    ordered_features = [f for f in ALL_COMPUTED_FEATURE_NAMES if f in selected_features]
     if not ordered_features:
         raise ValueError("No features selected for ablation.")
     return ordered_features
@@ -85,19 +82,46 @@ def rows_to_matrix_subset(rows, selected_features):
     return X, y, qids, ordered_features
 
 
-def _validate_feature_setup():
-    """Validate that ablation feature groups match active routing features."""
-    if len(ALL_FEATURES) != len(set(ALL_FEATURES)):
-        raise ValueError("Duplicate feature names detected in FEATURE_GROUPS.")
+def _validate_inventory_setup(feature_inventory, feature_names, feature_groups, rows_by_dataset):
+    """Validate feature inventory, groups, and row coverage for selected inventory."""
+    if len(feature_names) != len(set(feature_names)):
+        raise ValueError(f"Duplicate feature names in inventory={feature_inventory}.")
 
-    expected = set(FEATURE_NAMES)
-    actual = set(ALL_FEATURES)
+    grouped_features = sum(feature_groups.values(), [])
+    if len(grouped_features) != len(set(grouped_features)):
+        raise ValueError(f"Duplicate feature names in groups for inventory={feature_inventory}.")
+
+    expected = set(feature_names)
+    actual = set(grouped_features)
     if expected != actual:
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
         raise ValueError(
-            "Ablation feature definition mismatch with active FEATURE_NAMES. "
-            f"Missing={missing}, Extra={extra}"
+            "Feature group mismatch for inventory="
+            f"{feature_inventory}. Missing={missing}, Extra={extra}"
+        )
+
+    ordered = [f for f in ALL_COMPUTED_FEATURE_NAMES if f in feature_names]
+    if ordered != feature_names:
+        raise ValueError(
+            f"Inventory ordering for {feature_inventory} must follow master feature ordering."
+        )
+
+    sample_row = None
+    for dataset_rows in rows_by_dataset.values():
+        if dataset_rows:
+            sample_row = dataset_rows[0]
+            break
+
+    if sample_row is None:
+        raise ValueError("No feature rows available to validate inventory coverage.")
+
+    available = set(sample_row.get("features", {}).keys())
+    missing_in_rows = [f for f in feature_names if f not in available]
+    if missing_in_rows:
+        raise ValueError(
+            "Selected inventory contains features not present in cached rows: "
+            f"{missing_in_rows}. Rebuild/refresh feature cache."
         )
 
 
@@ -284,15 +308,15 @@ def run_ablation_experiment(
     raise ValueError(f"Unsupported eval_mode={eval_mode!r}. Use 'within_dataset' or 'loodo'.")
 
 
-def build_experiments():
+def build_experiments(feature_names, feature_groups):
     """Return ordered ablation experiment definitions."""
-    experiments = [("all_features", "ALL", ALL_FEATURES)]
+    experiments = [("all_features", "ALL", feature_names)]
 
-    for group_name, group_features in FEATURE_GROUPS.items():
-        selected = [f for f in ALL_FEATURES if f not in group_features]
+    for group_name, group_features in feature_groups.items():
+        selected = [f for f in feature_names if f not in group_features]
         experiments.append(("leave_one_out", group_name, selected))
 
-    for group_name, group_features in FEATURE_GROUPS.items():
+    for group_name, group_features in feature_groups.items():
         experiments.append(("single_group", group_name, list(group_features)))
 
     return experiments
@@ -306,6 +330,8 @@ def save_ablation_results(results, output_csv):
             [
                 "experiment",
                 "feature_set",
+                "model_type",
+                "feature_inventory",
                 "evaluation_mode",
                 "dense_ndcg",
                 "sparse_ndcg",
@@ -318,6 +344,8 @@ def save_ablation_results(results, output_csv):
                 [
                     row["experiment"],
                     row["feature_set"],
+                    row["model_type"],
+                    row["feature_inventory"],
                     row["evaluation_mode"],
                     f"{row['dense']:.6f}",
                     f"{row['sparse']:.6f}",
@@ -325,6 +353,33 @@ def save_ablation_results(results, output_csv):
                     f"{row['dynamic']:.6f}",
                 ]
             )
+
+
+def write_feature_inventory_summary(output_json, selected_inventory):
+    """Write audit summary of current/restored/skipped features."""
+    current_features, _ = get_feature_inventory("current")
+    expanded_features, _ = get_feature_inventory("expanded")
+
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "selected_feature_inventory": selected_inventory,
+                "available_inventories": {
+                    "current": {
+                        "feature_count": len(current_features),
+                        "groups": FEATURE_GROUPS_CURRENT,
+                    },
+                    "expanded": {
+                        "feature_count": len(expanded_features),
+                        "groups": FEATURE_GROUPS_EXPANDED,
+                    },
+                },
+                "feature_catalog": build_feature_catalog(),
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
 
 
 def main():
@@ -336,12 +391,21 @@ def main():
         default="config.yaml",
         help="Path to YAML config file (default: config.yaml)",
     )
+    parser.add_argument(
+        "--feature-inventory",
+        choices=["current", "expanded"],
+        default=None,
+        help="Feature inventory override for ablation experiments.",
+    )
+    parser.add_argument(
+        "--compare-inventories",
+        action="store_true",
+        help="Run additional ALL-features comparison for both current and expanded inventories.",
+    )
     args = parser.parse_args()
 
     u.CONFIG_PATH = args.config
     cfg = load_config()
-
-    _validate_feature_setup()
 
     datasets = cfg.get("datasets", [])
     if not datasets:
@@ -388,6 +452,26 @@ def main():
             f"C={svr_cfg['C']}, gamma={svr_cfg['gamma']}, epsilon={svr_cfg['epsilon']}"
         )
 
+    ablation_cfg = cfg.get("ablation", {}) or {}
+    selected_inventory = (
+        args.feature_inventory
+        if args.feature_inventory
+        else str(ablation_cfg.get("feature_inventory", "current")).strip().lower()
+    )
+    compare_inventories = bool(args.compare_inventories or ablation_cfg.get("compare_inventories", False))
+
+    feature_names, feature_groups = get_feature_inventory(selected_inventory)
+
+    print(f"Feature inventory: {selected_inventory}")
+    print(f"Compare inventories: {compare_inventories}")
+
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    out_dir = os.path.join(results_root, short_model, "ablation")
+    ensure_dir(out_dir)
+    out_csv = os.path.join(out_dir, "ablation_results.csv")
+    feature_summary_json = os.path.join(out_dir, "feature_inventory_summary.json")
+    write_feature_inventory_summary(feature_summary_json, selected_inventory)
+
     print("\n[1/3] Loading cached retrieval artifacts per dataset ...")
     dataset_cache_map = {}
     for dataset_name in datasets:
@@ -409,8 +493,10 @@ def main():
     for ds in datasets:
         rows_by_dataset[ds].sort(key=lambda r: r["query_id"])
 
+    _validate_inventory_setup(selected_inventory, feature_names, feature_groups, rows_by_dataset)
+
     print("\n[3/3] Running ablation experiments ...")
-    experiments = build_experiments()
+    experiments = build_experiments(feature_names, feature_groups)
     results = []
 
     for experiment, group_name, selected_features in tqdm(
@@ -440,20 +526,48 @@ def main():
             {
                 "experiment": experiment,
                 "feature_set": group_name,
+                "model_type": model_type,
+                "feature_inventory": selected_inventory,
                 "evaluation_mode": eval_mode,
                 **metrics,
             }
         )
 
-    results_root = get_config_path(cfg, "results_folder", "data/results")
-    out_dir = os.path.join(results_root, short_model, "ablation")
-    ensure_dir(out_dir)
-    out_csv = os.path.join(out_dir, "ablation_results.csv")
+    if compare_inventories:
+        for inventory_name in ["current", "expanded"]:
+            inv_features, inv_groups = get_feature_inventory(inventory_name)
+            _validate_inventory_setup(inventory_name, inv_features, inv_groups, rows_by_dataset)
+
+            print(f"\n[COMPARE] Running all_features for inventory={inventory_name}")
+            metrics = run_ablation_experiment(
+                rows_by_dataset=rows_by_dataset,
+                dataset_cache_map=dataset_cache_map,
+                selected_features=inv_features,
+                eval_mode=eval_mode,
+                cfg=cfg,
+                datasets=datasets,
+                device=device,
+                ndcg_k=ndcg_k,
+                rrf_k=rrf_k,
+            )
+            print(f"Dynamic NDCG@{ndcg_k}: {metrics['dynamic']:.4f}")
+            results.append(
+                {
+                    "experiment": "inventory_compare",
+                    "feature_set": "ALL",
+                    "model_type": model_type,
+                    "feature_inventory": inventory_name,
+                    "evaluation_mode": eval_mode,
+                    **metrics,
+                }
+            )
+
     save_ablation_results(results, out_csv)
 
     print("\n" + "=" * 72)
     print("Ablation study completed.")
     print(f"Results CSV: {out_csv}")
+    print(f"Feature inventory summary JSON: {feature_summary_json}")
     print("=" * 72)
 
 

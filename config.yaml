@@ -121,6 +121,14 @@ within_dataset_evaluation:
   shuffle: true
 
 # ------------------------------------------------------------
+# Ablation controls
+# Used by: python src/ablation_study.py
+# ------------------------------------------------------------
+ablation:
+  feature_inventory: "expanded"  # current | expanded
+  compare_inventories: false
+
+# ------------------------------------------------------------
 # Supervised query-level routing benchmark (LOODO)
 # ------------------------------------------------------------
 # Used by: python src/retrieve_and_evaluate.py
@@ -132,7 +140,7 @@ supervised_routing:
   feature_workers: 8
 
   # Model/training setup
-  model_type: "svr_rbf"  # logistic | random_forest | xgboost | svr_rbf
+  model_type: "xgboost"  # logistic | random_forest | xgboost | svr_rbf
   regularization: "l2"
   C: 1.0
   fit_intercept: true
