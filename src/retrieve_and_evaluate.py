@@ -11,7 +11,8 @@ This script reuses preprocessing artifacts and retrieval caches to benchmark:
 Important methodological points:
   - No oracle search on the held-out dataset.
   - Soft labels are query-level targets in [0, 1], not hard classes.
-    - Supports logistic regression (PyTorch) and random forest regression (scikit-learn).
+        - Supports logistic regression (PyTorch), random forest regression (scikit-learn),
+            and XGBoost regression (xgboost).
 """
 
 import argparse
@@ -875,6 +876,25 @@ def get_random_forest_config(cfg):
     }
 
 
+def get_xgboost_config(cfg):
+    """Return XGBoost hyperparameters with reproducible defaults."""
+    routing_cfg = cfg.get("supervised_routing", {})
+    xgb_cfg = cfg.get("xgboost", {})
+    return {
+        "n_estimators": int(xgb_cfg.get("n_estimators", 300)),
+        "max_depth": int(xgb_cfg.get("max_depth", 6)),
+        "learning_rate": float(xgb_cfg.get("learning_rate", 0.05)),
+        "subsample": float(xgb_cfg.get("subsample", 0.8)),
+        "colsample_bytree": float(xgb_cfg.get("colsample_bytree", 0.8)),
+        "reg_lambda": float(xgb_cfg.get("reg_lambda", 1.0)),
+        "reg_alpha": float(xgb_cfg.get("reg_alpha", 0.0)),
+        "min_child_weight": float(xgb_cfg.get("min_child_weight", 1)),
+        "objective": str(xgb_cfg.get("objective", "reg:squarederror")),
+        "n_jobs": int(xgb_cfg.get("n_jobs", -1)),
+        "random_state": int(xgb_cfg.get("random_state", routing_cfg.get("seed", 42))),
+    }
+
+
 def _create_random_forest_regressor(cfg):
     """Create RandomForestRegressor with clear sklearn-missing error."""
     try:
@@ -889,6 +909,19 @@ def _create_random_forest_regressor(cfg):
     return RandomForestRegressor(**rf_params)
 
 
+def _create_xgboost_regressor(cfg):
+    """Create XGBRegressor with explicit dependency error and reproducible params."""
+    try:
+        from xgboost import XGBRegressor
+    except ImportError as exc:
+        raise ImportError(
+            "xgboost is required for model_type='xgboost'. Please install it."
+        ) from exc
+
+    xgb_params = get_xgboost_config(cfg)
+    return XGBRegressor(**xgb_params)
+
+
 def train_router_model(X_train, y_train, cfg, device):
     """Train selected router model and return a model bundle."""
     model_type = get_router_model_type(cfg)
@@ -899,9 +932,13 @@ def train_router_model(X_train, y_train, cfg, device):
         model = _create_random_forest_regressor(cfg)
         model.fit(X_train, y_train)
         return {"model_type": model_type, "model": model}
+    if model_type == "xgboost":
+        model = _create_xgboost_regressor(cfg)
+        model.fit(X_train, y_train)
+        return {"model_type": model_type, "model": model}
     raise ValueError(
         f"Unsupported supervised_routing.model_type={model_type!r}. "
-        "Use 'logistic' or 'random_forest'."
+        "Use 'logistic', 'random_forest', or 'xgboost'."
     )
 
 
@@ -913,6 +950,9 @@ def predict_router_alpha(model_bundle, X, cfg, device):
     if model_type == "logistic":
         return predict_alpha(model, X, device)
     if model_type == "random_forest":
+        pred = model.predict(X)
+        return np.clip(pred, 0.0, 1.0).astype(np.float32)
+    if model_type == "xgboost":
         pred = model.predict(X)
         return np.clip(pred, 0.0, 1.0).astype(np.float32)
 
@@ -929,6 +969,11 @@ def extract_router_importance_or_coefficients(model_bundle, feature_names, cfg):
         return intercept, values, "coefficient"
 
     if model_type == "random_forest":
+        importances = model.feature_importances_.reshape(-1)
+        by_feature = {name: float(importances[idx]) for idx, name in enumerate(feature_names)}
+        return 0.0, by_feature, "importance"
+
+    if model_type == "xgboost":
         importances = model.feature_importances_.reshape(-1)
         by_feature = {name: float(importances[idx]) for idx, name in enumerate(feature_names)}
         return 0.0, by_feature, "importance"
@@ -954,6 +999,12 @@ def serialize_router_model(model_bundle):
             "estimator": model,
         }
 
+    if model_type == "xgboost":
+        return {
+            "model_type": model_type,
+            "estimator": model,
+        }
+
     raise ValueError(f"Unsupported router model type in serialization: {model_type!r}")
 
 
@@ -972,6 +1023,9 @@ def deserialize_router_model(serialized, cfg, device):
     if model_type == "random_forest":
         return {"model_type": model_type, "model": serialized["estimator"]}
 
+    if model_type == "xgboost":
+        return {"model_type": model_type, "model": serialized["estimator"]}
+
     raise ValueError(f"Unsupported router model type in deserialization: {model_type!r}")
 
 
@@ -980,6 +1034,8 @@ def save_router_metadata_json(cfg, model_type, output_path):
     payload = {"model_type": model_type}
     if model_type == "random_forest":
         payload["random_forest"] = get_random_forest_config(cfg)
+    if model_type == "xgboost":
+        payload["xgboost"] = get_xgboost_config(cfg)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
 
@@ -1437,6 +1493,14 @@ def run_within_dataset_benchmark(
     print(f"Router model type: {model_type}")
     if model_type == "random_forest":
         print(f"RandomForest params: {get_random_forest_config(cfg)}")
+    if model_type == "xgboost":
+        xgb_cfg = get_xgboost_config(cfg)
+        print(
+            "XGBoost params: "
+            f"n_estimators={xgb_cfg['n_estimators']}, "
+            f"max_depth={xgb_cfg['max_depth']}, "
+            f"learning_rate={xgb_cfg['learning_rate']}"
+        )
 
     per_repeat_rows = []
     alpha_rows = []
@@ -1664,6 +1728,14 @@ def main():
     print(f"Router model type: {model_type}")
     if model_type == "random_forest":
         print(f"RandomForest params: {get_random_forest_config(cfg)}")
+    if model_type == "xgboost":
+        xgb_cfg = get_xgboost_config(cfg)
+        print(
+            "XGBoost params: "
+            f"n_estimators={xgb_cfg['n_estimators']}, "
+            f"max_depth={xgb_cfg['max_depth']}, "
+            f"learning_rate={xgb_cfg['learning_rate']}"
+        )
     print("\n[1/4] Loading cached retrieval artifacts per dataset ...")
 
     dataset_cache_map = {}
@@ -1763,6 +1835,7 @@ def main():
             "bm25": u.get_bm25_params(cfg),
             "model_type": model_type,
             "random_forest": get_random_forest_config(cfg) if model_type == "random_forest" else None,
+            "xgboost": get_xgboost_config(cfg) if model_type == "xgboost" else None,
             "training_cfg": {
                 "regularization": routing_cfg.get("regularization", "l2"),
                 "C": routing_cfg.get("C", 1.0),

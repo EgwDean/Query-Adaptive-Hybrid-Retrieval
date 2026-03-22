@@ -18,6 +18,7 @@ torch
 # Scientific computing
 numpy
 scikit-learn
+xgboost
 
 # Visualization
 matplotlib

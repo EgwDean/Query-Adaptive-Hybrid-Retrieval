@@ -3,7 +3,7 @@
 Structured feature ablation study for supervised query routing.
 
 This script reuses cached retrieval artifacts and cached query-level features,
-then evaluates the same logistic router under different feature subsets.
+then evaluates the selected router model under different feature subsets.
 """
 
 import argparse
@@ -34,6 +34,7 @@ from src.retrieve_and_evaluate import (
     evaluate_benchmark_methods_for_qids,
     get_random_forest_config,
     get_router_model_type,
+    get_xgboost_config,
     predict_router_alpha,
     set_global_seed,
     split_rows_train_test,
@@ -371,6 +372,14 @@ def main():
     print(f"Router model type: {model_type}")
     if model_type == "random_forest":
         print(f"RandomForest params: {get_random_forest_config(cfg)}")
+    if model_type == "xgboost":
+        xgb_cfg = get_xgboost_config(cfg)
+        print(
+            "XGBoost params: "
+            f"n_estimators={xgb_cfg['n_estimators']}, "
+            f"max_depth={xgb_cfg['max_depth']}, "
+            f"learning_rate={xgb_cfg['learning_rate']}"
+        )
 
     print("\n[1/3] Loading cached retrieval artifacts per dataset ...")
     dataset_cache_map = {}

@@ -89,8 +89,8 @@ bm25_optimization:
 # Embedding model
 # ------------------------------------------------------------
 embeddings:
-  #model_name: "BAAI/bge-m3"
-  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  model_name: "BAAI/bge-m3"
+  #model_name: "sentence-transformers/all-MiniLM-L6-v2"
   batch_size: 64   # lower to 8-16 for large models on GPU with long documents
   # max_seq_length: 512   # truncate docs to this many tokens before encoding.
 
@@ -132,8 +132,7 @@ supervised_routing:
   feature_workers: 8
 
   # Model/training setup
-  model_type: "logistic"
-  model_type: "random_forest"
+  model_type: "xgboost"  # logistic | random_forest | xgboost
   regularization: "l2"
   C: 1.0
   fit_intercept: true
@@ -156,5 +155,21 @@ random_forest:
   min_samples_leaf: 4
   max_features: "sqrt"
   bootstrap: true
+  n_jobs: -1
+  random_state: 42
+
+# ------------------------------------------------------------
+# XGBoost router (used when supervised_routing.model_type=xgboost)
+# ------------------------------------------------------------
+xgboost:
+  n_estimators: 300
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  reg_alpha: 0.0
+  min_child_weight: 1
+  objective: "reg:squarederror"
   n_jobs: -1
   random_state: 42
