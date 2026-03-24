@@ -206,5 +206,95 @@ xgboost_optimization:
 # If not provided for a dataset/mode, global xgboost defaults are used.
 # ------------------------------------------------------------
 xgboost_per_dataset:
-  within_dataset: {}
-  loodo: {}
+  within_dataset:
+    scifact:
+      n_estimators: 200
+      max_depth: 6
+      learning_rate: 0.1
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 1
+      reg_lambda: 1.0
+      reg_alpha: 0.0
+    nfcorpus:
+      n_estimators: 100
+      max_depth: 4
+      learning_rate: 0.1
+      subsample: 0.8
+      colsample_bytree: 1.0
+      min_child_weight: 1
+      reg_lambda: 3.0
+      reg_alpha: 0.0
+    arguana:
+      n_estimators: 500
+      max_depth: 8
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 5
+      reg_lambda: 3.0
+      reg_alpha: 0.0
+    fiqa:
+      n_estimators: 300
+      max_depth: 6
+      learning_rate: 0.03
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 5
+      reg_lambda: 3.0
+      reg_alpha: 0.1
+    scidocs:
+      n_estimators: 200
+      max_depth: 6
+      learning_rate: 0.03
+      subsample: 0.8
+      colsample_bytree: 1.0
+      min_child_weight: 3
+      reg_lambda: 1.0
+      reg_alpha: 0.1
+  loodo:
+    scifact:
+      n_estimators: 200
+      max_depth: 4
+      learning_rate: 0.1
+      subsample: 1.0
+      colsample_bytree: 1.0
+      min_child_weight: 5
+      reg_lambda: 1.0
+      reg_alpha: 0.0
+    nfcorpus:
+      n_estimators: 100
+      max_depth: 4
+      learning_rate: 0.05
+      subsample: 0.8
+      colsample_bytree: 1.0
+      min_child_weight: 1
+      reg_lambda: 1.0
+      reg_alpha: 0.0
+    arguana:
+      n_estimators: 300
+      max_depth: 3
+      learning_rate: 0.1
+      subsample: 1.0
+      colsample_bytree: 0.8
+      min_child_weight: 3
+      reg_lambda: 1.0
+      reg_alpha: 0.1
+    fiqa:
+      n_estimators: 300
+      max_depth: 6
+      learning_rate: 0.1
+      subsample: 0.8
+      colsample_bytree: 0.8
+      min_child_weight: 5
+      reg_lambda: 3.0
+      reg_alpha: 0.1
+    scidocs:
+      n_estimators: 500
+      max_depth: 6
+      learning_rate: 0.1
+      subsample: 1.0
+      colsample_bytree: 1.0
+      min_child_weight: 3
+      reg_lambda: 3.0
+      reg_alpha: 0.0
