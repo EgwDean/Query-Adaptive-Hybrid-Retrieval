@@ -1,12 +1,19 @@
 """compare_negative_delta_features.py
 
-Compare a compact routing model (features with negative LOFO macro deltas)
-against the full-feature routing model.
+Run a model ladder between compact and full routing features.
+
+Default setup targets 14 total models:
+- 1 dense-only retrieval baseline (no router training)
+- 1 full-feature router
+- 12 compact-based ladder models, where each next model adds one omitted
+    feature (ordered by least harmful macro LOFO delta first)
 
 Method:
 - Within-dataset only
 - Paired train/test splits
-- Delta definition: compact_ndcg - full_ndcg
+- Delta definitions:
+    - delta_vs_full = model_ndcg - full_ndcg
+    - delta_vs_prev = model_ndcg - previous_model_ndcg (ladder order)
 """
 
 import argparse
@@ -14,6 +21,9 @@ import csv
 import os
 import sys
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -55,6 +65,17 @@ def load_negative_feature_rows(macro_delta_csv, threshold):
     return rows
 
 
+def load_macro_delta_map(macro_delta_csv):
+    """Load full feature->macro_delta mapping from LOFO macro CSV."""
+    delta_map = {}
+    with open(macro_delta_csv, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            feature = str(row["feature_removed"]).strip()
+            delta_map[feature] = float(row["macro_delta_ndcg"])
+    return delta_map
+
+
 def run_model_once(train_rows, test_rows, feature_names, cfg, dataset_name, ds_cache, device, ndcg_k, rrf_k):
     """Train and evaluate one model on one paired split."""
     X_train_raw, y_train, _ = rows_to_matrix_with_features(train_rows, feature_names)
@@ -87,6 +108,20 @@ def run_model_once(train_rows, test_rows, feature_names, cfg, dataset_name, ds_c
     return float(metrics["dynamic_wrrf_ndcg"])
 
 
+def evaluate_dense_baseline_for_qids(test_qids, ds_cache, ndcg_k, rrf_k):
+    """Evaluate dense-only retrieval on a fixed query subset."""
+    metrics = evaluate_benchmark_methods_for_qids(
+        bm25_results=ds_cache["bm25_results"],
+        dense_results=ds_cache["dense_results"],
+        qrels=ds_cache["qrels"],
+        ndcg_k=ndcg_k,
+        rrf_k=rrf_k,
+        query_ids=test_qids,
+        alpha_map=None,
+    )
+    return float(metrics["dense_only_ndcg"])
+
+
 def save_negative_feature_list(rows, output_csv):
     """Persist the chosen compact feature set with macro deltas."""
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
@@ -96,58 +131,146 @@ def save_negative_feature_list(rows, output_csv):
             writer.writerow([row["feature_removed"], f"{row['macro_delta_ndcg']:.6f}"])
 
 
+def save_ladder_plan_csv(rows, output_csv):
+    """Persist model ladder plan and feature composition."""
+    with open(output_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "model_index",
+                "model_name",
+                "model_type",
+                "feature_count",
+                "added_feature",
+                "added_feature_macro_delta",
+                "feature_list",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["model_index"],
+                    row["model_name"],
+                    row["model_type"],
+                    row["feature_count"],
+                    row.get("added_feature", ""),
+                    "" if row.get("added_feature_macro_delta") is None else f"{row['added_feature_macro_delta']:.6f}",
+                    "|".join(row.get("feature_names", [])),
+                ]
+            )
+
+
 def save_per_dataset_comparison(rows, output_csv):
-    """Save per-dataset full-vs-compact comparison."""
+    """Save per-dataset model comparison against full and previous model."""
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
                 "dataset",
-                "full_dynamic_ndcg",
-                "compact_dynamic_ndcg",
-                "delta_compact_minus_full",
-                "compact_feature_count",
+                "model_index",
+                "model_name",
+                "model_type",
+                "feature_count",
+                "dynamic_ndcg",
+                "delta_vs_full",
+                "delta_vs_previous",
+                "added_feature",
             ]
         )
         for row in rows:
             writer.writerow(
                 [
                     row["dataset"],
-                    f"{row['full_dynamic_ndcg']:.6f}",
-                    f"{row['compact_dynamic_ndcg']:.6f}",
-                    f"{row['delta_compact_minus_full']:.6f}",
-                    row["compact_feature_count"],
+                    row["model_index"],
+                    row["model_name"],
+                    row["model_type"],
+                    row["feature_count"],
+                    f"{row['dynamic_ndcg']:.6f}",
+                    f"{row['delta_vs_full']:.6f}",
+                    "" if row["delta_vs_previous"] is None else f"{row['delta_vs_previous']:.6f}",
+                    row.get("added_feature", ""),
                 ]
             )
 
 
-def save_macro_comparison(row, output_csv):
-    """Save macro-average full-vs-compact comparison."""
+def save_macro_comparison(rows, output_csv):
+    """Save macro-average comparison across all evaluated models."""
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
-                "macro_full_dynamic_ndcg",
-                "macro_compact_dynamic_ndcg",
-                "macro_delta_compact_minus_full",
-                "full_feature_count",
-                "compact_feature_count",
+                "model_index",
+                "model_name",
+                "model_type",
+                "feature_count",
+                "macro_dynamic_ndcg",
+                "macro_delta_vs_full",
+                "macro_delta_vs_previous",
+                "added_feature",
             ]
         )
-        writer.writerow(
-            [
-                f"{row['macro_full_dynamic_ndcg']:.6f}",
-                f"{row['macro_compact_dynamic_ndcg']:.6f}",
-                f"{row['macro_delta_compact_minus_full']:.6f}",
-                row["full_feature_count"],
-                row["compact_feature_count"],
-            ]
+        for row in rows:
+            writer.writerow(
+                [
+                    row["model_index"],
+                    row["model_name"],
+                    row["model_type"],
+                    row["feature_count"],
+                    f"{row['macro_dynamic_ndcg']:.6f}",
+                    f"{row['macro_delta_vs_full']:.6f}",
+                    "" if row["macro_delta_vs_previous"] is None else f"{row['macro_delta_vs_previous']:.6f}",
+                    row.get("added_feature", ""),
+                ]
+            )
+
+
+def save_macro_delta_plot(macro_rows, output_png):
+    """Save macro delta-vs-full bar plot for all models."""
+    labels = [f"{r['model_index']}: {r['model_name']}" for r in macro_rows]
+    values = [r["macro_delta_vs_full"] for r in macro_rows]
+    colors = ["#1f77b4" if v >= 0 else "#d62728" for v in values]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.bar(labels, values, color=colors)
+    ax.axhline(0.0, color="black", linewidth=1.0)
+    ax.set_title("Macro Delta vs Full (NDCG@10)")
+    ax.set_ylabel("model_ndcg - full_ndcg")
+    ax.set_xlabel("Model")
+    ax.grid(axis="y", alpha=0.25)
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    fig.savefig(output_png, dpi=220)
+    plt.close(fig)
+
+
+def save_dataset_delta_plot(per_dataset_rows, output_png):
+    """Save per-dataset delta-vs-full line plot across model index."""
+    datasets = sorted({r["dataset"] for r in per_dataset_rows})
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    for ds in datasets:
+        ds_rows = sorted(
+            [r for r in per_dataset_rows if r["dataset"] == ds],
+            key=lambda r: r["model_index"],
         )
+        x = [r["model_index"] for r in ds_rows]
+        y = [r["delta_vs_full"] for r in ds_rows]
+        ax.plot(x, y, marker="o", linewidth=1.5, label=ds)
+
+    ax.axhline(0.0, color="black", linewidth=1.0)
+    ax.set_title("Per-Dataset Delta vs Full Across Ladder")
+    ax.set_xlabel("Model index")
+    ax.set_ylabel("model_ndcg - full_ndcg")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    plt.tight_layout()
+    fig.savefig(output_png, dpi=220)
+    plt.close(fig)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compare full router vs compact router built from negative LOFO macro deltas."
+        description="Compare dense baseline, full router, and compact-based feature-addition ladder models."
     )
     parser.add_argument(
         "--config",
@@ -164,6 +287,12 @@ def main():
         type=float,
         default=0.0,
         help="Keep features with macro_delta_ndcg < threshold (default: 0.0).",
+    )
+    parser.add_argument(
+        "--n-ladder-models",
+        type=int,
+        default=12,
+        help="Number of compact-based ladder models (default: 12).",
     )
     args = parser.parse_args()
 
@@ -205,6 +334,7 @@ def main():
         )
 
     full_features = get_selected_feature_names()
+    macro_delta_map = load_macro_delta_map(macro_delta_csv)
     negative_rows = load_negative_feature_rows(macro_delta_csv, args.delta_threshold)
     negative_feature_set = {r["feature_removed"] for r in negative_rows}
     compact_features = [f for f in full_features if f in negative_feature_set]
@@ -214,15 +344,56 @@ def main():
             "No compact features selected. Try increasing --delta-threshold or verify LOFO CSV values."
         )
 
+    omitted_features = [f for f in full_features if f not in negative_feature_set]
+    if not omitted_features:
+        raise ValueError("No omitted features available to build a ladder.")
+
+    omitted_sorted = sorted(
+        omitted_features,
+        key=lambda f: (macro_delta_map.get(f, float("inf")), f),
+    )
+
+    n_ladder = int(args.n_ladder_models)
+    if n_ladder <= 0:
+        raise ValueError("--n-ladder-models must be > 0.")
+
+    max_additions = min(len(omitted_sorted), max(0, n_ladder - 1))
+    if max_additions < (n_ladder - 1):
+        print(
+            f"[WARN] Requested {n_ladder} ladder models but only {len(omitted_sorted)} omitted features are "
+            f"available. Using {max_additions + 1} ladder models instead."
+        )
+    n_ladder_effective = max_additions + 1
+
+    ladder_models = []
+    for idx in range(n_ladder_effective):
+        added = omitted_sorted[:idx]
+        added_feature = omitted_sorted[idx - 1] if idx > 0 else ""
+        added_delta = macro_delta_map.get(added_feature) if added_feature else None
+        feature_names = [f for f in full_features if (f in compact_features or f in added)]
+        ladder_models.append(
+            {
+                "model_name": f"compact_plus_{idx}",
+                "model_type": "router",
+                "feature_names": feature_names,
+                "feature_count": len(feature_names),
+                "added_feature": added_feature,
+                "added_feature_macro_delta": added_delta,
+            }
+        )
+
     print("=" * 72)
-    print("Full vs compact (negative-delta) feature comparison")
+    print("Dense + full + compact ladder comparison")
     print(f"Device                 : {device}")
     print(f"Datasets ({len(datasets)})         : {', '.join(datasets)}")
     print(f"Full feature count     : {len(full_features)}")
     print(f"Compact feature count  : {len(compact_features)}")
+    print(f"Omitted feature count  : {len(omitted_features)}")
+    print(f"Ladder models          : {n_ladder_effective}")
+    print(f"Total models (target)  : dense + full + ladder = {2 + n_ladder_effective}")
     print(f"Delta threshold        : {args.delta_threshold} (keep delta < threshold)")
     print(f"Macro delta CSV        : {macro_delta_csv}")
-    print("Delta definition       : compact_ndcg - full_ndcg")
+    print("Delta definition       : model_ndcg - full_ndcg")
     print("=" * 72)
 
     print("\n[1/4] Loading cached retrieval artifacts per dataset ...")
@@ -238,8 +409,36 @@ def main():
     for ds in datasets:
         rows_by_dataset[ds].sort(key=lambda r: r["query_id"])
 
-    print("\n[3/4] Running paired within-dataset comparison ...")
+    print("\n[3/4] Running paired within-dataset comparison across all models ...")
+
+    model_specs = []
+    model_specs.append(
+        {
+            "model_name": "dense_only",
+            "model_type": "dense_baseline",
+            "feature_names": [],
+            "feature_count": 0,
+            "added_feature": "",
+            "added_feature_macro_delta": None,
+        }
+    )
+    model_specs.append(
+        {
+            "model_name": "full_router",
+            "model_type": "router",
+            "feature_names": list(full_features),
+            "feature_count": len(full_features),
+            "added_feature": "",
+            "added_feature_macro_delta": None,
+        }
+    )
+    model_specs.extend(ladder_models)
+
+    for idx, spec in enumerate(model_specs):
+        spec["model_index"] = idx
+
     per_dataset_rows = []
+    per_dataset_model_scores = {}
 
     for dataset_name in datasets:
         ds_rows = list(rows_by_dataset[dataset_name])
@@ -247,8 +446,7 @@ def main():
             raise ValueError(f"Dataset {dataset_name} has only {len(ds_rows)} rows; need at least 2.")
 
         ds_offset = dataset_seed_offset(dataset_name)
-        full_scores = []
-        compact_scores = []
+        per_model_scores = {spec["model_name"]: [] for spec in model_specs}
 
         for repeat_idx in range(n_repeats):
             repeat_seed = seed + repeat_idx + ds_offset
@@ -259,81 +457,114 @@ def main():
                 shuffle=shuffle,
             )
 
-            full_ndcg = run_model_once(
-                train_rows=train_rows,
-                test_rows=test_rows,
-                feature_names=full_features,
-                cfg=cfg,
-                dataset_name=dataset_name,
+            dense_ndcg = evaluate_dense_baseline_for_qids(
+                test_qids=[r["query_id"] for r in test_rows],
                 ds_cache=dataset_cache_map[dataset_name],
-                device=device,
                 ndcg_k=ndcg_k,
                 rrf_k=rrf_k,
             )
-            compact_ndcg = run_model_once(
-                train_rows=train_rows,
-                test_rows=test_rows,
-                feature_names=compact_features,
-                cfg=cfg,
-                dataset_name=dataset_name,
-                ds_cache=dataset_cache_map[dataset_name],
-                device=device,
-                ndcg_k=ndcg_k,
-                rrf_k=rrf_k,
+            per_model_scores["dense_only"].append(dense_ndcg)
+
+            for spec in model_specs:
+                if spec["model_type"] != "router":
+                    continue
+                ndcg = run_model_once(
+                    train_rows=train_rows,
+                    test_rows=test_rows,
+                    feature_names=spec["feature_names"],
+                    cfg=cfg,
+                    dataset_name=dataset_name,
+                    ds_cache=dataset_cache_map[dataset_name],
+                    device=device,
+                    ndcg_k=ndcg_k,
+                    rrf_k=rrf_k,
+                )
+                per_model_scores[spec["model_name"]].append(ndcg)
+
+        per_dataset_model_scores[dataset_name] = {
+            k: float(np.mean(v)) for k, v in per_model_scores.items()
+        }
+
+        full_mean = per_dataset_model_scores[dataset_name]["full_router"]
+        print(f"\n  Dataset={dataset_name} | full={full_mean:.4f}")
+        previous_mean = None
+        for spec in model_specs:
+            model_mean = per_dataset_model_scores[dataset_name][spec["model_name"]]
+            delta_vs_full = float(model_mean - full_mean)
+            delta_vs_prev = None if previous_mean is None else float(model_mean - previous_mean)
+            previous_mean = model_mean
+
+            per_dataset_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "model_index": spec["model_index"],
+                    "model_name": spec["model_name"],
+                    "model_type": spec["model_type"],
+                    "feature_count": spec["feature_count"],
+                    "dynamic_ndcg": model_mean,
+                    "delta_vs_full": delta_vs_full,
+                    "delta_vs_previous": delta_vs_prev,
+                    "added_feature": spec.get("added_feature", ""),
+                }
+            )
+            print(
+                f"    idx={spec['model_index']:>2} | {spec['model_name']:<16} | "
+                f"ndcg={model_mean:.4f} | d_full={delta_vs_full:+.4f}"
             )
 
-            full_scores.append(full_ndcg)
-            compact_scores.append(compact_ndcg)
-
-        full_mean = float(np.mean(full_scores))
-        compact_mean = float(np.mean(compact_scores))
-        delta = float(compact_mean - full_mean)
-
-        per_dataset_rows.append(
+    macro_rows = []
+    previous_macro = None
+    macro_full = float(np.mean([per_dataset_model_scores[ds]["full_router"] for ds in datasets]))
+    for spec in model_specs:
+        model_macro = float(np.mean([per_dataset_model_scores[ds][spec["model_name"]] for ds in datasets]))
+        macro_delta_vs_full = float(model_macro - macro_full)
+        macro_delta_vs_previous = None if previous_macro is None else float(model_macro - previous_macro)
+        previous_macro = model_macro
+        macro_rows.append(
             {
-                "dataset": dataset_name,
-                "full_dynamic_ndcg": full_mean,
-                "compact_dynamic_ndcg": compact_mean,
-                "delta_compact_minus_full": delta,
-                "compact_feature_count": len(compact_features),
+                "model_index": spec["model_index"],
+                "model_name": spec["model_name"],
+                "model_type": spec["model_type"],
+                "feature_count": spec["feature_count"],
+                "macro_dynamic_ndcg": model_macro,
+                "macro_delta_vs_full": macro_delta_vs_full,
+                "macro_delta_vs_previous": macro_delta_vs_previous,
+                "added_feature": spec.get("added_feature", ""),
             }
         )
-        print(
-            f"  dataset={dataset_name:>10} | "
-            f"full={full_mean:.4f} | compact={compact_mean:.4f} | delta={delta:.4f}"
-        )
-
-    macro_full = float(np.mean([r["full_dynamic_ndcg"] for r in per_dataset_rows]))
-    macro_compact = float(np.mean([r["compact_dynamic_ndcg"] for r in per_dataset_rows]))
-    macro_delta = float(macro_compact - macro_full)
-    macro_row = {
-        "macro_full_dynamic_ndcg": macro_full,
-        "macro_compact_dynamic_ndcg": macro_compact,
-        "macro_delta_compact_minus_full": macro_delta,
-        "full_feature_count": len(full_features),
-        "compact_feature_count": len(compact_features),
-    }
 
     print("\n[4/4] Writing comparison outputs ...")
     out_dir = os.path.join(ablation_dir, "negative_feature_subset_comparison")
     ensure_dir(out_dir)
 
     kept_features_csv = os.path.join(out_dir, "kept_negative_delta_features.csv")
-    per_dataset_csv = os.path.join(out_dir, "full_vs_compact_per_dataset.csv")
-    macro_csv = os.path.join(out_dir, "full_vs_compact_macro.csv")
+    ladder_plan_csv = os.path.join(out_dir, "model_ladder_plan.csv")
+    per_dataset_csv = os.path.join(out_dir, "model_ladder_per_dataset.csv")
+    macro_csv = os.path.join(out_dir, "model_ladder_macro.csv")
+    macro_plot_png = os.path.join(out_dir, "model_ladder_macro_delta_vs_full.png")
+    dataset_plot_png = os.path.join(out_dir, "model_ladder_dataset_delta_vs_full.png")
 
     save_negative_feature_list(negative_rows, kept_features_csv)
+    save_ladder_plan_csv(model_specs, ladder_plan_csv)
     save_per_dataset_comparison(per_dataset_rows, per_dataset_csv)
-    save_macro_comparison(macro_row, macro_csv)
+    save_macro_comparison(macro_rows, macro_csv)
+    save_macro_delta_plot(macro_rows, macro_plot_png)
+    save_dataset_delta_plot(per_dataset_rows, dataset_plot_png)
 
     print("\nComparison completed.")
-    print(f"Kept features CSV   : {kept_features_csv}")
-    print(f"Per-dataset CSV     : {per_dataset_csv}")
-    print(f"Macro summary CSV   : {macro_csv}")
-    print(
-        "Macro result        : "
-        f"full={macro_full:.6f}, compact={macro_compact:.6f}, delta={macro_delta:.6f}"
-    )
+    print(f"Kept features CSV      : {kept_features_csv}")
+    print(f"Ladder plan CSV        : {ladder_plan_csv}")
+    print(f"Per-dataset CSV        : {per_dataset_csv}")
+    print(f"Macro summary CSV      : {macro_csv}")
+    print(f"Macro delta plot       : {macro_plot_png}")
+    print(f"Per-dataset delta plot : {dataset_plot_png}")
+    print(f"Macro full_router      : {macro_full:.6f}")
+    for row in macro_rows:
+        print(
+            f"  idx={row['model_index']:>2} | {row['model_name']:<16} | "
+            f"macro_ndcg={row['macro_dynamic_ndcg']:.6f} | "
+            f"d_full={row['macro_delta_vs_full']:+.6f}"
+        )
 
 
 if __name__ == "__main__":
