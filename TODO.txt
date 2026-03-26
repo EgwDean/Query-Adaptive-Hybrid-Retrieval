@@ -1,5 +1,4 @@
-Optimize the grid search to run faster
-Run the grid search again for within dataset & loodo, but modify the script to run consequently
+Run the grid search again for within dataset & loodo
 Add the new parameters 
 Run the retirieval again for within dataset & loodo
 Modify the SHAP plots and the analyze script to output only needed files
