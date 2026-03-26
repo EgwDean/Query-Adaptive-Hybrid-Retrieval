@@ -125,9 +125,7 @@ within_dataset_evaluation:
 # Used by: python src/ablation_study.py
 # ------------------------------------------------------------
 ablation:
-  feature_inventory: "expanded"  # current | expanded
-  mode: "group_ablation"         # group_ablation | candidate_feature_sets
-  compare_inventories: false
+  mode: "lofo_single_feature_within_dataset"
 
 # ------------------------------------------------------------
 # Supervised query-level routing benchmark (LOODO)
@@ -136,6 +134,7 @@ ablation:
 supervised_routing:
   # Feature construction
   overlap_k: 10
+  feature_stat_k: 10
   epsilon: 1.0e-8
   ce_smoothing_alpha: 1.0
   feature_workers: 8

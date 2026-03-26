@@ -30,12 +30,12 @@ if PROJECT_ROOT not in sys.path:
 os.chdir(PROJECT_ROOT)
 
 import src.utils as u
-from src.feature_inventory import get_selected_feature_names
 from src.retrieve_and_evaluate import (
     apply_zscore,
     build_or_load_query_feature_cache,
     compute_zscore_stats,
     ensure_retrieval_results_cached,
+    get_selected_feature_names,
     get_router_model_type,
     get_xgboost_config,
     predict_router_alpha,

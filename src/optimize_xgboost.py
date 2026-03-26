@@ -41,12 +41,12 @@ from src.retrieve_and_evaluate import (
     dataset_seed_offset,
     ensure_retrieval_results_cached,
     evaluate_benchmark_methods_for_qids,
+    get_selected_feature_names,
     predict_router_alpha,
     set_global_seed,
     split_rows_train_test,
     train_router_model,
 )
-from src.feature_inventory import get_selected_feature_names
 from src.utils import ensure_dir, get_config_path, load_config, model_short_name
 
 

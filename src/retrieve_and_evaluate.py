@@ -58,19 +58,44 @@ from src.utils import (
     save_pickle,
     stem_and_tokenize,
 )
-from src.feature_inventory import (
-    CURRENT_FEATURES,
-    EXPANDED_FEATURES,
-    FEATURE_SCHEMA_VERSION,
-    get_selected_feature_names,
-)
 
 
-# Keep backward-compatible default training feature set.
-FEATURE_NAMES = list(CURRENT_FEATURES)
+FEATURE_SCHEMA_VERSION = "routing_features_v4_final_lofo_topk_names"
 
-# Master inventory computed/stored in cache for ablation and future tuning.
-ALL_COMPUTED_FEATURE_NAMES = list(EXPANDED_FEATURES)
+# Final thesis feature set:
+# - keep all documented current + legacy features
+# - remove overlap_at_3
+# - add new ranking-shape/interaction features
+FEATURE_NAMES = [
+    "cross_entropy",
+    "agreement",
+    "query_length",
+    "dense_confidence",
+    "sparse_confidence",
+    "confidence_gap",
+    "top_dense_score",
+    "top_sparse_score",
+    "top_score_gap",
+    "average_idf",
+    "max_idf",
+    "idf_std",
+    "rare_term_ratio",
+    "stopword_ratio",
+    "first_shared_doc_rank",
+    "spearman_topk",
+    "dense_entropy_topk",
+    "sparse_entropy_topk",
+    "dense_concentration_topk",
+    "sparse_concentration_topk",
+]
+
+# Master inventory computed/stored in cache.
+ALL_COMPUTED_FEATURE_NAMES = list(FEATURE_NAMES)
+
+
+def get_selected_feature_names():
+    """Return final selected feature list used for XGBoost training/optimization."""
+    return list(FEATURE_NAMES)
 
 
 def set_global_seed(seed):
@@ -434,6 +459,7 @@ def compute_feature_row_for_query(
     total_docs,
     stopword_stems,
     overlap_k,
+    feature_stat_k,
     epsilon,
     ce_smoothing_alpha,
     ndcg_k,
@@ -460,7 +486,6 @@ def compute_feature_row_for_query(
     top_dense = [doc_id for doc_id, _ in dense_for_query[:overlap_k]]
     overlap = len(set(top_sparse) & set(top_dense))
     agreement = float(overlap / max(1, overlap_k))
-    overlap_at_3 = float(len(set(top_sparse[:3]) & set(top_dense[:3])) / 3.0)
 
     # Score-derived features use normalized per-query score scales.
     if len(dense_norm) >= 2:
@@ -483,6 +508,50 @@ def compute_feature_row_for_query(
     top_dense_score = float(dense_norm[0][1]) if dense_norm else 0.0
     top_sparse_score = float(bm25_norm[0][1]) if bm25_norm else 0.0
     top_score_gap = float(top_dense_score - top_sparse_score)
+
+    # Top-k ranking-shape features.
+    top_k_sparse_pairs = bm25_norm[:feature_stat_k]
+    top_k_dense_pairs = dense_norm[:feature_stat_k]
+
+    top_k_sparse_docs = [doc_id for doc_id, _ in top_k_sparse_pairs]
+    top_k_dense_docs = [doc_id for doc_id, _ in top_k_dense_pairs]
+    sparse_rank_map = {doc_id: rank for rank, doc_id in enumerate(top_k_sparse_docs, start=1)}
+    dense_rank_map = {doc_id: rank for rank, doc_id in enumerate(top_k_dense_docs, start=1)}
+    shared_docs = set(sparse_rank_map.keys()) & set(dense_rank_map.keys())
+
+    if shared_docs:
+        first_shared_doc_rank = float(
+            min((sparse_rank_map[d] + dense_rank_map[d]) / 2.0 for d in shared_docs)
+        )
+    else:
+        first_shared_doc_rank = float(feature_stat_k + 1)
+
+    if len(shared_docs) >= 2:
+        rank_diffs_sq = [
+            float((sparse_rank_map[d] - dense_rank_map[d]) ** 2)
+            for d in shared_docs
+        ]
+        n_shared = float(len(rank_diffs_sq))
+        spearman_topk = float(
+            1.0 - ((6.0 * sum(rank_diffs_sq)) / (n_shared * (n_shared**2 - 1.0)))
+        )
+    else:
+        spearman_topk = 0.0
+
+    def _entropy_and_concentration(pairs):
+        if not pairs:
+            return 0.0, 0.0
+        scores = np.asarray([max(float(score), 0.0) for _, score in pairs], dtype=np.float64)
+        total = float(scores.sum())
+        if total <= epsilon:
+            return 0.0, 0.0
+        probs = scores / total
+        entropy = float(-np.sum(probs * np.log2(np.maximum(probs, epsilon))))
+        concentration = float(scores[0] / total)
+        return entropy, concentration
+
+    dense_entropy_topk, dense_concentration_topk = _entropy_and_concentration(top_k_dense_pairs)
+    sparse_entropy_topk, sparse_concentration_topk = _entropy_and_concentration(top_k_sparse_pairs)
 
     # Features requiring stopword-filtered tokens.
     vocab_size = max(1, len(word_freq))
@@ -526,7 +595,6 @@ def compute_feature_row_for_query(
         "features": {
             "cross_entropy": cross_entropy,
             "agreement": agreement,
-            "overlap_at_3": overlap_at_3,
             "query_length": query_length,
             "dense_confidence": dense_confidence,
             "sparse_confidence": sparse_confidence,
@@ -539,6 +607,12 @@ def compute_feature_row_for_query(
             "idf_std": idf_std,
             "rare_term_ratio": rare_term_ratio,
             "stopword_ratio": stopword_ratio,
+            "first_shared_doc_rank": first_shared_doc_rank,
+            "spearman_topk": spearman_topk,
+            "dense_entropy_topk": dense_entropy_topk,
+            "sparse_entropy_topk": sparse_entropy_topk,
+            "dense_concentration_topk": dense_concentration_topk,
+            "sparse_concentration_topk": sparse_concentration_topk,
         },
         "soft_label": label,
         "sparse_q_ndcg": sparse_q_ndcg,
@@ -554,6 +628,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
 
     routing_cfg = cfg.get("supervised_routing", {})
     overlap_k = int(routing_cfg.get("overlap_k", 100))
+    feature_stat_k = int(routing_cfg.get("feature_stat_k", 10))
     epsilon = float(routing_cfg.get("epsilon", 1.0e-8))
     ce_smoothing_alpha = float(routing_cfg.get("ce_smoothing_alpha", 1.0))
     feature_workers = int(routing_cfg.get("feature_workers", max(1, (os.cpu_count() or 4) // 2)))
@@ -565,6 +640,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
         "feature_names": ALL_COMPUTED_FEATURE_NAMES,
         "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "overlap_k": overlap_k,
+        "feature_stat_k": feature_stat_k,
         "epsilon": epsilon,
         "ce_smoothing_alpha": ce_smoothing_alpha,
         "ndcg_k": ndcg_k,
@@ -615,6 +691,7 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
                 total_docs=ds["total_docs"],
                 stopword_stems=stopword_stems,
                 overlap_k=overlap_k,
+                feature_stat_k=feature_stat_k,
                 epsilon=epsilon,
                 ce_smoothing_alpha=ce_smoothing_alpha,
                 ndcg_k=ndcg_k,
@@ -1148,13 +1225,30 @@ def deserialize_router_model(serialized, cfg, device):
     raise ValueError(f"Unsupported router model type in deserialization: {model_type!r}")
 
 
-def save_router_metadata_json(cfg, model_type, output_path):
+def save_router_metadata_json(
+    cfg,
+    model_type,
+    output_path,
+    datasets=None,
+    optimization_mode=None,
+):
     """Save selected router model metadata for reproducibility."""
     payload = {"model_type": model_type}
     if model_type == "random_forest":
         payload["random_forest"] = get_random_forest_config(cfg)
     if model_type == "xgboost":
-        payload["xgboost"] = get_xgboost_config(cfg)
+        if datasets and optimization_mode in {"within_dataset", "loodo"}:
+            payload["optimization_mode"] = optimization_mode
+            payload["xgboost_per_dataset_resolved"] = {
+                ds: get_xgboost_config(
+                    cfg,
+                    dataset_name=ds,
+                    optimization_mode=optimization_mode,
+                )
+                for ds in datasets
+            }
+        else:
+            payload["xgboost"] = get_xgboost_config(cfg)
     if model_type == "svr_rbf":
         payload["svr_rbf"] = get_svr_rbf_config()
     with open(output_path, "w", encoding="utf-8") as f:
@@ -1619,13 +1713,7 @@ def run_within_dataset_benchmark(
     if model_type == "random_forest":
         print(f"RandomForest params: {get_random_forest_config(cfg)}")
     if model_type == "xgboost":
-        xgb_cfg = get_xgboost_config(cfg)
-        print(
-            "XGBoost params: "
-            f"n_estimators={xgb_cfg['n_estimators']}, "
-            f"max_depth={xgb_cfg['max_depth']}, "
-            f"learning_rate={xgb_cfg['learning_rate']}"
-        )
+        print("XGBoost params: dataset-specific within_dataset overrides will be applied.")
     if model_type == "svr_rbf":
         print("SVR params: C=10.0, gamma=scale, epsilon=0.05")
 
@@ -1644,6 +1732,18 @@ def run_within_dataset_benchmark(
         ds_seed_offset = dataset_seed_offset(dataset_name)
         print(f"\n{'-' * 68}")
         print(f"Dataset: {dataset_name} | Query rows: {len(ds_rows):,}")
+        if model_type == "xgboost":
+            xgb_cfg = get_xgboost_config(
+                cfg,
+                dataset_name=dataset_name,
+                optimization_mode="within_dataset",
+            )
+            print(
+                "XGBoost params: "
+                f"n_estimators={xgb_cfg['n_estimators']}, "
+                f"max_depth={xgb_cfg['max_depth']}, "
+                f"learning_rate={xgb_cfg['learning_rate']}"
+            )
         print(f"{'-' * 68}")
 
         for repeat_idx in range(n_repeats):
@@ -1792,7 +1892,13 @@ def run_within_dataset_benchmark(
     save_within_norm_stats_csv(norm_rows, norm_csv)
     save_within_alpha_summary(alpha_rows, alpha_summary_csv)
     save_within_dataset_plots(summary_rows, alpha_rows, plots_dir)
-    save_router_metadata_json(cfg, model_type, router_metadata_json)
+    save_router_metadata_json(
+        cfg,
+        model_type,
+        router_metadata_json,
+        datasets=datasets,
+        optimization_mode="within_dataset",
+    )
 
     print("\n" + "=" * 72)
     print("WITHIN-DATASET supervised routing benchmark completed.")
@@ -1869,13 +1975,7 @@ def main():
     if model_type == "random_forest":
         print(f"RandomForest params: {get_random_forest_config(cfg)}")
     if model_type == "xgboost":
-        xgb_cfg = get_xgboost_config(cfg)
-        print(
-            "XGBoost params: "
-            f"n_estimators={xgb_cfg['n_estimators']}, "
-            f"max_depth={xgb_cfg['max_depth']}, "
-            f"learning_rate={xgb_cfg['learning_rate']}"
-        )
+        print("XGBoost params: heldout-specific loodo overrides will be applied per fold.")
     if model_type == "svr_rbf":
         print("SVR params: C=10.0, gamma=scale, epsilon=0.05")
     print("\n[1/4] Loading cached retrieval artifacts per dataset ...")
@@ -1936,6 +2036,18 @@ def main():
 
         print(f"\n{'-' * 68}")
         print(f"Held-out dataset: {heldout}")
+        if model_type == "xgboost":
+            xgb_cfg = get_xgboost_config(
+                cfg,
+                dataset_name=heldout,
+                optimization_mode="loodo",
+            )
+            print(
+                "XGBoost params: "
+                f"n_estimators={xgb_cfg['n_estimators']}, "
+                f"max_depth={xgb_cfg['max_depth']}, "
+                f"learning_rate={xgb_cfg['learning_rate']}"
+            )
         print(f"Train datasets   : {', '.join(train_datasets)}")
         print(f"Train queries    : {len(train_rows):,} | Test queries: {len(test_rows):,}")
         print(f"{'-' * 68}")
@@ -1977,7 +2089,15 @@ def main():
             "bm25": u.get_bm25_params(cfg),
             "model_type": model_type,
             "random_forest": get_random_forest_config(cfg) if model_type == "random_forest" else None,
-            "xgboost": get_xgboost_config(cfg) if model_type == "xgboost" else None,
+            "xgboost": (
+                get_xgboost_config(
+                    cfg,
+                    dataset_name=heldout,
+                    optimization_mode="loodo",
+                )
+                if model_type == "xgboost"
+                else None
+            ),
             "svr_rbf": get_svr_rbf_config() if model_type == "svr_rbf" else None,
             "training_cfg": {
                 "regularization": routing_cfg.get("regularization", "l2"),
@@ -2117,7 +2237,13 @@ def main():
     save_macro_summary(fold_results, macro_csv)
     save_fold_coefficients_csv(coefficient_rows, fold_coefficients_csv)
     save_fold_normalization_stats_csv(fold_norm_rows, fold_norm_csv)
-    save_router_metadata_json(cfg, model_type, router_metadata_json)
+    save_router_metadata_json(
+        cfg,
+        model_type,
+        router_metadata_json,
+        datasets=datasets,
+        optimization_mode="loodo",
+    )
 
     with open(alpha_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
