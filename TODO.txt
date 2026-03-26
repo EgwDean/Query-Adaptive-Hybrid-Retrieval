@@ -1,0 +1,12 @@
+Research new features to add and modify/omit the old ones
+Add a cleaner ablation study
+Run the ablation study and analyze the results, then write a report on the findings
+Modify the repo to use the new features
+Optimize the grid search to run faster
+Run the grid search again for within dataset & loodo
+Add the new parameters 
+Run the retirieval again for within dataset & loodo
+Modify the SHAP plots and the analyze script to output only needed files
+Run the analysis again
+Move all results locally
+Delete old data files

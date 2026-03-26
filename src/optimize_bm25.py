@@ -120,22 +120,28 @@ def ensure_sparse_artifacts(dataset_name, cfg, k1, b, use_stemming):
         use_stemming=use_stemming,
     )
 
-    if not file_exists(sparse_paths["word_freq_pkl"]) or not file_exists(sparse_paths["doc_freq_pkl"]):
-        _, _, global_counts, total_corpus_tokens = build_bm25_and_word_freq_index(
+    needs_freq = not file_exists(sparse_paths["word_freq_pkl"]) or not file_exists(
+        sparse_paths["doc_freq_pkl"]
+    )
+    needs_bm25 = not file_exists(sparse_paths["bm25_pkl"]) or not file_exists(
+        sparse_paths["bm25_docids_pkl"]
+    )
+
+    bm25 = None
+    bm25_doc_ids = None
+    if needs_freq or needs_bm25:
+        bm25, bm25_doc_ids, global_counts, total_corpus_tokens = build_bm25_and_word_freq_index(
             sparse_paths["tokenized_corpus_jsonl"],
             k1=k1,
             b=b,
         )
+
+    if needs_freq:
         doc_freq, total_docs = build_doc_freq_index(sparse_paths["tokenized_corpus_jsonl"])
         save_pickle((global_counts, total_corpus_tokens), sparse_paths["word_freq_pkl"])
         save_pickle((doc_freq, total_docs), sparse_paths["doc_freq_pkl"])
 
-    if not file_exists(sparse_paths["bm25_pkl"]) or not file_exists(sparse_paths["bm25_docids_pkl"]):
-        bm25, bm25_doc_ids, _, _ = build_bm25_and_word_freq_index(
-            sparse_paths["tokenized_corpus_jsonl"],
-            k1=k1,
-            b=b,
-        )
+    if needs_bm25:
         save_pickle(bm25, sparse_paths["bm25_pkl"])
         save_pickle(bm25_doc_ids, sparse_paths["bm25_docids_pkl"])
 

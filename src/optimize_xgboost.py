@@ -414,6 +414,16 @@ def optimize_xgboost(cfg, mode):
     print("Using selected feature set: CORE_PLUS_QUERY")
     print(f"Features: {feature_names}")
 
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    out_dir = os.path.join(results_root, short_model, "xgboost_optimization", mode)
+    ensure_dir(out_dir)
+
+    trial_csv = os.path.join(out_dir, "trial_results.csv")
+    summary_csv = os.path.join(out_dir, "summary.csv")
+    best_json = os.path.join(out_dir, "best_params_per_dataset.json")
+    best_yaml = os.path.join(out_dir, "best_params_per_dataset.yaml")
+    metadata_json = os.path.join(out_dir, "search_metadata.json")
+
     print("\n[3/4] Running XGBoost search ...")
     trial_rows = []
     best_by_dataset = {}
@@ -490,6 +500,11 @@ def optimize_xgboost(cfg, mode):
             "params": best_params,
         }
 
+        # Checkpoint after each completed target dataset.
+        write_trial_results_csv(trial_rows, trial_csv)
+        write_summary_csv(best_by_dataset, summary_csv)
+        write_best_outputs(mode, best_by_dataset, best_json, best_yaml)
+
         print(
             "Best for "
             f"{target_dataset}: score={best_score:.6f}, "
@@ -497,15 +512,6 @@ def optimize_xgboost(cfg, mode):
         )
 
     print("\n[4/4] Writing optimization outputs ...")
-    results_root = get_config_path(cfg, "results_folder", "data/results")
-    out_dir = os.path.join(results_root, short_model, "xgboost_optimization", mode)
-    ensure_dir(out_dir)
-
-    trial_csv = os.path.join(out_dir, "trial_results.csv")
-    summary_csv = os.path.join(out_dir, "summary.csv")
-    best_json = os.path.join(out_dir, "best_params_per_dataset.json")
-    best_yaml = os.path.join(out_dir, "best_params_per_dataset.yaml")
-    metadata_json = os.path.join(out_dir, "search_metadata.json")
 
     write_trial_results_csv(trial_rows, trial_csv)
     write_summary_csv(best_by_dataset, summary_csv)

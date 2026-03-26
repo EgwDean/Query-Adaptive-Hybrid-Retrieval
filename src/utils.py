@@ -176,6 +176,7 @@ def load_corpus_batch_generator(filepath, batch_size):
     skipped.
     """
     batch_ids, batch_texts = [], []
+    malformed_lines = 0
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -187,9 +188,14 @@ def load_corpus_batch_generator(filepath, batch_size):
                     yield batch_ids, batch_texts
                     batch_ids, batch_texts = [], []
             except json.JSONDecodeError:
+                malformed_lines += 1
                 continue
     if batch_texts:
         yield batch_ids, batch_texts
+    if malformed_lines > 0:
+        print(
+            f"  [WARN] Skipped {malformed_lines} malformed JSON lines in corpus file: {filepath}"
+        )
 
 
 # ============================================================

@@ -272,6 +272,9 @@ def preprocess_queries(
 
 
 def run_for_dataset(dataset_name, cfg, model, device):
+    global _gpu_failed
+    _gpu_failed = False
+
     datasets_folder = u.get_config_path(cfg, "datasets_folder", "data/datasets")
     processed_folder = u.get_config_path(cfg, "processed_folder", "data/processed_data")
 

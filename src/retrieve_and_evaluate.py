@@ -264,6 +264,7 @@ def run_dense_retrieval(
     """Run chunked dense retrieval and return {qid: [(doc_id, score), ...]}."""
     results = {}
     n_queries = len(query_ids)
+    retrieval_device = corpus_vectors.device
 
     for q_start in tqdm(
         range(0, n_queries, query_chunk_size),
@@ -271,7 +272,7 @@ def run_dense_retrieval(
         dynamic_ncols=True,
     ):
         q_end = min(q_start + query_chunk_size, n_queries)
-        q_batch = query_vectors[q_start:q_end].to(device)
+        q_batch = query_vectors[q_start:q_end].to(retrieval_device)
         hits = st_util.semantic_search(
             q_batch,
             corpus_vectors,
@@ -379,6 +380,13 @@ def ensure_retrieval_results_cached(dataset_name, cfg, device):
     else:
         print("  Running dense retrieval and caching results ...")
         corpus_embeddings = torch.load(paths["corpus_emb_pt"], weights_only=True)
+        if device.type == "cuda":
+            try:
+                corpus_embeddings = corpus_embeddings.to(device)
+                print("  Dense retrieval corpus embeddings moved to CUDA.")
+            except torch.cuda.OutOfMemoryError:
+                print("  [WARN] CUDA OOM while moving corpus embeddings; using CPU for dense retrieval.")
+                torch.cuda.empty_cache()
         corpus_ids = load_pickle(paths["corpus_ids_pkl"])
         query_vectors = torch.load(paths["query_vectors_pt"], weights_only=True)
         query_ids = load_pickle(paths["query_ids_pkl"])
@@ -652,17 +660,6 @@ def build_or_load_query_feature_cache(dataset_cache_map, cfg, short_model):
 
     print(f"[Feature Cache] Wrote {len(all_rows):,} rows to cache.")
     return all_rows, feature_cache_pkl, feature_cache_csv
-
-
-def rows_to_matrix(rows):
-    """Convert feature rows to X matrix, y vector, and qid list."""
-    qids = [r["query_id"] for r in rows]
-    X = np.asarray(
-        [[float(r["features"][name]) for name in FEATURE_NAMES] for r in rows],
-        dtype=np.float32,
-    )
-    y = np.asarray([float(r["soft_label"]) for r in rows], dtype=np.float32)
-    return X, y, qids
 
 
 def rows_to_matrix_with_features(rows, feature_names):
@@ -965,7 +962,7 @@ def _create_random_forest_regressor(cfg):
     return RandomForestRegressor(**rf_params)
 
 
-def _create_xgboost_regressor(cfg):
+def _create_xgboost_regressor(cfg, dataset_name=None, optimization_mode=None):
     """Create XGBRegressor with explicit dependency error and reproducible params."""
     try:
         from xgboost import XGBRegressor
@@ -974,7 +971,11 @@ def _create_xgboost_regressor(cfg):
             "xgboost is required for model_type='xgboost'. Please install it."
         ) from exc
 
-    xgb_params = get_xgboost_config(cfg)
+    xgb_params = get_xgboost_config(
+        cfg,
+        dataset_name=dataset_name,
+        optimization_mode=optimization_mode,
+    )
     return XGBRegressor(**xgb_params)
 
 
@@ -1010,7 +1011,14 @@ def predict_alpha_svr(model, X):
     return np.clip(pred, 0.0, 1.0).astype(np.float32)
 
 
-def train_router_model(X_train, y_train, cfg, device):
+def train_router_model(
+    X_train,
+    y_train,
+    cfg,
+    device,
+    dataset_name=None,
+    optimization_mode=None,
+):
     """Train selected router model and return a model bundle."""
     model_type = get_router_model_type(cfg)
     if model_type == "logistic":
@@ -1021,7 +1029,11 @@ def train_router_model(X_train, y_train, cfg, device):
         model.fit(X_train, y_train)
         return {"model_type": model_type, "model": model}
     if model_type == "xgboost":
-        model = _create_xgboost_regressor(cfg)
+        model = _create_xgboost_regressor(
+            cfg,
+            dataset_name=dataset_name,
+            optimization_mode=optimization_mode,
+        )
         model.fit(X_train, y_train)
         return {"model_type": model_type, "model": model}
     if model_type == "svr_rbf":
@@ -1678,7 +1690,14 @@ def run_within_dataset_benchmark(
                 f"  Repeat {repeat}/{n_repeats} | "
                 f"train={len(train_rows):,}, test={len(test_rows):,}, seed={repeat_seed}"
             )
-            model_bundle = train_router_model(X_train, y_train, cfg, device)
+            model_bundle = train_router_model(
+                X_train,
+                y_train,
+                cfg,
+                device,
+                dataset_name=dataset_name,
+                optimization_mode="within_dataset",
+            )
 
             intercept, coef_by_feature, value_type = extract_router_importance_or_coefficients(
                 model_bundle,
@@ -1988,7 +2007,14 @@ def main():
                 model_bundle = deserialize_router_model(payload["model"], cfg, device)
             else:
                 print("  Fold cache exists but signature changed; retraining.")
-                model_bundle = train_router_model(X_train, y_train, cfg, device)
+                model_bundle = train_router_model(
+                    X_train,
+                    y_train,
+                    cfg,
+                    device,
+                    dataset_name=heldout,
+                    optimization_mode="loodo",
+                )
                 save_pickle(
                     {
                         "signature": fold_signature,
@@ -1999,7 +2025,14 @@ def main():
                 )
         else:
             print("  Training fold model from scratch ...")
-            model_bundle = train_router_model(X_train, y_train, cfg, device)
+            model_bundle = train_router_model(
+                X_train,
+                y_train,
+                cfg,
+                device,
+                dataset_name=heldout,
+                optimization_mode="loodo",
+            )
             save_pickle(
                 {
                     "signature": fold_signature,
