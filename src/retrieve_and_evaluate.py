@@ -1026,7 +1026,7 @@ def get_xgboost_config(cfg, dataset_name=None, optimization_mode=None):
         dataset_name=dataset_name,
         optimization_mode=optimization_mode,
     )
-    return {
+    resolved = {
         "n_estimators": int(xgb_cfg.get("n_estimators", 300)),
         "max_depth": int(xgb_cfg.get("max_depth", 6)),
         "learning_rate": float(xgb_cfg.get("learning_rate", 0.05)),
@@ -1039,6 +1039,23 @@ def get_xgboost_config(cfg, dataset_name=None, optimization_mode=None):
         "n_jobs": int(xgb_cfg.get("n_jobs", -1)),
         "random_state": int(xgb_cfg.get("random_state", routing_cfg.get("seed", 42))),
     }
+
+    # Optional passthrough keys preserve compatibility with XGBoost CPU/GPU runtimes.
+    optional_keys = [
+        "tree_method",
+        "device",
+        "predictor",
+        "max_bin",
+        "grow_policy",
+        "sampling_method",
+        "eval_metric",
+        "verbosity",
+    ]
+    for key in optional_keys:
+        if key in xgb_cfg and xgb_cfg[key] is not None:
+            resolved[key] = xgb_cfg[key]
+
+    return resolved
 
 
 def _create_random_forest_regressor(cfg):

@@ -270,7 +270,7 @@ def save_test_summary_csv(rows, output_csv):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run paired statistical analysis for full router vs compact_plus_11."
+        description="Run paired statistical analysis for full router vs compact_plus_k."
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config file.")
     parser.add_argument(
@@ -451,9 +451,10 @@ def main():
     out_dir = os.path.join(ablation_dir, f"statistical_full_vs_plus{args.plus_index}")
     ensure_dir(out_dir)
 
-    repeat_dataset_csv = os.path.join(out_dir, "full_vs_plus11_per_repeat_per_dataset.csv")
-    repeat_macro_csv = os.path.join(out_dir, "full_vs_plus11_per_repeat_macro.csv")
-    tests_csv = os.path.join(out_dir, "full_vs_plus11_stat_tests.csv")
+    prefix = f"full_vs_plus{args.plus_index}"
+    repeat_dataset_csv = os.path.join(out_dir, f"{prefix}_per_repeat_per_dataset.csv")
+    repeat_macro_csv = os.path.join(out_dir, f"{prefix}_per_repeat_macro.csv")
+    tests_csv = os.path.join(out_dir, f"{prefix}_stat_tests.csv")
 
     save_repeat_dataset_csv(per_repeat_dataset_rows, repeat_dataset_csv)
     save_repeat_macro_csv(per_repeat_macro_rows, repeat_macro_csv)

@@ -1,5 +1,3 @@
-Run the ablation study and analyze the results, then write a report on the findings
-Modify the repo to use the new features
 Optimize the grid search to run faster
 Run the grid search again for within dataset & loodo, but modify the script to run consequently
 Add the new parameters 

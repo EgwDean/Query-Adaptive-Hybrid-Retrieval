@@ -35,12 +35,13 @@ os.chdir(PROJECT_ROOT)
 
 import src.utils as u
 from src.retrieve_and_evaluate import (
+    apply_dynamic_wrrf,
     apply_zscore,
     build_or_load_query_feature_cache,
+    calculate_dataset_ndcg_at_k_subset,
     compute_zscore_stats,
     dataset_seed_offset,
     ensure_retrieval_results_cached,
-    evaluate_benchmark_methods_for_qids,
     get_selected_feature_names,
     predict_router_alpha,
     set_global_seed,
@@ -80,9 +81,9 @@ def parse_mode(cli_mode, cfg):
     else:
         mode = str(cfg.get("xgboost_optimization", {}).get("mode", "within_dataset")).strip().lower()
 
-    if mode not in {"within_dataset", "loodo"}:
+    if mode not in {"within_dataset", "loodo", "both"}:
         raise ValueError(
-            f"Unsupported optimization mode={mode!r}. Use 'within_dataset' or 'loodo'."
+            f"Unsupported optimization mode={mode!r}. Use 'within_dataset', 'loodo', or 'both'."
         )
     return mode
 
@@ -141,7 +142,7 @@ def generate_grid_candidates(param_grid, max_configs):
     return candidates, len(combos)
 
 
-def build_candidate_cfg(base_cfg, params):
+def build_candidate_cfg(base_cfg, params, force_gpu_xgboost=False):
     """Create one evaluation config forcing xgboost model_type and candidate params."""
     cfg = deepcopy(base_cfg)
     cfg.setdefault("supervised_routing", {})
@@ -149,21 +150,41 @@ def build_candidate_cfg(base_cfg, params):
 
     merged_xgb = dict(cfg.get("xgboost", {}) or {})
     merged_xgb.update(params)
+    if force_gpu_xgboost:
+        merged_xgb["tree_method"] = "hist"
+        merged_xgb["device"] = "cuda"
     cfg["xgboost"] = merged_xgb
     return cfg
 
 
-def evaluate_within_dataset_candidate(
-    dataset_name,
-    ds_rows,
-    ds_cache,
-    cfg,
-    device,
-    ndcg_k,
-    rrf_k,
-    feature_names,
-):
-    """Evaluate one candidate in within-dataset mode for a single dataset."""
+def probe_xgboost_gpu_ready():
+    """Return True when XGBoost CUDA training appears available in this env."""
+    try:
+        from xgboost import XGBRegressor
+    except Exception:
+        return False
+
+    try:
+        X = np.asarray([[0.0], [1.0], [2.0], [3.0]], dtype=np.float32)
+        y = np.asarray([0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+        model = XGBRegressor(
+            n_estimators=4,
+            max_depth=2,
+            learning_rate=0.1,
+            objective="reg:squarederror",
+            tree_method="hist",
+            device="cuda",
+            n_jobs=1,
+            random_state=0,
+        )
+        model.fit(X, y)
+        return True
+    except Exception:
+        return False
+
+
+def build_within_eval_context(dataset_name, ds_rows, feature_names, cfg):
+    """Precompute repeat splits and normalized matrices once per dataset."""
     routing_cfg = cfg.get("supervised_routing", {})
     base_seed = int(routing_cfg.get("seed", 42))
 
@@ -176,7 +197,7 @@ def evaluate_within_dataset_candidate(
         raise ValueError("within_dataset_evaluation.n_repeats must be > 0.")
 
     ds_seed_offset = dataset_seed_offset(dataset_name)
-    repeat_scores = []
+    repeats = []
 
     for repeat_idx in range(n_repeats):
         repeat_seed = base_seed + repeat_idx + ds_seed_offset
@@ -194,35 +215,68 @@ def evaluate_within_dataset_candidate(
         X_train = apply_zscore(X_train_raw, train_mean, train_std)
         X_test = apply_zscore(X_test_raw, train_mean, train_std)
 
-        model_bundle = train_router_model(X_train, y_train, cfg, device)
-        alphas = predict_router_alpha(model_bundle, X_test, cfg, device)
-        alpha_map = {qid: float(alpha) for qid, alpha in zip(test_qids, alphas)}
-
-        metrics = evaluate_benchmark_methods_for_qids(
-            bm25_results=ds_cache["bm25_results"],
-            dense_results=ds_cache["dense_results"],
-            qrels=ds_cache["qrels"],
-            ndcg_k=ndcg_k,
-            rrf_k=rrf_k,
-            query_ids=test_qids,
-            alpha_map=alpha_map,
+        repeats.append(
+            {
+                "X_train": X_train,
+                "y_train": y_train,
+                "X_test": X_test,
+                "test_qids": test_qids,
+            }
         )
-        repeat_scores.append(float(metrics["dynamic_wrrf_ndcg"]))
 
-    return float(np.mean(repeat_scores))
+    return repeats
 
 
-def evaluate_loodo_candidate(
-    heldout,
-    rows_by_dataset,
-    dataset_cache_map,
+def evaluate_within_dataset_candidate(
+    dataset_name,
+    repeat_context,
+    ds_cache,
     cfg,
     device,
     ndcg_k,
     rrf_k,
-    feature_names,
 ):
-    """Evaluate one candidate in LOODO mode for one held-out dataset."""
+    """Evaluate one candidate in within-dataset mode for a single dataset."""
+    repeat_scores = []
+
+    for rep in repeat_context:
+        X_train = rep["X_train"]
+        y_train = rep["y_train"]
+        X_test = rep["X_test"]
+        test_qids = rep["test_qids"]
+
+        model_bundle = train_router_model(
+            X_train,
+            y_train,
+            cfg,
+            device,
+            dataset_name=dataset_name,
+            optimization_mode="within_dataset",
+        )
+        alphas = predict_router_alpha(model_bundle, X_test, cfg, device)
+        alpha_map = {qid: float(alpha) for qid, alpha in zip(test_qids, alphas)}
+
+        bm25_subset = {qid: ds_cache["bm25_results"].get(qid, []) for qid in test_qids}
+        dense_subset = {qid: ds_cache["dense_results"].get(qid, []) for qid in test_qids}
+        dynamic_scores = apply_dynamic_wrrf(
+            bm25_subset,
+            dense_subset,
+            alpha_map,
+            rrf_k=rrf_k,
+        )
+        score = calculate_dataset_ndcg_at_k_subset(
+            dynamic_scores,
+            ds_cache["qrels"],
+            ndcg_k,
+            test_qids,
+        )
+        repeat_scores.append(float(score))
+
+    return float(np.mean(repeat_scores))
+
+
+def build_loodo_eval_context(heldout, rows_by_dataset, feature_names):
+    """Precompute normalized train/test matrices for one held-out fold."""
     train_rows = [row for ds, rows in rows_by_dataset.items() if ds != heldout for row in rows]
     test_rows = list(rows_by_dataset[heldout])
 
@@ -236,21 +290,57 @@ def evaluate_loodo_candidate(
     X_train = apply_zscore(X_train_raw, train_mean, train_std)
     X_test = apply_zscore(X_test_raw, train_mean, train_std)
 
-    model_bundle = train_router_model(X_train, y_train, cfg, device)
+    return {
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_test": X_test,
+        "test_qids": test_qids,
+    }
+
+
+def evaluate_loodo_candidate(
+    heldout,
+    fold_context,
+    dataset_cache_map,
+    cfg,
+    device,
+    ndcg_k,
+    rrf_k,
+):
+    """Evaluate one candidate in LOODO mode for one held-out dataset."""
+    X_train = fold_context["X_train"]
+    y_train = fold_context["y_train"]
+    X_test = fold_context["X_test"]
+    test_qids = fold_context["test_qids"]
+
+    model_bundle = train_router_model(
+        X_train,
+        y_train,
+        cfg,
+        device,
+        dataset_name=heldout,
+        optimization_mode="loodo",
+    )
     alphas = predict_router_alpha(model_bundle, X_test, cfg, device)
     alpha_map = {qid: float(alpha) for qid, alpha in zip(test_qids, alphas)}
 
     ds_cache = dataset_cache_map[heldout]
-    metrics = evaluate_benchmark_methods_for_qids(
-        bm25_results=ds_cache["bm25_results"],
-        dense_results=ds_cache["dense_results"],
-        qrels=ds_cache["qrels"],
-        ndcg_k=ndcg_k,
+    bm25_subset = {qid: ds_cache["bm25_results"].get(qid, []) for qid in test_qids}
+    dense_subset = {qid: ds_cache["dense_results"].get(qid, []) for qid in test_qids}
+    dynamic_scores = apply_dynamic_wrrf(
+        bm25_subset,
+        dense_subset,
+        alpha_map,
         rrf_k=rrf_k,
-        query_ids=test_qids,
-        alpha_map=alpha_map,
     )
-    return float(metrics["dynamic_wrrf_ndcg"])
+    return float(
+        calculate_dataset_ndcg_at_k_subset(
+            dynamic_scores,
+            ds_cache["qrels"],
+            ndcg_k,
+            test_qids,
+        )
+    )
 
 
 def write_trial_results_csv(rows, output_csv):
@@ -355,7 +445,7 @@ def write_search_metadata(output_path, mode, total_grid_configs, evaluated_confi
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
-def optimize_xgboost(cfg, mode):
+def optimize_xgboost(cfg, mode, force_gpu_xgboost=False):
     """Run XGBoost optimization for selected mode and return result rows."""
     datasets = cfg.get("datasets", [])
     if not datasets:
@@ -382,10 +472,23 @@ def optimize_xgboost(cfg, mode):
 
     short_model = model_short_name(cfg["embeddings"]["model_name"])
 
+    progress_every = int(cfg.get("xgboost_optimization", {}).get("progress_every", 25))
+    progress_every = max(1, progress_every)
+
+    gpu_enabled = bool(force_gpu_xgboost)
+    if gpu_enabled:
+        if not torch.cuda.is_available():
+            print("[WARN] GPU optimization requested but CUDA is not available in torch; using CPU XGBoost.")
+            gpu_enabled = False
+        elif not probe_xgboost_gpu_ready():
+            print("[WARN] XGBoost CUDA backend probe failed; using CPU XGBoost.")
+            gpu_enabled = False
+
     print("=" * 72)
     print("XGBoost router hyperparameter optimization")
     print(f"Mode                 : {mode}")
     print(f"Device               : {device}")
+    print(f"XGBoost GPU forcing  : {gpu_enabled}")
     print(f"Model                : {cfg['embeddings']['model_name']}")
     print(f"Datasets ({len(datasets)})       : {', '.join(datasets)}")
     print(f"Search type          : {opt_cfg['search_type']}")
@@ -413,6 +516,25 @@ def optimize_xgboost(cfg, mode):
     feature_names = get_selected_feature_names()
     print("Using selected feature set: canonical thesis feature set")
     print(f"Features: {feature_names}")
+
+    eval_context_map = {}
+    if mode == "within_dataset":
+        print("Precomputing repeat split matrices for within-dataset mode ...")
+        for ds in datasets:
+            eval_context_map[ds] = build_within_eval_context(
+                dataset_name=ds,
+                ds_rows=rows_by_dataset[ds],
+                feature_names=feature_names,
+                cfg=cfg,
+            )
+    else:
+        print("Precomputing fold matrices for LOODO mode ...")
+        for heldout in datasets:
+            eval_context_map[heldout] = build_loodo_eval_context(
+                heldout=heldout,
+                rows_by_dataset=rows_by_dataset,
+                feature_names=feature_names,
+            )
 
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_dir = os.path.join(results_root, short_model, "xgboost_optimization", mode)
@@ -444,29 +566,27 @@ def optimize_xgboost(cfg, mode):
         ):
             config_index = int(candidate["config_index"])
             params = dict(candidate["params"])
-            eval_cfg = build_candidate_cfg(cfg, params)
+            eval_cfg = build_candidate_cfg(cfg, params, force_gpu_xgboost=gpu_enabled)
 
             if mode == "within_dataset":
                 score = evaluate_within_dataset_candidate(
                     dataset_name=target_dataset,
-                    ds_rows=rows_by_dataset[target_dataset],
+                    repeat_context=eval_context_map[target_dataset],
                     ds_cache=dataset_cache_map[target_dataset],
                     cfg=eval_cfg,
                     device=device,
                     ndcg_k=ndcg_k,
                     rrf_k=rrf_k,
-                    feature_names=feature_names,
                 )
             else:
                 score = evaluate_loodo_candidate(
                     heldout=target_dataset,
-                    rows_by_dataset=rows_by_dataset,
+                    fold_context=eval_context_map[target_dataset],
                     dataset_cache_map=dataset_cache_map,
                     cfg=eval_cfg,
                     device=device,
                     ndcg_k=ndcg_k,
                     rrf_k=rrf_k,
-                    feature_names=feature_names,
                 )
 
             row = {
@@ -478,13 +598,13 @@ def optimize_xgboost(cfg, mode):
             }
             trial_rows.append(row)
 
-            print(
-                f"  [{rank_idx}/{len(candidates)}] "
-                f"config_index={config_index} "
-                f"params={params} "
-                f"score={score:.6f} "
-                f"best_so_far={max(best_score, score):.6f}"
-            )
+            if (rank_idx % progress_every == 0) or (score > best_score):
+                print(
+                    f"  [{rank_idx}/{len(candidates)}] "
+                    f"config_index={config_index} "
+                    f"score={score:.6f} "
+                    f"best_so_far={max(best_score, score):.6f}"
+                )
 
             if score > best_score:
                 best_score = float(score)
@@ -520,7 +640,7 @@ def optimize_xgboost(cfg, mode):
         metadata_json,
         mode,
         total_grid_configs,
-        len(candidates),
+        len(trial_rows),
         cfg,
         datasets,
     )
@@ -546,9 +666,20 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["within_dataset", "loodo"],
+        choices=["within_dataset", "loodo", "both"],
         default=None,
         help="Override xgboost_optimization.mode from config.",
+    )
+    gpu_group = parser.add_mutually_exclusive_group()
+    gpu_group.add_argument(
+        "--use-gpu-xgboost",
+        action="store_true",
+        help="Force XGBoost GPU backend for optimization candidates (with preflight fallback).",
+    )
+    gpu_group.add_argument(
+        "--no-gpu-xgboost",
+        action="store_true",
+        help="Force CPU XGBoost backend for optimization candidates.",
     )
     args = parser.parse_args()
 
@@ -556,7 +687,25 @@ def main():
     cfg = load_config()
 
     mode = parse_mode(args.mode, cfg)
-    optimize_xgboost(cfg, mode)
+    datasets = cfg.get("datasets", [])
+    if mode == "both" and len(datasets) < 2:
+        raise ValueError(
+            "Mode 'both' requires at least two configured datasets because it includes LOODO."
+        )
+
+    cfg_gpu_pref = bool(cfg.get("xgboost_optimization", {}).get("use_gpu_xgboost", False))
+    if args.use_gpu_xgboost:
+        force_gpu_xgboost = True
+    elif args.no_gpu_xgboost:
+        force_gpu_xgboost = False
+    else:
+        force_gpu_xgboost = cfg_gpu_pref
+
+    if mode == "both":
+        optimize_xgboost(cfg, "within_dataset", force_gpu_xgboost=force_gpu_xgboost)
+        optimize_xgboost(cfg, "loodo", force_gpu_xgboost=force_gpu_xgboost)
+    else:
+        optimize_xgboost(cfg, mode, force_gpu_xgboost=force_gpu_xgboost)
 
 
 if __name__ == "__main__":
