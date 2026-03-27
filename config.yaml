@@ -117,8 +117,14 @@ benchmark:
 # ------------------------------------------------------------
 within_dataset_evaluation:
   train_fraction: 0.8
-  n_repeats: 5
+  n_repeats: 20
   shuffle: true
+
+# ------------------------------------------------------------
+# LOODO supervised routing evaluation
+# ------------------------------------------------------------
+loodo_evaluation:
+  n_repeats: 10
 
 # ------------------------------------------------------------
 # Ablation controls

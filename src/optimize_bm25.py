@@ -162,9 +162,17 @@ def run_or_load_bm25_results(dataset_name, cfg, k1, b, use_stemming):
     ds_inputs = ensure_sparse_artifacts(dataset_name, cfg, k1, b, use_stemming)
     sparse_paths = ds_inputs["paths"]
 
+    bm25_results = None
     if file_exists(sparse_paths["bm25_results_pkl"]):
-        bm25_results = load_pickle(sparse_paths["bm25_results_pkl"])
-    else:
+        try:
+            bm25_results = load_pickle(sparse_paths["bm25_results_pkl"])
+        except Exception as exc:
+            print(
+                f"  [WARN] Failed to load BM25 results cache for {dataset_name}; rebuilding. "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    if bm25_results is None:
         queries = load_queries(ds_inputs["queries_jsonl"])
         bm25 = load_pickle(sparse_paths["bm25_pkl"])
         bm25_doc_ids = load_pickle(sparse_paths["bm25_docids_pkl"])

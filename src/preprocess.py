@@ -40,6 +40,7 @@ from src.utils import (
     load_config,
     ensure_dir,
     file_exists,
+    load_pickle,
     save_pickle,
     write_corpus_jsonl,
     write_queries_jsonl,
@@ -63,6 +64,11 @@ torch.set_num_interop_threads(1)
 
 # Module-level flag used by the encoding OOM fallback helper.
 _gpu_failed = False
+
+
+def _is_nonempty_file(path):
+    """Return True when path exists and has non-zero size."""
+    return file_exists(path) and os.path.getsize(path) > 0
 
 
 def preprocess_corpus(
@@ -248,6 +254,11 @@ def build_corpus_embeddings(corpus_jsonl, model, batch_size, device):
         all_ids.extend(batch_ids)
         all_embs.extend(embs_list)
 
+    if not all_embs:
+        raise ValueError(
+            "No corpus embeddings were produced. The corpus appears empty or malformed."
+        )
+
     return torch.cat(all_embs, dim=0), all_ids
 
 
@@ -262,6 +273,11 @@ def build_dense_query_vectors(queries, model, batch_size, device):
         embs_list = _encode_with_oom_retry(model, batch, device, batch_size)
         all_embs.extend(embs_list)
 
+    if not all_embs:
+        raise ValueError(
+            "No query embeddings were produced. The query set appears empty or malformed."
+        )
+
     return torch.cat(all_embs, dim=0), qids
 
 
@@ -274,8 +290,19 @@ def preprocess_queries(
 ):
     """Tokenize/stem queries and cache both JSONL and dict-by-id forms."""
     if file_exists(tokenized_queries_jsonl) and file_exists(query_tokens_pkl):
-        print("  Query preprocessing cache exists. Skipping.")
-        return
+        cache_ok = False
+        try:
+            token_map = load_pickle(query_tokens_pkl)
+            cache_ok = isinstance(token_map, dict) and _is_nonempty_file(tokenized_queries_jsonl)
+        except Exception as exc:
+            print(
+                "  [WARN] Query preprocessing cache unreadable; rebuilding. "
+                f"({type(exc).__name__}: {exc})"
+            )
+        if cache_ok:
+            print("  Query preprocessing cache exists. Skipping.")
+            return
+        print("  [WARN] Query preprocessing cache is incomplete/corrupted; rebuilding.")
 
     queries = load_queries(queries_jsonl)
     stemmer = SnowballStemmer(stemmer_lang) if use_stemming else None
@@ -358,9 +385,11 @@ def run_for_dataset(dataset_name, cfg, model, device):
         write_qrels_tsv(qrels, qrels_tsv)
 
     # 3) Preprocess corpus and queries
-    if file_exists(tokenized_corpus_jsonl):
+    if _is_nonempty_file(tokenized_corpus_jsonl):
         print("[2/6] Tokenized corpus exists. Skipping.")
     else:
+        if file_exists(tokenized_corpus_jsonl):
+            print("[2/6] Tokenized corpus cache is empty/incomplete; rebuilding.")
         print("[2/6] Tokenizing/stemming corpus ...")
         preprocess_corpus(
             corpus_jsonl,
@@ -380,10 +409,10 @@ def run_for_dataset(dataset_name, cfg, model, device):
 
     # 4) BM25 + frequency indexes
     has_index = (
-        file_exists(bm25_pkl)
-        and file_exists(bm25_docids_pkl)
-        and file_exists(word_freq_pkl)
-        and file_exists(doc_freq_pkl)
+        _is_nonempty_file(bm25_pkl)
+        and _is_nonempty_file(bm25_docids_pkl)
+        and _is_nonempty_file(word_freq_pkl)
+        and _is_nonempty_file(doc_freq_pkl)
     )
     if has_index:
         print("[4/6] BM25 + frequency indexes exist. Skipping.")
@@ -401,9 +430,11 @@ def run_for_dataset(dataset_name, cfg, model, device):
         save_pickle((doc_freq, total_docs), doc_freq_pkl)
 
     # 5) Corpus embeddings
-    if file_exists(corpus_emb_pt) and file_exists(corpus_ids_pkl):
+    if _is_nonempty_file(corpus_emb_pt) and _is_nonempty_file(corpus_ids_pkl):
         print("[5/6] Corpus embeddings exist. Skipping.")
     else:
+        if file_exists(corpus_emb_pt) or file_exists(corpus_ids_pkl):
+            print("[5/6] Corpus embedding cache is incomplete; rebuilding.")
         print("[5/6] Encoding corpus ...")
         corpus_embeddings, corpus_ids = build_corpus_embeddings(
             corpus_jsonl,
@@ -415,9 +446,11 @@ def run_for_dataset(dataset_name, cfg, model, device):
         save_pickle(corpus_ids, corpus_ids_pkl)
 
     # 6) Query embeddings
-    if file_exists(query_vectors_pt) and file_exists(query_ids_pkl):
+    if _is_nonempty_file(query_vectors_pt) and _is_nonempty_file(query_ids_pkl):
         print("[6/6] Query embeddings exist. Skipping.")
     else:
+        if file_exists(query_vectors_pt) or file_exists(query_ids_pkl):
+            print("[6/6] Query embedding cache is incomplete; rebuilding.")
         print("[6/6] Encoding queries ...")
         queries = load_queries(queries_jsonl)
         query_vectors, query_ids = build_dense_query_vectors(

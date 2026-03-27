@@ -23,6 +23,7 @@ import math
 import os
 import random
 import sys
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib
@@ -269,6 +270,9 @@ def run_bm25_retrieval(bm25, doc_ids, queries, stemmer_lang, top_k, use_stemming
         tokens = stem_and_tokenize(qtext, stemmer)
         scores = bm25.get_scores(tokens)
         k = min(top_k, len(scores))
+        if k <= 0:
+            results[qid] = []
+            continue
         top_idx = np.argpartition(scores, -k)[-k:]
         top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
         results[qid] = [(doc_ids[i], float(scores[i])) for i in top_idx]
@@ -286,6 +290,9 @@ def run_dense_retrieval(
     query_chunk_size,
 ):
     """Run chunked dense retrieval and return {qid: [(doc_id, score), ...]}."""
+    if int(top_k) <= 0:
+        return {qid: [] for qid in query_ids}
+
     results = {}
     n_queries = len(query_ids)
     retrieval_device = corpus_vectors.device
@@ -329,6 +336,7 @@ def prepare_dataset_inputs(dataset_name, cfg):
         "dataset_dir": ds_dir,
         "queries_jsonl": os.path.join(ds_dir, "queries.jsonl"),
         "qrels_tsv": os.path.join(ds_dir, "qrels.tsv"),
+        "tokenized_corpus_jsonl": bm25_paths["tokenized_corpus_jsonl"],
         "word_freq_pkl": bm25_paths["word_freq_pkl"],
         "doc_freq_pkl": bm25_paths["doc_freq_pkl"],
         "query_tokens_pkl": bm25_paths["query_tokens_pkl"],
@@ -346,6 +354,7 @@ def prepare_dataset_inputs(dataset_name, cfg):
     missing = _missing_paths([
         paths["queries_jsonl"],
         paths["qrels_tsv"],
+        paths["tokenized_corpus_jsonl"],
         paths["word_freq_pkl"],
         paths["doc_freq_pkl"],
         paths["query_tokens_pkl"],
@@ -438,9 +447,67 @@ def ensure_retrieval_results_cached(dataset_name, cfg, device):
         save_pickle(dense_results, paths["dense_results_pkl"])
 
     qrels = load_qrels(paths["qrels_tsv"])
-    query_tokens = load_pickle(paths["query_tokens_pkl"])
-    word_freq, total_corpus_tokens = load_pickle(paths["word_freq_pkl"])
-    doc_freq, total_docs = load_pickle(paths["doc_freq_pkl"])
+
+    query_tokens = None
+    if file_exists(paths["query_tokens_pkl"]):
+        try:
+            query_tokens = load_pickle(paths["query_tokens_pkl"])
+        except Exception as exc:
+            print(
+                "  [WARN] Failed to load query-token cache; rebuilding. "
+                f"({type(exc).__name__}: {exc})"
+            )
+
+    if not isinstance(query_tokens, dict):
+        stemmer = SnowballStemmer(stemmer_lang) if bm25_params["use_stemming"] else None
+        query_tokens = {
+            qid: stem_and_tokenize(qtext, stemmer)
+            for qid, qtext in queries.items()
+        }
+        save_pickle(query_tokens, paths["query_tokens_pkl"])
+
+    freq_payload_ok = False
+    word_freq = None
+    total_corpus_tokens = None
+    doc_freq = None
+    total_docs = None
+
+    try:
+        word_freq, total_corpus_tokens = load_pickle(paths["word_freq_pkl"])
+        doc_freq, total_docs = load_pickle(paths["doc_freq_pkl"])
+        freq_payload_ok = (
+            isinstance(word_freq, dict)
+            and isinstance(doc_freq, dict)
+            and float(total_corpus_tokens) >= 0.0
+            and float(total_docs) >= 0.0
+        )
+    except Exception as exc:
+        print(
+            "  [WARN] Failed to load frequency payloads; rebuilding. "
+            f"({type(exc).__name__}: {exc})"
+        )
+
+    if not freq_payload_ok:
+        print("  Rebuilding word/doc-frequency payloads from tokenized corpus ...")
+        word_freq = {}
+        doc_freq = {}
+        total_corpus_tokens = 0
+        total_docs = 0
+        with open(paths["tokenized_corpus_jsonl"], "r", encoding="utf-8") as f:
+            for line in f:
+                d = json.loads(line)
+                tokens = d.get("tokens", [])
+                total_docs += 1
+                total_corpus_tokens += len(tokens)
+                seen = set()
+                for t in tokens:
+                    word_freq[t] = word_freq.get(t, 0) + 1
+                    seen.add(t)
+                for t in seen:
+                    doc_freq[t] = doc_freq.get(t, 0) + 1
+
+        save_pickle((word_freq, total_corpus_tokens), paths["word_freq_pkl"])
+        save_pickle((doc_freq, total_docs), paths["doc_freq_pkl"])
 
     return {
         "dataset": dataset_name,
@@ -1331,11 +1398,12 @@ def save_fold_coefficients_csv(rows, output_csv):
     """Save one readable router-effects table across all LOODO folds."""
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["heldout_dataset", "model_type", "value_type", "term", "coefficient"])
+        writer.writerow(["heldout_dataset", "repeat", "model_type", "value_type", "term", "coefficient"])
         for row in rows:
             writer.writerow(
                 [
                     row["heldout_dataset"],
+                    row.get("repeat", ""),
                     row["model_type"],
                     row["value_type"],
                     row["term"],
@@ -1348,15 +1416,105 @@ def save_fold_normalization_stats_csv(rows, output_csv):
     """Save train/test z-score statistics for each fold and feature."""
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["heldout_dataset", "split", "feature", "mean", "std"])
+        writer.writerow(["heldout_dataset", "repeat", "split", "feature", "mean", "std"])
         for row in rows:
             writer.writerow(
                 [
                     row["heldout_dataset"],
+                    row.get("repeat", ""),
                     row["split"],
                     row["feature"],
                     f"{row['mean']:.12f}",
                     f"{row['std']:.12f}",
+                ]
+            )
+
+
+def save_loodo_per_repeat_results(rows, output_csv):
+    """Save per-repeat LOODO benchmark results."""
+    with open(output_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "dataset",
+                "repeat",
+                "dense_only_ndcg",
+                "sparse_only_ndcg",
+                "static_rrf_ndcg",
+                "dynamic_wrrf_ndcg",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["dataset"],
+                    row["repeat"],
+                    f"{row['dense_only_ndcg']:.6f}",
+                    f"{row['sparse_only_ndcg']:.6f}",
+                    f"{row['static_rrf_ndcg']:.6f}",
+                    f"{row['dynamic_wrrf_ndcg']:.6f}",
+                ]
+            )
+
+
+def summarize_loodo_rows(per_repeat_rows):
+    """Aggregate LOODO per-repeat rows into mean/std summaries by dataset."""
+    by_dataset = {}
+    for row in per_repeat_rows:
+        by_dataset.setdefault(row["dataset"], []).append(row)
+
+    summary_rows = []
+    for dataset in sorted(by_dataset.keys()):
+        rows = by_dataset[dataset]
+        dense_vals = [r["dense_only_ndcg"] for r in rows]
+        sparse_vals = [r["sparse_only_ndcg"] for r in rows]
+        static_vals = [r["static_rrf_ndcg"] for r in rows]
+        dynamic_vals = [r["dynamic_wrrf_ndcg"] for r in rows]
+        summary_rows.append(
+            {
+                "dataset": dataset,
+                "dense_only_ndcg": float(np.mean(dense_vals)),
+                "dense_only_std": float(np.std(dense_vals)),
+                "sparse_only_ndcg": float(np.mean(sparse_vals)),
+                "sparse_only_std": float(np.std(sparse_vals)),
+                "static_rrf_ndcg": float(np.mean(static_vals)),
+                "static_rrf_std": float(np.std(static_vals)),
+                "dynamic_wrrf_ndcg": float(np.mean(dynamic_vals)),
+                "dynamic_wrrf_std": float(np.std(dynamic_vals)),
+            }
+        )
+    return summary_rows
+
+
+def save_loodo_dataset_summary(rows, output_csv):
+    """Save LOODO mean/std summary by held-out dataset."""
+    with open(output_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "dataset",
+                "dense_only_mean",
+                "dense_only_std",
+                "sparse_only_mean",
+                "sparse_only_std",
+                "static_rrf_mean",
+                "static_rrf_std",
+                "dynamic_wrrf_mean",
+                "dynamic_wrrf_std",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["dataset"],
+                    f"{row['dense_only_ndcg']:.6f}",
+                    f"{row['dense_only_std']:.6f}",
+                    f"{row['sparse_only_ndcg']:.6f}",
+                    f"{row['sparse_only_std']:.6f}",
+                    f"{row['static_rrf_ndcg']:.6f}",
+                    f"{row['static_rrf_std']:.6f}",
+                    f"{row['dynamic_wrrf_ndcg']:.6f}",
+                    f"{row['dynamic_wrrf_std']:.6f}",
                 ]
             )
 
@@ -1988,6 +2146,11 @@ def main():
             "Use 'loodo' or 'within_dataset'."
         )
 
+    loodo_cfg = cfg.get("loodo_evaluation", {}) or {}
+    loodo_n_repeats = int(loodo_cfg.get("n_repeats", 1))
+    if loodo_n_repeats <= 0:
+        raise ValueError(f"loodo_evaluation.n_repeats must be > 0, got {loodo_n_repeats}.")
+
     results_root = get_config_path(cfg, "results_folder", "data/results")
     benchmark_dir = os.path.join(results_root, short_model, "supervised_routing")
     plots_dir = os.path.join(benchmark_dir, "plots")
@@ -2056,6 +2219,8 @@ def main():
         raise ValueError("LOODO requires at least two configured datasets.")
 
     print("\n[3/4] Running LOODO folds with cached model reuse ...")
+    print(f"LOODO config: n_repeats={loodo_n_repeats}")
+    fold_repeat_rows = []
     fold_results = []
     alpha_rows = []
     coefficient_rows = []
@@ -2097,75 +2262,122 @@ def main():
         # Held-out dataset uses training-fold normalization statistics.
         X_test = apply_zscore(X_test_raw, train_mean, train_std)
 
-        for feat_idx, feat_name in enumerate(training_feature_names):
-            fold_norm_rows.append(
-                {
-                    "heldout_dataset": heldout,
-                    "split": "train",
-                    "feature": feat_name,
-                    "mean": float(train_mean[feat_idx]),
-                    "std": float(train_std[feat_idx]),
-                }
-            )
-            fold_norm_rows.append(
-                {
-                    "heldout_dataset": heldout,
-                    "split": "test",
-                    "feature": feat_name,
-                    "mean": float(train_mean[feat_idx]),
-                    "std": float(train_std[feat_idx]),
-                }
-            )
+        repeat_metrics = []
+        for repeat_idx in range(loodo_n_repeats):
+            repeat = repeat_idx + 1
+            repeat_seed = seed + repeat_idx + dataset_seed_offset(heldout)
 
-        fold_signature_payload = {
-            "heldout": heldout,
-            "train_datasets": train_datasets,
-            "feature_names": training_feature_names,
-            "bm25": u.get_bm25_params(cfg),
-            "model_type": model_type,
-            "random_forest": get_random_forest_config(cfg) if model_type == "random_forest" else None,
-            "xgboost": (
-                get_xgboost_config(
-                    cfg,
-                    dataset_name=heldout,
-                    optimization_mode="loodo",
+            cfg_repeat = deepcopy(cfg)
+            cfg_repeat.setdefault("supervised_routing", {})
+            cfg_repeat["supervised_routing"]["seed"] = repeat_seed
+            repeat_routing_cfg = cfg_repeat.get("supervised_routing", {})
+
+            set_global_seed(repeat_seed)
+            print(f"  Repeat {repeat}/{loodo_n_repeats} | seed={repeat_seed}")
+
+            for feat_idx, feat_name in enumerate(training_feature_names):
+                fold_norm_rows.append(
+                    {
+                        "heldout_dataset": heldout,
+                        "repeat": repeat,
+                        "split": "train",
+                        "feature": feat_name,
+                        "mean": float(train_mean[feat_idx]),
+                        "std": float(train_std[feat_idx]),
+                    }
                 )
-                if model_type == "xgboost"
-                else None
-            ),
-            "svr_rbf": get_svr_rbf_config() if model_type == "svr_rbf" else None,
-            "training_cfg": {
-                "regularization": routing_cfg.get("regularization", "l2"),
-                "C": routing_cfg.get("C", 1.0),
-                "fit_intercept": routing_cfg.get("fit_intercept", True),
-                "optimizer": routing_cfg.get("optimizer", "lbfgs"),
-                "learning_rate": routing_cfg.get("learning_rate", 0.05),
-                "epochs": routing_cfg.get("epochs", 300),
-                "batch_size": routing_cfg.get("batch_size", 256),
-                "early_stopping_patience": routing_cfg.get("early_stopping_patience", 30),
-                "early_stopping_min_delta": routing_cfg.get("early_stopping_min_delta", 1.0e-6),
-                "seed": routing_cfg.get("seed", 42),
-            },
-            "model": model_name,
-        }
-        fold_signature = hashlib.md5(
-            json.dumps(fold_signature_payload, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        fold_model_path = os.path.join(model_cache_dir, f"fold_{heldout}.pkl")
+                fold_norm_rows.append(
+                    {
+                        "heldout_dataset": heldout,
+                        "repeat": repeat,
+                        "split": "test",
+                        "feature": feat_name,
+                        "mean": float(train_mean[feat_idx]),
+                        "std": float(train_std[feat_idx]),
+                    }
+                )
 
-        model_bundle = None
+            fold_signature_payload = {
+                "heldout": heldout,
+                "repeat": repeat,
+                "repeat_seed": repeat_seed,
+                "train_datasets": train_datasets,
+                "feature_names": training_feature_names,
+                "bm25": u.get_bm25_params(cfg_repeat),
+                "model_type": model_type,
+                "random_forest": (
+                    get_random_forest_config(cfg_repeat)
+                    if model_type == "random_forest"
+                    else None
+                ),
+                "xgboost": (
+                    get_xgboost_config(
+                        cfg_repeat,
+                        dataset_name=heldout,
+                        optimization_mode="loodo",
+                    )
+                    if model_type == "xgboost"
+                    else None
+                ),
+                "svr_rbf": get_svr_rbf_config() if model_type == "svr_rbf" else None,
+                "training_cfg": {
+                    "regularization": repeat_routing_cfg.get("regularization", "l2"),
+                    "C": repeat_routing_cfg.get("C", 1.0),
+                    "fit_intercept": repeat_routing_cfg.get("fit_intercept", True),
+                    "optimizer": repeat_routing_cfg.get("optimizer", "lbfgs"),
+                    "learning_rate": repeat_routing_cfg.get("learning_rate", 0.05),
+                    "epochs": repeat_routing_cfg.get("epochs", 300),
+                    "batch_size": repeat_routing_cfg.get("batch_size", 256),
+                    "early_stopping_patience": repeat_routing_cfg.get("early_stopping_patience", 30),
+                    "early_stopping_min_delta": repeat_routing_cfg.get("early_stopping_min_delta", 1.0e-6),
+                    "seed": repeat_routing_cfg.get("seed", 42),
+                },
+                "model": model_name,
+            }
+            fold_signature = hashlib.md5(
+                json.dumps(fold_signature_payload, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            fold_model_path = os.path.join(model_cache_dir, f"fold_{heldout}_rep_{repeat}.pkl")
 
-        if file_exists(fold_model_path):
-            payload = load_pickle(fold_model_path)
-            if payload.get("signature") == fold_signature:
-                print("  Reusing cached fold model.")
-                model_bundle = deserialize_router_model(payload["model"], cfg, device)
+            model_bundle = None
+
+            if file_exists(fold_model_path):
+                payload = None
+                try:
+                    payload = load_pickle(fold_model_path)
+                except Exception as exc:
+                    print(
+                        "  [WARN] Fold cache unreadable; retraining. "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+
+                if isinstance(payload, dict) and payload.get("signature") == fold_signature:
+                    print("  Reusing cached fold model.")
+                    model_bundle = deserialize_router_model(payload["model"], cfg_repeat, device)
+                else:
+                    print("  Fold cache exists but signature changed; retraining.")
+                    model_bundle = train_router_model(
+                        X_train,
+                        y_train,
+                        cfg_repeat,
+                        device,
+                        dataset_name=heldout,
+                        optimization_mode="loodo",
+                    )
+                    save_pickle(
+                        {
+                            "signature": fold_signature,
+                            "signature_payload": fold_signature_payload,
+                            "model": serialize_router_model(model_bundle),
+                        },
+                        fold_model_path,
+                    )
             else:
-                print("  Fold cache exists but signature changed; retraining.")
+                print("  Training fold model from scratch ...")
                 model_bundle = train_router_model(
                     X_train,
                     y_train,
-                    cfg,
+                    cfg_repeat,
                     device,
                     dataset_name=heldout,
                     optimization_mode="loodo",
@@ -2178,97 +2390,102 @@ def main():
                     },
                     fold_model_path,
                 )
-        else:
-            print("  Training fold model from scratch ...")
-            model_bundle = train_router_model(
-                X_train,
-                y_train,
-                cfg,
-                device,
-                dataset_name=heldout,
-                optimization_mode="loodo",
-            )
-            save_pickle(
-                {
-                    "signature": fold_signature,
-                    "signature_payload": fold_signature_payload,
-                    "model": serialize_router_model(model_bundle),
-                },
-                fold_model_path,
-            )
 
-        intercept, coef_by_feature, value_type = extract_router_importance_or_coefficients(
-            model_bundle,
-            training_feature_names,
-            cfg,
-        )
-        coefficient_rows.append(
-            {
-                "heldout_dataset": heldout,
-                "model_type": model_type,
-                "value_type": value_type,
-                "term": "intercept",
-                "coefficient": intercept,
-            }
-        )
-        for feat_name in training_feature_names:
+            intercept, coef_by_feature, value_type = extract_router_importance_or_coefficients(
+                model_bundle,
+                training_feature_names,
+                cfg_repeat,
+            )
             coefficient_rows.append(
                 {
                     "heldout_dataset": heldout,
+                    "repeat": repeat,
                     "model_type": model_type,
                     "value_type": value_type,
-                    "term": feat_name,
-                    "coefficient": coef_by_feature[feat_name],
+                    "term": "intercept",
+                    "coefficient": intercept,
                 }
             )
+            for feat_name in training_feature_names:
+                coefficient_rows.append(
+                    {
+                        "heldout_dataset": heldout,
+                        "repeat": repeat,
+                        "model_type": model_type,
+                        "value_type": value_type,
+                        "term": feat_name,
+                        "coefficient": coef_by_feature[feat_name],
+                    }
+                )
 
-        alphas = predict_router_alpha(model_bundle, X_test, cfg, device)
-        alpha_map = {qid: float(alpha) for qid, alpha in zip(test_qids, alphas)}
-        alpha_rows.extend(
-            {"dataset": heldout, "query_id": qid, "alpha": float(alpha)}
-            for qid, alpha in zip(test_qids, alphas)
-        )
+            alphas = predict_router_alpha(model_bundle, X_test, cfg_repeat, device)
+            alpha_map = {qid: float(alpha) for qid, alpha in zip(test_qids, alphas)}
+            alpha_rows.extend(
+                {
+                    "dataset": heldout,
+                    "repeat": repeat,
+                    "query_id": qid,
+                    "alpha": float(alpha),
+                }
+                for qid, alpha in zip(test_qids, alphas)
+            )
 
-        ds_cache = dataset_cache_map[heldout]
-        bm25_results = ds_cache["bm25_results"]
-        dense_results = ds_cache["dense_results"]
-        qrels = ds_cache["qrels"]
+            ds_cache = dataset_cache_map[heldout]
+            bm25_results = ds_cache["bm25_results"]
+            dense_results = ds_cache["dense_results"]
+            qrels = ds_cache["qrels"]
 
-        sparse_scores, dense_scores = bm25_and_dense_to_score_maps(bm25_results, dense_results)
-        static_rrf_scores = apply_static_rrf(bm25_results, dense_results, rrf_k=rrf_k)
-        dynamic_scores = apply_dynamic_wrrf(bm25_results, dense_results, alpha_map, rrf_k=rrf_k)
+            sparse_scores, dense_scores = bm25_and_dense_to_score_maps(bm25_results, dense_results)
+            static_rrf_scores = apply_static_rrf(bm25_results, dense_results, rrf_k=rrf_k)
+            dynamic_scores = apply_dynamic_wrrf(bm25_results, dense_results, alpha_map, rrf_k=rrf_k)
 
-        dense_only_ndcg = calculate_dataset_ndcg_at_k(dense_scores, qrels, ndcg_k)
-        sparse_only_ndcg = calculate_dataset_ndcg_at_k(sparse_scores, qrels, ndcg_k)
-        static_rrf_ndcg = calculate_dataset_ndcg_at_k(static_rrf_scores, qrels, ndcg_k)
-        dynamic_wrrf_ndcg = calculate_dataset_ndcg_at_k(dynamic_scores, qrels, ndcg_k)
+            dense_only_ndcg = calculate_dataset_ndcg_at_k(dense_scores, qrels, ndcg_k)
+            sparse_only_ndcg = calculate_dataset_ndcg_at_k(sparse_scores, qrels, ndcg_k)
+            static_rrf_ndcg = calculate_dataset_ndcg_at_k(static_rrf_scores, qrels, ndcg_k)
+            dynamic_wrrf_ndcg = calculate_dataset_ndcg_at_k(dynamic_scores, qrels, ndcg_k)
 
-        print(f"  Dense only   NDCG@{ndcg_k}: {dense_only_ndcg:.4f}")
-        print(f"  Sparse only  NDCG@{ndcg_k}: {sparse_only_ndcg:.4f}")
-        print(f"  Static RRF   NDCG@{ndcg_k}: {static_rrf_ndcg:.4f}")
-        print(f"  Dynamic wRRF NDCG@{ndcg_k}: {dynamic_wrrf_ndcg:.4f}")
+            print(
+                f"    Dense={dense_only_ndcg:.4f} | "
+                f"Sparse={sparse_only_ndcg:.4f} | "
+                f"Static={static_rrf_ndcg:.4f} | "
+                f"Dynamic={dynamic_wrrf_ndcg:.4f}"
+            )
 
-        fold_results.append(
-            {
+            metric_row = {
                 "dataset": heldout,
+                "repeat": repeat,
                 "dense_only_ndcg": dense_only_ndcg,
                 "sparse_only_ndcg": sparse_only_ndcg,
                 "static_rrf_ndcg": static_rrf_ndcg,
                 "dynamic_wrrf_ndcg": dynamic_wrrf_ndcg,
                 "fold_model_path": fold_model_path,
             }
+            repeat_metrics.append(metric_row)
+            fold_repeat_rows.append(metric_row)
+
+        heldout_summary = summarize_loodo_rows(repeat_metrics)[0]
+        print(
+            f"  Mean over repeats | Dense={heldout_summary['dense_only_ndcg']:.4f} | "
+            f"Sparse={heldout_summary['sparse_only_ndcg']:.4f} | "
+            f"Static={heldout_summary['static_rrf_ndcg']:.4f} | "
+            f"Dynamic={heldout_summary['dynamic_wrrf_ndcg']:.4f}"
         )
+        fold_results.append(heldout_summary)
 
     print("\n[4/4] Writing benchmark outputs and plots ...")
 
+    per_repeat_csv = os.path.join(benchmark_dir, "loodo_per_repeat_results.csv")
     per_dataset_csv = os.path.join(benchmark_dir, "per_dataset_results.csv")
+    per_dataset_summary_csv = os.path.join(benchmark_dir, "per_dataset_summary.csv")
     macro_csv = os.path.join(benchmark_dir, "loodo_macro_summary.csv")
     alpha_csv = os.path.join(benchmark_dir, "predicted_alphas.csv")
     fold_coefficients_csv = os.path.join(benchmark_dir, "fold_model_effects.csv")
     fold_norm_csv = os.path.join(benchmark_dir, "fold_normalization_stats.csv")
     router_metadata_json = os.path.join(benchmark_dir, "router_model_metadata.json")
 
+    save_loodo_per_repeat_results(fold_repeat_rows, per_repeat_csv)
     save_per_dataset_results(fold_results, per_dataset_csv)
+    save_loodo_dataset_summary(fold_results, per_dataset_summary_csv)
     save_macro_summary(fold_results, macro_csv)
     save_fold_coefficients_csv(coefficient_rows, fold_coefficients_csv)
     save_fold_normalization_stats_csv(fold_norm_rows, fold_norm_csv)
@@ -2282,18 +2499,26 @@ def main():
 
     with open(alpha_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["dataset", "query_id", "alpha"])
+        writer.writerow(["dataset", "repeat", "query_id", "alpha"])
         for row in alpha_rows:
-            writer.writerow([row["dataset"], row["query_id"], f"{row['alpha']:.6f}"])
+            writer.writerow([
+                row["dataset"],
+                row.get("repeat", ""),
+                row["query_id"],
+                f"{row['alpha']:.6f}",
+            ])
 
     save_plots(fold_results, alpha_rows, plots_dir)
 
     print("\n" + "=" * 72)
     print("LOODO supervised routing benchmark completed.")
+    print(f"LOODO repeats configured      : {loodo_n_repeats}")
     print(f"Per-query feature cache (pkl): {feature_cache_pkl}")
     print(f"Per-query feature cache (csv): {feature_cache_csv}")
     print(f"Fold models directory        : {model_cache_dir}")
+    print(f"Per-repeat results CSV       : {per_repeat_csv}")
     print(f"Per-dataset results CSV      : {per_dataset_csv}")
+    print(f"Per-dataset summary CSV      : {per_dataset_summary_csv}")
     print(f"Macro summary CSV            : {macro_csv}")
     print(f"Predicted alphas CSV         : {alpha_csv}")
     print(f"Fold model effects CSV      : {fold_coefficients_csv}")
