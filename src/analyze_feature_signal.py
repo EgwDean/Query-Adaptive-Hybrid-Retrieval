@@ -16,11 +16,13 @@ import csv
 import os
 import sys
 from collections import defaultdict
+from time import perf_counter
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 from sklearn.base import clone
 from sklearn.dummy import DummyRegressor
@@ -67,6 +69,20 @@ def load_table(csv_path):
         raise ValueError(f"Input CSV has no header: {csv_path}")
 
     return rows, fieldnames
+
+
+def format_seconds(seconds):
+    """Format elapsed seconds to a compact human-readable string."""
+    seconds = float(max(0.0, seconds))
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rem = seconds - (60 * minutes)
+    if minutes < 60:
+        return f"{minutes}m {rem:.1f}s"
+    hours = int(minutes // 60)
+    minutes = minutes % 60
+    return f"{hours}h {minutes}m {rem:.1f}s"
 
 
 def infer_feature_columns(fieldnames, label_column):
@@ -213,12 +229,22 @@ def generate_splits(cv_mode, X, y, groups, n_splits, n_repeats, seed):
     return list(splitter.split(X, y))
 
 
-def evaluate_models_with_controls(models, X, y, splits, seed):
+def evaluate_models_with_controls(models, X, y, splits, seed, show_progress=True):
     """Evaluate each model and shuffled-label control over CV splits."""
     rng = np.random.default_rng(seed)
     rows = []
 
-    for model_name, model in models.items():
+    model_items = list(models.items())
+    n_models = len(model_items)
+    n_folds = len(splits)
+    # dummy_mean contributes one fit per fold; every other model contributes original+shuffle.
+    total_steps = n_folds * (1 + (2 * max(0, n_models - 1)))
+
+    pbar = None
+    if show_progress:
+        pbar = tqdm(total=total_steps, desc="CV model fits", dynamic_ncols=True)
+
+    for model_name, model in model_items:
         for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
             X_train = X[train_idx]
             y_train = y[train_idx]
@@ -240,6 +266,10 @@ def evaluate_models_with_controls(models, X, y, splits, seed):
                 }
             )
 
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(model=model_name, fold=f"{fold_idx}/{n_folds}")
+
             if model_name == "dummy_mean":
                 continue
 
@@ -258,6 +288,13 @@ def evaluate_models_with_controls(models, X, y, splits, seed):
                     "pred_label_pearson": pearson_corr(pred_shuf, y_test),
                 }
             )
+
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(model=f"{model_name}(shuf)", fold=f"{fold_idx}/{n_folds}")
+
+    if pbar is not None:
+        pbar.close()
 
     return rows
 
@@ -344,12 +381,16 @@ def write_cv_outputs(cv_rows, cv_summary, out_dir):
     return detail_csv, summary_csv
 
 
-def compute_feature_dependence_scores(X, y, feature_cols, seed):
+def compute_feature_dependence_scores(X, y, feature_cols, seed, show_progress=True):
     """Compute per-feature dependence scores (linear + nonlinear)."""
     pearsons = []
     dcor_vals = []
 
-    for j in range(X.shape[1]):
+    feature_iter = range(X.shape[1])
+    if show_progress:
+        feature_iter = tqdm(feature_iter, desc="Feature dependence", dynamic_ncols=True)
+
+    for j in feature_iter:
         xj = X[:, j]
         pearsons.append(pearson_corr(xj, y))
         dcor_vals.append(distance_correlation_1d(xj, y))
@@ -396,7 +437,17 @@ def write_feature_dependence_csv(rows, out_csv):
             )
 
 
-def aggregate_permutation_importance(models, model_name, X, y, splits, feature_cols, seed, n_repeats):
+def aggregate_permutation_importance(
+    models,
+    model_name,
+    X,
+    y,
+    splits,
+    feature_cols,
+    seed,
+    n_repeats,
+    show_progress=True,
+):
     """Estimate permutation importance on test folds and aggregate mean/std."""
     if model_name not in models:
         raise ValueError(f"Model {model_name!r} not found for permutation importance.")
@@ -404,7 +455,11 @@ def aggregate_permutation_importance(models, model_name, X, y, splits, feature_c
     rng = np.random.default_rng(seed)
     fold_importances = []
 
-    for train_idx, test_idx in splits:
+    split_iter = splits
+    if show_progress:
+        split_iter = tqdm(splits, desc="Permutation importance folds", dynamic_ncols=True)
+
+    for train_idx, test_idx in split_iter:
         X_train = X[train_idx]
         y_train = y[train_idx]
         X_test = X[test_idx]
@@ -535,7 +590,15 @@ def plot_permutation_importance(rows, out_png):
     plt.close()
 
 
-def maybe_compute_shap_interactions(models, model_name, X, feature_cols, out_dir, max_samples):
+def maybe_compute_shap_interactions(
+    models,
+    model_name,
+    X,
+    feature_cols,
+    out_dir,
+    max_samples,
+    verbose=True,
+):
     """Optionally compute SHAP interaction strength matrix for tree models."""
     if model_name != "xgboost":
         return None, None
@@ -552,8 +615,12 @@ def maybe_compute_shap_interactions(models, model_name, X, feature_cols, out_dir
     X_sample = X[:n]
     model = clone(models[model_name])
     # Fit on full data for interaction diagnostics.
+    if verbose:
+        print(f"[SHAP] Fitting xgboost for interaction analysis on {X.shape[0]} rows ...")
     model.fit(X, y_global_ref["y"])
 
+    if verbose:
+        print(f"[SHAP] Computing interaction values for {n} samples (this can take time) ...")
     explainer = shap.TreeExplainer(model)
     inter = explainer.shap_interaction_values(X_sample)
     inter = np.asarray(inter, dtype=np.float64)
@@ -636,7 +703,15 @@ def main():
         default=1000,
         help="Max samples used for SHAP interaction computation.",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce progress output (final summary is still printed).",
+    )
     args = parser.parse_args()
+
+    verbose = not bool(args.quiet)
+    global_start = perf_counter()
 
     u.CONFIG_PATH = args.config
     cfg = load_config()
@@ -649,9 +724,16 @@ def main():
     out_dir = args.output_dir or os.path.join(analysis_dir, "feature_signal_diagnostics")
     ensure_dir(out_dir)
 
+    if verbose:
+        print("[1/7] Loading input table ...")
+
     rows, fieldnames = load_table(input_csv)
     feature_cols = infer_feature_columns(fieldnames, args.label_column)
     X, y, groups = rows_to_arrays(rows, feature_cols, args.label_column)
+
+    if verbose:
+        print(f"  rows={X.shape[0]}, features={X.shape[1]}, label={args.label_column}")
+        print("[2/7] Building CV splits ...")
 
     splits = generate_splits(
         cv_mode=args.cv_mode,
@@ -663,7 +745,12 @@ def main():
         seed=args.seed,
     )
 
+    if verbose:
+        print(f"  splits={len(splits)} ({args.cv_mode} mode)")
+        print("[3/7] Running CV predictive tests (models + controls) ...")
+
     models = make_models(cfg, args.seed)
+    cv_t0 = perf_counter()
 
     cv_rows = evaluate_models_with_controls(
         models=models,
@@ -671,15 +758,30 @@ def main():
         y=y,
         splits=splits,
         seed=args.seed,
+        show_progress=verbose,
     )
+    if verbose:
+        print(f"  CV stage finished in {format_seconds(perf_counter() - cv_t0)}")
+
+    if verbose:
+        print("[4/7] Summarizing and saving CV results ...")
     cv_summary = summarize_cv_rows(cv_rows)
 
     cv_detail_csv, cv_summary_csv = write_cv_outputs(cv_rows, cv_summary, out_dir)
 
-    dep_rows = compute_feature_dependence_scores(X, y, feature_cols, args.seed)
+    if verbose:
+        print("[5/7] Computing feature dependence metrics (Pearson, dCor, MI) ...")
+    dep_t0 = perf_counter()
+    dep_rows = compute_feature_dependence_scores(X, y, feature_cols, args.seed, show_progress=verbose)
+    if verbose:
+        print(f"  Dependence stage finished in {format_seconds(perf_counter() - dep_t0)}")
+
     dep_csv = os.path.join(out_dir, "feature_dependence_scores.csv")
     write_feature_dependence_csv(dep_rows, dep_csv)
 
+    if verbose:
+        print("[6/7] Computing permutation importance (xgboost) ...")
+    perm_t0 = perf_counter()
     perm_rows = aggregate_permutation_importance(
         models=models,
         model_name="xgboost",
@@ -689,7 +791,11 @@ def main():
         feature_cols=feature_cols,
         seed=args.seed,
         n_repeats=args.perm_repeats,
+        show_progress=verbose,
     )
+    if verbose:
+        print(f"  Permutation stage finished in {format_seconds(perf_counter() - perm_t0)}")
+
     perm_csv = os.path.join(out_dir, "permutation_importance_xgboost.csv")
     write_permutation_csv(perm_rows, perm_csv)
 
@@ -704,6 +810,9 @@ def main():
     shap_csv = None
     shap_png = None
     if args.compute_shap_interactions:
+        if verbose:
+            print("[7/7] Computing optional SHAP interactions ...")
+        shap_t0 = perf_counter()
         y_global_ref["y"] = y
         shap_csv, shap_png = maybe_compute_shap_interactions(
             models=models,
@@ -712,7 +821,13 @@ def main():
             feature_cols=feature_cols,
             out_dir=out_dir,
             max_samples=args.max_shap_samples,
+            verbose=verbose,
         )
+        if verbose:
+            print(f"  SHAP interaction stage finished in {format_seconds(perf_counter() - shap_t0)}")
+
+    if verbose:
+        print(f"Total runtime: {format_seconds(perf_counter() - global_start)}")
 
     print("Feature-signal diagnostics completed.")
     print(f"Input CSV             : {input_csv}")
