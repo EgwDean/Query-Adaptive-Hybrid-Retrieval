@@ -86,9 +86,19 @@ def format_seconds(seconds):
     return f"{hours}h {minutes}m {rem:.1f}s"
 
 
+def log_line(message):
+    """Write logs without breaking tqdm progress bars."""
+    try:
+        tqdm.write(str(message))
+    except Exception:
+        print(str(message), flush=True)
+
+
 def run_with_heartbeat(fn, label, heartbeat_seconds=20.0, enabled=False, tracker=None):
     """Run a callable and print periodic heartbeat logs while it executes."""
     start = perf_counter()
+    if enabled:
+        log_line(f"  [progress] starting {label}")
     if (not enabled) or heartbeat_seconds <= 0:
         return fn(), perf_counter() - start
 
@@ -109,7 +119,7 @@ def run_with_heartbeat(fn, label, heartbeat_seconds=20.0, enabled=False, tracker
                     msg += f" | stage {done}/{total}, ETA ~ {format_seconds(eta)}"
                 elif total > 0:
                     msg += f" | stage {done}/{total}"
-            print(msg, flush=True)
+            log_line(msg)
 
     t = threading.Thread(target=_heartbeat_loop, daemon=True)
     t.start()
@@ -120,8 +130,104 @@ def run_with_heartbeat(fn, label, heartbeat_seconds=20.0, enabled=False, tracker
         t.join(timeout=0.1)
 
     elapsed = perf_counter() - start
-    print(f"  [progress] completed {label} in {format_seconds(elapsed)}", flush=True)
+    log_line(f"  [progress] completed {label} in {format_seconds(elapsed)}")
     return result, elapsed
+
+
+def build_speed_profile(speed_profile_name):
+    """Return runtime controls for full/fast/seconds diagnostic execution."""
+    if speed_profile_name == "full":
+        return {
+            "name": "full",
+            "max_rows": None,
+            "max_cv_splits": None,
+            "models_to_run": ["dummy_mean", "ridge", "random_forest", "xgboost"],
+            "shuffled_models": ["ridge", "random_forest", "xgboost"],
+            "xgb_n_estimators_cap": None,
+            "xgb_max_depth_cap": None,
+            "rf_n_estimators_cap": None,
+            "perm_max_folds": None,
+            "perm_repeats_cap": None,
+            "shap_max_samples_cap": None,
+            "heartbeat_default_seconds": 5.0,
+        }
+    if speed_profile_name == "fast":
+        return {
+            "name": "fast",
+            "max_rows": 1800,
+            "max_cv_splits": 3,
+            "models_to_run": ["dummy_mean", "ridge", "xgboost"],
+            "shuffled_models": ["ridge", "xgboost"],
+            "xgb_n_estimators_cap": 120,
+            "xgb_max_depth_cap": 4,
+            "rf_n_estimators_cap": 120,
+            "perm_max_folds": 2,
+            "perm_repeats_cap": 3,
+            "shap_max_samples_cap": 80,
+            "heartbeat_default_seconds": 3.0,
+        }
+    if speed_profile_name == "seconds":
+        return {
+            "name": "seconds",
+            "max_rows": 500,
+            "max_cv_splits": 2,
+            "models_to_run": ["dummy_mean", "xgboost"],
+            "shuffled_models": ["xgboost"],
+            "xgb_n_estimators_cap": 20,
+            "xgb_max_depth_cap": 3,
+            "rf_n_estimators_cap": 80,
+            "perm_max_folds": 1,
+            "perm_repeats_cap": 1,
+            "shap_max_samples_cap": 20,
+            "heartbeat_default_seconds": 2.0,
+        }
+    raise ValueError(f"Unknown speed profile: {speed_profile_name!r}")
+
+
+def subsample_rows_by_group(X, y, groups, max_rows, seed):
+    """Subsample rows with per-group quotas to preserve grouped-CV viability."""
+    if max_rows is None or X.shape[0] <= int(max_rows):
+        return X, y, groups, np.arange(X.shape[0], dtype=np.int64)
+
+    max_rows = int(max_rows)
+    rng = np.random.default_rng(seed)
+    n = X.shape[0]
+    unique_groups = np.unique(groups)
+
+    group_indices = {}
+    for g in unique_groups:
+        idx = np.where(groups == g)[0]
+        group_indices[g] = idx
+
+    quotas = {}
+    for g in unique_groups:
+        size_g = group_indices[g].shape[0]
+        q = int(round((size_g / float(n)) * max_rows))
+        quotas[g] = max(1, min(size_g, q))
+
+    selected = []
+    for g in unique_groups:
+        idx = group_indices[g]
+        q = quotas[g]
+        if q >= idx.shape[0]:
+            chosen = idx
+        else:
+            chosen = rng.choice(idx, size=q, replace=False)
+        selected.append(np.asarray(chosen, dtype=np.int64))
+
+    selected = np.concatenate(selected)
+
+    if selected.shape[0] > max_rows:
+        selected = rng.choice(selected, size=max_rows, replace=False)
+    elif selected.shape[0] < max_rows:
+        remaining = np.setdiff1d(np.arange(n, dtype=np.int64), selected, assume_unique=False)
+        add = min(max_rows - selected.shape[0], remaining.shape[0])
+        if add > 0:
+            extra = rng.choice(remaining, size=add, replace=False)
+            selected = np.concatenate([selected, extra])
+
+    selected = np.sort(selected)
+    return X[selected], y[selected], groups[selected], selected
 
 
 def infer_feature_columns(fieldnames, label_column):
@@ -191,7 +297,7 @@ def distance_correlation_1d(x, y):
     return float(np.sqrt(max(dcor2, 0.0)))
 
 
-def make_models(cfg, seed):
+def make_models(cfg, seed, speed_profile):
     """Build linear and nonlinear regressors for comparison."""
     rf_cfg = cfg.get("random_forest", {}) or {}
     xgb_cfg = cfg.get("xgboost", {}) or {}
@@ -203,8 +309,12 @@ def make_models(cfg, seed):
         ]
     )
 
+    rf_n_estimators = int(rf_cfg.get("n_estimators", 300))
+    if speed_profile.get("rf_n_estimators_cap") is not None:
+        rf_n_estimators = min(rf_n_estimators, int(speed_profile["rf_n_estimators_cap"]))
+
     rf = RandomForestRegressor(
-        n_estimators=int(rf_cfg.get("n_estimators", 300)),
+        n_estimators=rf_n_estimators,
         max_depth=None if rf_cfg.get("max_depth", 8) is None else int(rf_cfg.get("max_depth", 8)),
         min_samples_split=int(rf_cfg.get("min_samples_split", 8)),
         min_samples_leaf=int(rf_cfg.get("min_samples_leaf", 4)),
@@ -214,9 +324,16 @@ def make_models(cfg, seed):
         random_state=seed,
     )
 
+    xgb_n_estimators = int(xgb_cfg.get("n_estimators", 300))
+    xgb_max_depth = int(xgb_cfg.get("max_depth", 6))
+    if speed_profile.get("xgb_n_estimators_cap") is not None:
+        xgb_n_estimators = min(xgb_n_estimators, int(speed_profile["xgb_n_estimators_cap"]))
+    if speed_profile.get("xgb_max_depth_cap") is not None:
+        xgb_max_depth = min(xgb_max_depth, int(speed_profile["xgb_max_depth_cap"]))
+
     xgb_params = {
-        "n_estimators": int(xgb_cfg.get("n_estimators", 300)),
-        "max_depth": int(xgb_cfg.get("max_depth", 6)),
+        "n_estimators": xgb_n_estimators,
+        "max_depth": xgb_max_depth,
         "learning_rate": float(xgb_cfg.get("learning_rate", 0.05)),
         "subsample": float(xgb_cfg.get("subsample", 0.8)),
         "colsample_bytree": float(xgb_cfg.get("colsample_bytree", 0.8)),
@@ -227,6 +344,11 @@ def make_models(cfg, seed):
         "n_jobs": int(xgb_cfg.get("n_jobs", -1)),
         "random_state": seed,
     }
+
+    # For diagnostic speed, prefer histogram tree method when not explicitly configured.
+    if "tree_method" not in xgb_cfg and speed_profile["name"] != "full":
+        xgb_params["tree_method"] = "hist"
+
     for opt_key in ["tree_method", "device", "predictor", "max_bin", "grow_policy", "sampling_method"]:
         if opt_key in xgb_cfg and xgb_cfg[opt_key] is not None:
             xgb_params[opt_key] = xgb_cfg[opt_key]
@@ -276,16 +398,21 @@ def evaluate_models_with_controls(
     seed,
     show_progress=True,
     heartbeat_seconds=20.0,
+    shuffled_models=None,
 ):
     """Evaluate each model and shuffled-label control over CV splits."""
     rng = np.random.default_rng(seed)
     rows = []
 
     model_items = list(models.items())
-    n_models = len(model_items)
     n_folds = len(splits)
-    # dummy_mean contributes one fit per fold; every other model contributes original+shuffle.
-    total_steps = n_folds * (1 + (2 * max(0, n_models - 1)))
+    shuffled_models = set(shuffled_models or [])
+
+    total_steps = 0
+    for model_name, _ in model_items:
+        total_steps += n_folds
+        if model_name in shuffled_models:
+            total_steps += n_folds
 
     pbar = None
     if show_progress:
@@ -331,7 +458,7 @@ def evaluate_models_with_controls(
                 pbar.set_postfix(model=model_name, fold=f"{fold_idx}/{n_folds}")
             tracker["completed"] += 1
 
-            if model_name == "dummy_mean":
+            if model_name not in shuffled_models:
                 continue
 
             y_train_shuf = rng.permutation(y_train)
@@ -380,6 +507,13 @@ def summarize_cv_rows(cv_rows):
         mae_vals = np.asarray([r["mae"] for r in rows], dtype=np.float64)
         corr_vals = np.asarray([r["pred_label_pearson"] for r in rows], dtype=np.float64)
 
+        if np.all(np.isnan(corr_vals)):
+            corr_mean = float("nan")
+            corr_std = float("nan")
+        else:
+            corr_mean = float(np.nanmean(corr_vals))
+            corr_std = float(np.nanstd(corr_vals))
+
         summary.append(
             {
                 "model": model,
@@ -389,8 +523,8 @@ def summarize_cv_rows(cv_rows):
                 "r2_std": float(np.nanstd(r2_vals)),
                 "mae_mean": float(np.nanmean(mae_vals)),
                 "mae_std": float(np.nanstd(mae_vals)),
-                "pred_label_pearson_mean": float(np.nanmean(corr_vals)),
-                "pred_label_pearson_std": float(np.nanstd(corr_vals)),
+                "pred_label_pearson_mean": corr_mean,
+                "pred_label_pearson_std": corr_std,
             }
         )
 
@@ -557,7 +691,7 @@ def aggregate_permutation_importance(
                 model,
                 X_test,
                 y_test,
-                n_repeats=max(5, int(n_repeats)),
+                n_repeats=max(1, int(n_repeats)),
                 random_state=perm_seed,
                 scoring="neg_mean_absolute_error",
                 n_jobs=1,
@@ -806,6 +940,15 @@ def main():
         help="Max samples used for SHAP interaction computation.",
     )
     parser.add_argument(
+        "--speed-profile",
+        choices=["seconds", "fast", "full"],
+        default="seconds",
+        help=(
+            "Execution profile. 'seconds' is optimized for very fast turnaround; "
+            "'full' keeps the original exhaustive diagnostics."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Reduce progress output (final summary is still printed).",
@@ -813,13 +956,19 @@ def main():
     parser.add_argument(
         "--fit-heartbeat-seconds",
         type=float,
-        default=20.0,
+        default=None,
         help="Seconds between heartbeat logs while one long fit/scoring step is running (<=0 disables).",
     )
     args = parser.parse_args()
 
     verbose = not bool(args.quiet)
     global_start = perf_counter()
+    speed_profile = build_speed_profile(args.speed_profile)
+
+    if args.fit_heartbeat_seconds is None:
+        heartbeat_seconds = float(speed_profile["heartbeat_default_seconds"])
+    else:
+        heartbeat_seconds = float(args.fit_heartbeat_seconds)
 
     u.CONFIG_PATH = args.config
     cfg = load_config()
@@ -838,17 +987,34 @@ def main():
     rows, fieldnames = load_table(input_csv)
     feature_cols = infer_feature_columns(fieldnames, args.label_column)
     X, y, groups = rows_to_arrays(rows, feature_cols, args.label_column)
+    X, y, groups, selected_idx = subsample_rows_by_group(
+        X,
+        y,
+        groups,
+        max_rows=speed_profile["max_rows"],
+        seed=args.seed,
+    )
 
     if verbose:
         print(f"  rows={X.shape[0]}, features={X.shape[1]}, label={args.label_column}")
+        if speed_profile["max_rows"] is not None:
+            print(
+                f"  speed_profile={speed_profile['name']} (sampled {X.shape[0]} rows from {len(rows)} total)"
+            )
+        else:
+            print(f"  speed_profile={speed_profile['name']} (full dataset)")
         print("[2/7] Building CV splits ...")
+
+    n_splits_effective = int(args.n_splits)
+    if speed_profile.get("max_cv_splits") is not None:
+        n_splits_effective = min(n_splits_effective, int(speed_profile["max_cv_splits"]))
 
     splits = generate_splits(
         cv_mode=args.cv_mode,
         X=X,
         y=y,
         groups=groups,
-        n_splits=args.n_splits,
+        n_splits=n_splits_effective,
         n_repeats=args.n_repeats,
         seed=args.seed,
     )
@@ -856,8 +1022,11 @@ def main():
     if verbose:
         print(f"  splits={len(splits)} ({args.cv_mode} mode)")
         print("[3/7] Running CV predictive tests (models + controls) ...")
+        print("  Note: xgboost fits are typically the slowest steps in this stage.")
 
-    models = make_models(cfg, args.seed)
+    models = make_models(cfg, args.seed, speed_profile)
+    models = {k: v for k, v in models.items() if k in set(speed_profile["models_to_run"]) }
+    shuffled_models = [m for m in speed_profile["shuffled_models"] if m in models]
     cv_t0 = perf_counter()
 
     cv_rows = evaluate_models_with_controls(
@@ -867,7 +1036,8 @@ def main():
         splits=splits,
         seed=args.seed,
         show_progress=verbose,
-        heartbeat_seconds=args.fit_heartbeat_seconds,
+        heartbeat_seconds=heartbeat_seconds,
+        shuffled_models=shuffled_models,
     )
     if verbose:
         print(f"  CV stage finished in {format_seconds(perf_counter() - cv_t0)}")
@@ -891,17 +1061,26 @@ def main():
     if verbose:
         print("[6/7] Computing permutation importance (xgboost) ...")
     perm_t0 = perf_counter()
+
+    perm_repeats_effective = int(args.perm_repeats)
+    if speed_profile.get("perm_repeats_cap") is not None:
+        perm_repeats_effective = min(perm_repeats_effective, int(speed_profile["perm_repeats_cap"]))
+
+    perm_splits = splits
+    if speed_profile.get("perm_max_folds") is not None:
+        perm_splits = splits[: int(speed_profile["perm_max_folds"])]
+
     perm_rows = aggregate_permutation_importance(
         models=models,
         model_name="xgboost",
         X=X,
         y=y,
-        splits=splits,
+        splits=perm_splits,
         feature_cols=feature_cols,
         seed=args.seed,
-        n_repeats=args.perm_repeats,
+        n_repeats=perm_repeats_effective,
         show_progress=verbose,
-        heartbeat_seconds=args.fit_heartbeat_seconds,
+        heartbeat_seconds=heartbeat_seconds,
     )
     if verbose:
         print(f"  Permutation stage finished in {format_seconds(perf_counter() - perm_t0)}")
@@ -924,15 +1103,21 @@ def main():
             print("[7/7] Computing optional SHAP interactions ...")
         shap_t0 = perf_counter()
         y_global_ref["y"] = y
+        shap_samples_effective = int(args.max_shap_samples)
+        if speed_profile.get("shap_max_samples_cap") is not None:
+            shap_samples_effective = min(
+                shap_samples_effective,
+                int(speed_profile["shap_max_samples_cap"]),
+            )
         shap_csv, shap_png = maybe_compute_shap_interactions(
             models=models,
             model_name="xgboost",
             X=X,
             feature_cols=feature_cols,
             out_dir=out_dir,
-            max_samples=args.max_shap_samples,
+            max_samples=shap_samples_effective,
             verbose=verbose,
-            heartbeat_seconds=args.fit_heartbeat_seconds,
+            heartbeat_seconds=heartbeat_seconds,
         )
         if verbose:
             print(f"  SHAP interaction stage finished in {format_seconds(perf_counter() - shap_t0)}")
