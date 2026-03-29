@@ -15,6 +15,7 @@ import argparse
 import csv
 import os
 import sys
+import threading
 from collections import defaultdict
 from time import perf_counter
 
@@ -83,6 +84,44 @@ def format_seconds(seconds):
     hours = int(minutes // 60)
     minutes = minutes % 60
     return f"{hours}h {minutes}m {rem:.1f}s"
+
+
+def run_with_heartbeat(fn, label, heartbeat_seconds=20.0, enabled=False, tracker=None):
+    """Run a callable and print periodic heartbeat logs while it executes."""
+    start = perf_counter()
+    if (not enabled) or heartbeat_seconds <= 0:
+        return fn(), perf_counter() - start
+
+    stop_event = threading.Event()
+
+    def _heartbeat_loop():
+        while not stop_event.wait(heartbeat_seconds):
+            now = perf_counter()
+            msg = f"  [progress] still running {label} ({format_seconds(now - start)} elapsed)"
+            if tracker is not None:
+                done = int(tracker.get("completed", 0))
+                total = int(tracker.get("total", 0))
+                stage_start = float(tracker.get("stage_start", now))
+                stage_elapsed = max(0.0, now - stage_start)
+                if done > 0 and total > done:
+                    avg_step = stage_elapsed / float(done)
+                    eta = max(0.0, (total - done) * avg_step)
+                    msg += f" | stage {done}/{total}, ETA ~ {format_seconds(eta)}"
+                elif total > 0:
+                    msg += f" | stage {done}/{total}"
+            print(msg, flush=True)
+
+    t = threading.Thread(target=_heartbeat_loop, daemon=True)
+    t.start()
+    try:
+        result = fn()
+    finally:
+        stop_event.set()
+        t.join(timeout=0.1)
+
+    elapsed = perf_counter() - start
+    print(f"  [progress] completed {label} in {format_seconds(elapsed)}", flush=True)
+    return result, elapsed
 
 
 def infer_feature_columns(fieldnames, label_column):
@@ -229,7 +268,15 @@ def generate_splits(cv_mode, X, y, groups, n_splits, n_repeats, seed):
     return list(splitter.split(X, y))
 
 
-def evaluate_models_with_controls(models, X, y, splits, seed, show_progress=True):
+def evaluate_models_with_controls(
+    models,
+    X,
+    y,
+    splits,
+    seed,
+    show_progress=True,
+    heartbeat_seconds=20.0,
+):
     """Evaluate each model and shuffled-label control over CV splits."""
     rng = np.random.default_rng(seed)
     rows = []
@@ -244,6 +291,12 @@ def evaluate_models_with_controls(models, X, y, splits, seed, show_progress=True
     if show_progress:
         pbar = tqdm(total=total_steps, desc="CV model fits", dynamic_ncols=True)
 
+    tracker = {
+        "stage_start": perf_counter(),
+        "completed": 0,
+        "total": total_steps,
+    }
+
     for model_name, model in model_items:
         for fold_idx, (train_idx, test_idx) in enumerate(splits, start=1):
             X_train = X[train_idx]
@@ -252,7 +305,14 @@ def evaluate_models_with_controls(models, X, y, splits, seed, show_progress=True
             y_test = y[test_idx]
 
             fitted = clone(model)
-            fitted.fit(X_train, y_train)
+            fit_label = f"{model_name} fold {fold_idx}/{n_folds} (original fit)"
+            _, _ = run_with_heartbeat(
+                fn=lambda: fitted.fit(X_train, y_train),
+                label=fit_label,
+                heartbeat_seconds=heartbeat_seconds,
+                enabled=show_progress,
+                tracker=tracker,
+            )
             pred = fitted.predict(X_test)
 
             rows.append(
@@ -269,13 +329,21 @@ def evaluate_models_with_controls(models, X, y, splits, seed, show_progress=True
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(model=model_name, fold=f"{fold_idx}/{n_folds}")
+            tracker["completed"] += 1
 
             if model_name == "dummy_mean":
                 continue
 
             y_train_shuf = rng.permutation(y_train)
             fitted_shuf = clone(model)
-            fitted_shuf.fit(X_train, y_train_shuf)
+            fit_label = f"{model_name} fold {fold_idx}/{n_folds} (shuffled fit)"
+            _, _ = run_with_heartbeat(
+                fn=lambda: fitted_shuf.fit(X_train, y_train_shuf),
+                label=fit_label,
+                heartbeat_seconds=heartbeat_seconds,
+                enabled=show_progress,
+                tracker=tracker,
+            )
             pred_shuf = fitted_shuf.predict(X_test)
 
             rows.append(
@@ -292,6 +360,7 @@ def evaluate_models_with_controls(models, X, y, splits, seed, show_progress=True
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(model=f"{model_name}(shuf)", fold=f"{fold_idx}/{n_folds}")
+            tracker["completed"] += 1
 
     if pbar is not None:
         pbar.close()
@@ -447,6 +516,7 @@ def aggregate_permutation_importance(
     seed,
     n_repeats,
     show_progress=True,
+    heartbeat_seconds=20.0,
 ):
     """Estimate permutation importance on test folds and aggregate mean/std."""
     if model_name not in models:
@@ -459,24 +529,43 @@ def aggregate_permutation_importance(
     if show_progress:
         split_iter = tqdm(splits, desc="Permutation importance folds", dynamic_ncols=True)
 
-    for train_idx, test_idx in split_iter:
+    total_folds = len(splits)
+
+    for fold_idx, (train_idx, test_idx) in enumerate(split_iter, start=1):
         X_train = X[train_idx]
         y_train = y[train_idx]
         X_test = X[test_idx]
         y_test = y[test_idx]
 
         model = clone(models[model_name])
-        model.fit(X_train, y_train)
+        fold_tracker = {
+            "stage_start": perf_counter(),
+            "completed": fold_idx - 1,
+            "total": total_folds,
+        }
+        _, _ = run_with_heartbeat(
+            fn=lambda: model.fit(X_train, y_train),
+            label=f"permutation fold {fold_idx}/{total_folds} model fit",
+            heartbeat_seconds=heartbeat_seconds,
+            enabled=show_progress,
+            tracker=fold_tracker,
+        )
 
         perm_seed = int(rng.integers(0, 2**31 - 1))
-        perm = permutation_importance(
-            model,
-            X_test,
-            y_test,
-            n_repeats=max(5, int(n_repeats)),
-            random_state=perm_seed,
-            scoring="neg_mean_absolute_error",
-            n_jobs=1,
+        perm, _ = run_with_heartbeat(
+            fn=lambda: permutation_importance(
+                model,
+                X_test,
+                y_test,
+                n_repeats=max(5, int(n_repeats)),
+                random_state=perm_seed,
+                scoring="neg_mean_absolute_error",
+                n_jobs=1,
+            ),
+            label=f"permutation fold {fold_idx}/{total_folds} scoring",
+            heartbeat_seconds=heartbeat_seconds,
+            enabled=show_progress,
+            tracker=fold_tracker,
         )
         fold_importances.append(np.asarray(perm.importances_mean, dtype=np.float64))
 
@@ -598,6 +687,7 @@ def maybe_compute_shap_interactions(
     out_dir,
     max_samples,
     verbose=True,
+    heartbeat_seconds=20.0,
 ):
     """Optionally compute SHAP interaction strength matrix for tree models."""
     if model_name != "xgboost":
@@ -617,12 +707,24 @@ def maybe_compute_shap_interactions(
     # Fit on full data for interaction diagnostics.
     if verbose:
         print(f"[SHAP] Fitting xgboost for interaction analysis on {X.shape[0]} rows ...")
-    model.fit(X, y_global_ref["y"])
+    _, _ = run_with_heartbeat(
+        fn=lambda: model.fit(X, y_global_ref["y"]),
+        label="SHAP prep model fit",
+        heartbeat_seconds=heartbeat_seconds,
+        enabled=verbose,
+        tracker=None,
+    )
 
     if verbose:
         print(f"[SHAP] Computing interaction values for {n} samples (this can take time) ...")
     explainer = shap.TreeExplainer(model)
-    inter = explainer.shap_interaction_values(X_sample)
+    inter, _ = run_with_heartbeat(
+        fn=lambda: explainer.shap_interaction_values(X_sample),
+        label=f"SHAP interaction values ({n} samples)",
+        heartbeat_seconds=heartbeat_seconds,
+        enabled=verbose,
+        tracker=None,
+    )
     inter = np.asarray(inter, dtype=np.float64)
 
     # Mean absolute interaction matrix.
@@ -708,6 +810,12 @@ def main():
         action="store_true",
         help="Reduce progress output (final summary is still printed).",
     )
+    parser.add_argument(
+        "--fit-heartbeat-seconds",
+        type=float,
+        default=20.0,
+        help="Seconds between heartbeat logs while one long fit/scoring step is running (<=0 disables).",
+    )
     args = parser.parse_args()
 
     verbose = not bool(args.quiet)
@@ -759,6 +867,7 @@ def main():
         splits=splits,
         seed=args.seed,
         show_progress=verbose,
+        heartbeat_seconds=args.fit_heartbeat_seconds,
     )
     if verbose:
         print(f"  CV stage finished in {format_seconds(perf_counter() - cv_t0)}")
@@ -792,6 +901,7 @@ def main():
         seed=args.seed,
         n_repeats=args.perm_repeats,
         show_progress=verbose,
+        heartbeat_seconds=args.fit_heartbeat_seconds,
     )
     if verbose:
         print(f"  Permutation stage finished in {format_seconds(perf_counter() - perm_t0)}")
@@ -822,6 +932,7 @@ def main():
             out_dir=out_dir,
             max_samples=args.max_shap_samples,
             verbose=verbose,
+            heartbeat_seconds=args.fit_heartbeat_seconds,
         )
         if verbose:
             print(f"  SHAP interaction stage finished in {format_seconds(perf_counter() - shap_t0)}")
