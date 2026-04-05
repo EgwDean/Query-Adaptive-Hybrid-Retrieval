@@ -1,148 +1,81 @@
-# RAG-LLM Hybrid Retrieval Benchmark
+# Query-Adaptive Hybrid Retrieval
 
-This repository benchmarks sparse, dense, and hybrid retrieval on BEIR datasets with a two-phase workflow:
+Diploma Thesis — Konstantinos Anastasopoulos, CEID
 
-1. Preprocess and cache all heavy artifacts once.
-2. Run retrieval and evaluation repeatedly on the cached data.
+---
 
-The current hybrid logic uses supervised query-level routing in a leave-one-dataset-out (LOODO) setup.
+## Problem
 
-## Methods evaluated
+Standard retrieval systems apply a fixed strategy to every query. For some queries
+BM25 (sparse, lexical matching) is the better retriever; for others a dense
+embedding model is. A query-adaptive system learns to weight the two methods
+per query, improving retrieval quality across diverse query types.
 
-For each configured dataset, the evaluation script reports:
+---
 
-1. BM25 Only
-2. Dense Only
-3. RRF (static)
-4. Dynamic wRRF (alpha predicted by a PyTorch logistic regression model)
+## Algorithm
 
-All methods are scored with NDCG@k (default k=10).
+For each query $q$:
 
-## Repository layout
+1. **Sparse retrieval** — BM25 produces a ranked list of documents.
+2. **Dense retrieval** — a bi-encoder (BAAI/bge-m3) produces a ranked list via cosine similarity.
+3. **Router** — a classifier predicts a weight $\hat{\alpha}(q) \in [0, 1]$ from
+   query features. Values near 1 favour sparse; values near 0 favour dense.
+4. **Weighted RRF fusion** — the two ranked lists are combined:
 
-```text
-config.yaml
-requirements.txt
-src/
-  pipeline.py      # legacy reference pipeline (kept for comparison)
-  utils.py
-  download.py      # dataset downloader
-  preprocess.py    # preprocessing/cache builder
-  retrieve_and_evaluate.py  # LOODO supervised benchmark
-  correct.py       # migrate old cached files from results -> processed_data
-  fix.py           # one-time stale-cache cleanup for new retrieval logic
-data/
-  datasets/        # raw BEIR datasets
-  processed_data/  # reusable cache artifacts per model/dataset
-  results/         # model-level summaries and charts
-```
+$$\text{score}(q, d) = \hat{\alpha}(q) \cdot \frac{1}{k + r_\text{sparse}(d)} + (1 - \hat{\alpha}(q)) \cdot \frac{1}{k + r_\text{dense}(d)}$$
+
+with $k = 60$ (RRF damping constant). Setting $\hat{\alpha} = 0.5$ recovers
+static RRF, which serves as a baseline.
+
+The router is trained with **soft labels**: the target for each query is derived
+from the relative NDCG@10 of BM25 vs dense on that query (see `docs/routing_features.md`).
+
+---
+
+## Baselines compared
+
+For each dataset the benchmark reports NDCG@10 for:
+
+- **Sparse only** — BM25
+- **Dense only** — bi-encoder cosine similarity
+- **Static RRF** — equal-weight reciprocal rank fusion ($\hat{\alpha} = 0.5$)
+- **Weighted RRF** — per-query $\hat{\alpha}$ predicted by the trained router
+
+---
+
+## Datasets
+
+Five BEIR datasets: `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`.
+
+---
 
 ## Setup
 
 ```bash
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux / macOS
-source .venv/bin/activate
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux / macOS
 
 pip install -r requirements.txt
 ```
 
-## Configuration
-
-Edit config.yaml to choose:
-
-1. Active datasets (all uncommented entries are processed/evaluated).
-2. Embedding model and batch size.
-3. Retrieval/evaluation settings.
-4. Supervised routing feature/training settings.
-
-Important sections:
-
-```yaml
-datasets:
-  - scifact
-  - nfcorpus
-
-paths:
-  datasets_folder: "data/datasets"
-  results_folder: "data/results"
-  processed_folder: "data/processed_data"
-
-embeddings:
-  model_name: "BAAI/bge-m3"
-  batch_size: 64
-
-benchmark:
-  top_k: 100
-  ndcg_k: 10
-  rrf:
-    k: 60
-
-supervised_routing:
-  overlap_k: 100
-  epsilon: 1.0e-9
-  C: 1.0
-  optimizer: "adam"
-  learning_rate: 0.05
-```
+---
 
 ## Run order
 
-1. Download datasets
-
 ```bash
+# 1. Download BEIR datasets
 python src/download.py
-```
 
-2. Build caches (corpus/query files, BM25 index, frequency index, embeddings)
-
-```bash
+# 2. Build preprocessing caches (BM25 index, embeddings, frequency indexes)
 python src/preprocess.py
 ```
 
-3. Optional migration for previously generated caches
+Further scripts are added incrementally as the pipeline is developed.
 
-```bash
-python src/correct.py
-```
+---
 
-4. Optional one-time stale cleanup before new retrieval logic
+## Documentation
 
-```bash
-python src/fix.py
-```
-
-5. Run LOODO retrieval + evaluation
-
-```bash
-python src/retrieve_and_evaluate.py
-```
-
-## Supervised Routing Details
-
-The evaluation stage applies the following:
-
-1. Build per-query feature/label rows from cached sparse+dense retrieval.
-2. Train one logistic regression model per LOODO fold.
-3. Predict query-level alpha values on held-out datasets.
-4. Fuse sparse+dense rankings with dynamic wRRF and compare against baselines.
-
-## Outputs
-
-The supervised benchmark writes files under data/results/<model>/supervised_routing/:
-
-1. per_dataset_results.csv
-2. loodo_macro_summary.csv
-3. predicted_alphas.csv
-4. fold_models/*.pt
-5. plots/*.png
-
-Processed artifacts are cached under data/processed_data/<model>/<dataset>/ and reused across runs.
-
-## Notes
-
-1. CPU and CUDA are both supported.
-2. Preprocessing uses multiprocessing for corpus tokenization.
-3. Dense retrieval uses chunking controls from config for memory safety.
+- `docs/routing_features.md` — full feature definitions with formulas

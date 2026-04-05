@@ -15,5 +15,8 @@ Thumbs.db
 *.swo
 .vscode/
 
-# Todo diles
+# Tasks to be done
 TODO.txt
+
+# AI settings
+.claude/
