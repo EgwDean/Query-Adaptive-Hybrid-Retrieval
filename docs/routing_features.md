@@ -262,7 +262,7 @@ $$\text{sparse\_entropy\_topk} = -\sum_{i=1}^{k_f} p_i^B \log_2 \max\!\left(p_i^
 The target value for each query. Derived from query-level NDCG@k of each retriever,
 requiring relevance judgments — **used only at training time, not at inference**.
 
-$$\text{label}(q) = \frac{1}{2}\left(\frac{\text{NDCG@}k^B(q) - \text{NDCG@}k^D(q)}{\text{NDCG@}k^B(q) + \text{NDCG@}k^D(q) + \varepsilon} + 1\right) \in [0, 1]$$
+$$\text{label}(q) = \frac{1}{2}\left(\frac{\text{NDCG@}k^B(q) - \text{NDCG@}k^D(q)}{\max\!\left(\text{NDCG@}k^B(q),\;\text{NDCG@}k^D(q)\right) + \varepsilon} + 1\right) \in [0, 1]$$
 
 - $\text{label} = 1$ → sparse (BM25) is strictly better
 - $\text{label} = 0$ → dense is strictly better
