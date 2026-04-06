@@ -70,6 +70,9 @@ python src/download.py
 
 # 2. Build preprocessing caches (BM25 index, embeddings, frequency indexes)
 python src/preprocess.py
+
+# 3. Model selection grid search (find the best router model family)
+python src/weak_signal_model_grid_search.py
 ```
 
 Further scripts are added incrementally as the pipeline is developed.
@@ -79,3 +82,4 @@ Further scripts are added incrementally as the pipeline is developed.
 ## Documentation
 
 - `docs/routing_features.md` — full feature definitions with formulas
+- `docs/model_guide.md` — 9 candidate models, how they work, and every hyperparameter explained

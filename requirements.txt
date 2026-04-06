@@ -19,6 +19,8 @@ torch
 numpy
 scikit-learn
 xgboost
+lightgbm
+joblib
 
 # Visualization
 matplotlib

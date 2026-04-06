@@ -1,5 +1,5 @@
 """
-preproces.py
+preprocess.py
 
 Builds preprocessing artifacts for configured datasets and caches them on disk.
 The script always skips steps that are already available in processed_data.
@@ -491,12 +491,7 @@ def main():
     ensure_dir(processed_folder)
 
     model_name = cfg["embeddings"]["model_name"]
-    routing_cfg = cfg.get("supervised_routing", {})
-    use_cuda_if_available = bool(routing_cfg.get("use_cuda_if_available", True))
-    device = "cuda" if (use_cuda_if_available and torch.cuda.is_available()) else "cpu"
-
-    if torch.cuda.is_available() and not use_cuda_if_available:
-        print("CUDA is available but disabled by supervised_routing.use_cuda_if_available=false.")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Device : {device}")
     print(f"Model  : {model_name}")

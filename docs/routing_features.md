@@ -274,7 +274,7 @@ The label is clipped to $[0, 1]$ to guard against floating-point edge cases.
 
 ## Weighted RRF Fusion
 
-At inference the router predicts $\hat{\alpha}(q) \in [0, 1]$ from the 17 features.
+At inference the router predicts $\hat{\alpha}(q) \in [0, 1]$ from the 16 features.
 The final document score is:
 
 $$\text{score}(q, d) = \hat{\alpha}(q) \cdot \frac{1}{k_\text{rrf} + r^B(d)} + \bigl(1 - \hat{\alpha}(q)\bigr) \cdot \frac{1}{k_\text{rrf} + r^D(d)}$$

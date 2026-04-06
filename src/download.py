@@ -1,5 +1,5 @@
 """
-donwload.py
+download.py
 
 Downloads the datasets listed in config.yaml (uncommented entries only).
 If a dataset already exists locally, it is skipped.

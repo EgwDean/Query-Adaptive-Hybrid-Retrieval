@@ -287,7 +287,7 @@ def main():
 
     u.CONFIG_PATH = args.config
     cfg = load_config()
-    random.seed(int(cfg.get("supervised_routing", {}).get("seed", 42)))
+    random.seed(int(cfg.get("routing_features", {}).get("seed", 42)))
 
     datasets = cfg.get("datasets", [])
     grid     = cfg.get("bm25_optimization", {}) or {}

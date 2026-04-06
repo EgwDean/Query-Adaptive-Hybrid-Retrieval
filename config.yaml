@@ -78,14 +78,6 @@ bm25:
   use_stemming: true
 
 # ------------------------------------------------------------
-# BM25 optimization grid search
-# ------------------------------------------------------------
-bm25_optimization:
-  k1_values: [0.8, 1.2, 1.5, 1.6, 2.0]
-  b_values: [0.0, 0.25, 0.5, 0.75, 1.0]
-  use_stemming_values: [true, false]
-
-# ------------------------------------------------------------
 # Embedding model
 # ------------------------------------------------------------
 embeddings:
@@ -105,201 +97,85 @@ dense_search:
 # Benchmark / evaluation
 # ------------------------------------------------------------
 benchmark:
-  #evaluation_mode: "loodo"
-  evaluation_mode: "within_dataset"
   top_k: 100
   ndcg_k: 10
   rrf:
     k: 60               # RRF damping constant (Cormack et al. 2009)
 
 # ------------------------------------------------------------
-# Within-dataset supervised routing evaluation
+# Routing feature construction
 # ------------------------------------------------------------
-within_dataset_evaluation:
-  train_fraction: 0.8
-  n_repeats: 20
-  shuffle: true
-
-# ------------------------------------------------------------
-# LOODO supervised routing evaluation
-# ------------------------------------------------------------
-loodo_evaluation:
-  n_repeats: 10
-
-# ------------------------------------------------------------
-# Ablation controls
-# Used by: python src/ablation_study.py
-# ------------------------------------------------------------
-ablation:
-  mode: "lofo_single_feature_within_dataset"
-
-# ------------------------------------------------------------
-# Supervised query-level routing benchmark (LOODO)
-# ------------------------------------------------------------
-# Used by: python src/retrieve_and_evaluate.py
-supervised_routing:
-  # Feature construction
+routing_features:
   overlap_k: 10
   feature_stat_k: 10
   epsilon: 1.0e-8
   ce_smoothing_alpha: 1.0
   feature_workers: 8
-
-  # Model/training setup
-  model_type: "xgboost"  # logistic | random_forest | xgboost | svr_rbf
-  regularization: "l2"
-  C: 1.0
-  fit_intercept: true
-  optimizer: "lbfgs"
-  learning_rate: 0.05
-  epochs: 300
-  batch_size: 256
-  early_stopping_patience: 30
-  early_stopping_min_delta: 1.0e-6
   seed: 42
-  use_cuda_if_available: true
 
 # ------------------------------------------------------------
-# Random Forest router (used when supervised_routing.model_type=random_forest)
+# Model selection grid search  (Step 5)
+# Used by: python src/weak_signal_model_grid_search.py
+#
+# Total combinations: ~2 600
+# Each combo: 10 folds × 5 datasets = 50 train/eval cycles
+# Output:    data/results/model_grid_search_top100.csv
 # ------------------------------------------------------------
-random_forest:
-  n_estimators: 300
-  max_depth: 8
-  min_samples_split: 8
-  min_samples_leaf: 4
-  max_features: "sqrt"
-  bootstrap: true
-  n_jobs: -1
-  random_state: 42
+model_grid_search:
+  n_folds: 10
+  train_fraction: 0.8
+  top_n: 100
+  n_jobs: -1            # outer parallelism across combos (-1 = all cores)
 
-# ------------------------------------------------------------
-# XGBoost router (used when supervised_routing.model_type=xgboost)
-# ------------------------------------------------------------
-xgboost:
-  n_estimators: 300
-  max_depth: 6
-  learning_rate: 0.05
-  subsample: 0.8
-  colsample_bytree: 0.8
-  reg_lambda: 1.0
-  reg_alpha: 0.0
-  min_child_weight: 1
-  objective: "reg:squarederror"
-  n_jobs: -1
-  random_state: 42
+  models:
+    logistic_regression:
+      C: [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
 
-# ------------------------------------------------------------
-# XGBoost router hyperparameter optimization
-# Used by: python src/optimize_xgboost.py
-# ------------------------------------------------------------
-xgboost_optimization:
-  mode: "within_dataset"   # within_dataset | loodo
-  search_type: "grid"      # currently supported: grid
-  max_configs: null         # null => evaluate all generated combinations
-  param_grid:
-    n_estimators: [100, 200, 300, 500]
-    max_depth: [3, 4, 6, 8]
-    learning_rate: [0.03, 0.05, 0.1]
-    subsample: [0.8, 1.0]
-    colsample_bytree: [0.8, 1.0]
-    min_child_weight: [1, 3, 5]
-    reg_lambda: [1.0, 3.0, 5.0]
-    reg_alpha: [0.0, 0.1]
+    random_forest:
+      n_estimators: [50, 100, 200, 300, 500]
+      max_depth: [3, 5, 8, 12, null]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ["sqrt", "log2"]
 
-# ------------------------------------------------------------
-# Optional dataset-specific XGBoost router overrides
-# If not provided for a dataset/mode, global xgboost defaults are used.
-# ------------------------------------------------------------
-xgboost_per_dataset:
-  within_dataset:
-    scifact:
-      n_estimators: 100
-      max_depth: 3
-      learning_rate: 0.03
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 1
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-    nfcorpus:
-      n_estimators: 100
-      max_depth: 3
-      learning_rate: 0.03
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 1
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-    arguana:
-      n_estimators: 100
-      max_depth: 3
-      learning_rate: 0.03
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 1
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-    fiqa:
-      n_estimators: 100
-      max_depth: 3
-      learning_rate: 0.03
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 1
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-    scidocs:
-      n_estimators: 100
-      max_depth: 3
-      learning_rate: 0.03
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 1
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-  loodo:
-    scifact:
-      n_estimators: 200
-      max_depth: 4
-      learning_rate: 0.1
-      subsample: 1.0
-      colsample_bytree: 1.0
-      min_child_weight: 5
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-    nfcorpus:
-      n_estimators: 100
-      max_depth: 4
-      learning_rate: 0.05
-      subsample: 0.8
-      colsample_bytree: 1.0
-      min_child_weight: 1
-      reg_lambda: 1.0
-      reg_alpha: 0.0
-    arguana:
-      n_estimators: 300
-      max_depth: 3
-      learning_rate: 0.1
-      subsample: 1.0
-      colsample_bytree: 0.8
-      min_child_weight: 3
-      reg_lambda: 1.0
-      reg_alpha: 0.1
-    fiqa:
-      n_estimators: 300
-      max_depth: 6
-      learning_rate: 0.1
-      subsample: 0.8
-      colsample_bytree: 0.8
-      min_child_weight: 5
-      reg_lambda: 3.0
-      reg_alpha: 0.1
-    scidocs:
-      n_estimators: 500
-      max_depth: 6
-      learning_rate: 0.1
-      subsample: 1.0
-      colsample_bytree: 1.0
-      min_child_weight: 3
-      reg_lambda: 3.0
-      reg_alpha: 0.0
+    extra_trees:
+      n_estimators: [50, 100, 200, 300, 500]
+      max_depth: [3, 5, 8, 12, null]
+      min_samples_split: [2, 5, 10]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ["sqrt", "log2"]
+
+    xgboost:
+      n_estimators: [50, 100, 200, 300]
+      max_depth: [3, 4, 6, 8]
+      learning_rate: [0.01, 0.05, 0.1, 0.3]
+      subsample: [0.8, 1.0]
+      colsample_bytree: [0.8, 1.0]
+      min_child_weight: [1, 3, 5]
+
+    lightgbm:
+      n_estimators: [50, 100, 200, 300]
+      num_leaves: [15, 31, 63]
+      learning_rate: [0.01, 0.05, 0.1, 0.3]
+      subsample: [0.8, 1.0]
+      colsample_bytree: [0.8, 1.0]
+      min_child_weight: [1, 3, 5]
+
+    mlp:
+      hidden_layer_sizes: [[32], [64], [128], [256], [32, 16], [64, 32], [128, 64], [64, 32, 16]]
+      alpha: [0.0001, 0.001, 0.01, 0.1]
+      learning_rate_init: [0.001, 0.01]
+      batch_size: [16, 32]
+      activation: ["relu", "tanh"]
+
+    gaussian_nb:
+      var_smoothing: [1.0e-11, 1.0e-10, 1.0e-9, 1.0e-8, 1.0e-7]
+
+    adaboost:
+      n_estimators: [50, 100, 200, 300, 500]
+      learning_rate: [0.01, 0.05, 0.1, 0.5, 1.0]
+      base_max_depth: [1, 2, 3]
+
+    lda:
+      solver: ["svd", "lsqr", "eigen"]
+      shrinkage: [null, "auto", 0.1, 0.5, 0.9]
