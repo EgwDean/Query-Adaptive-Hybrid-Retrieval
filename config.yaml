@@ -126,6 +126,31 @@ ablation_study:
   n_jobs: -1
 
 # ------------------------------------------------------------
+# Per-dataset XGBoost hyperparameter search  (Step 7)
+# Used by: python src/weak_signal_params_grid_search.py
+#
+# Split: 70% train / 15% dev / 15% test (fixed per dataset)
+# Grid search selects best params on the dev set.
+# Test set is evaluated exactly once with the best params.
+#
+# Total combinations: ~6 480 per dataset (8× the model selection grid)
+# New axes vs model selection: gamma  (not tuned before)
+# Output: data/results/per_dataset_best_params.csv
+# ------------------------------------------------------------
+xgboost_params_grid:
+  n_folds:       10
+  test_fraction: 0.15
+  n_jobs:        -1
+
+  n_estimators:     [100, 200, 300, 500]
+  max_depth:        [4, 6, 8, 10]
+  learning_rate:    [0.01, 0.05, 0.1, 0.2, 0.3]
+  subsample:        [0.7, 0.8, 0.9]
+  colsample_bytree: [0.7, 0.8, 0.9]
+  min_child_weight: [1, 2, 3]
+  gamma:            [0.0, 0.1, 0.5]
+
+# ------------------------------------------------------------
 # Routing feature construction
 # ------------------------------------------------------------
 routing_features:
