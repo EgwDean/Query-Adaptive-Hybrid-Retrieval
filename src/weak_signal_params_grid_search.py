@@ -29,7 +29,6 @@ import warnings
 import numpy as np
 import xgboost as xgb
 from joblib import Parallel, delayed
-from sklearn.exceptions import ConvergenceWarning
 from tqdm import tqdm
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -112,7 +111,6 @@ def _build_grid(grid_cfg):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
 
     cfg = load_config()

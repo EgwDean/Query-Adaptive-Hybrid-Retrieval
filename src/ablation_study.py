@@ -82,10 +82,6 @@ FEATURE_GROUPS = {
     ],
 }
 
-# Pre-build index for fast column lookup
-_FEAT_IDX = {name: i for i, name in enumerate(FEATURE_NAMES)}
-
-
 def _cols_without(excluded_names):
     """Return column indices for all features except the excluded ones."""
     excluded = set(excluded_names)
@@ -211,7 +207,7 @@ def evaluate_config(
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
 
-def _make_plot(full_score, lof_results, log_results, dataset_names, out_path):
+def _make_plot(full_score, lof_results, log_results, out_path):
     """
     Two-panel horizontal bar chart.
 
@@ -402,7 +398,7 @@ def main():
 
     # ── Plot ───────────────────────────────────────────────────────────────────
     png_path = os.path.join(results_folder, "ablation_study.png")
-    _make_plot(full_score, lof, log_, list(dataset_names), png_path)
+    _make_plot(full_score, lof, log_, png_path)
 
 
 if __name__ == "__main__":
