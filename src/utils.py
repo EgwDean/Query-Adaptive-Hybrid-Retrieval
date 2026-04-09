@@ -276,8 +276,10 @@ def initialize_output_files(corpus_path, queries_path, qrels_path):
 
     Called once before appending data from multiple datasets.
     """
-    open(corpus_path, "w", encoding="utf-8").close()
-    open(queries_path, "w", encoding="utf-8").close()
+    with open(corpus_path, "w", encoding="utf-8"):
+        pass
+    with open(queries_path, "w", encoding="utf-8"):
+        pass
     ensure_dir(os.path.dirname(qrels_path))
     with open(qrels_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t")

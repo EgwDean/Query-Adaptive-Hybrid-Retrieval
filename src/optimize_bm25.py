@@ -22,7 +22,6 @@ import itertools
 import json
 import math
 import os
-import random
 import sys
 
 import numpy as np
@@ -287,7 +286,6 @@ def main():
 
     u.CONFIG_PATH = args.config
     cfg = load_config()
-    random.seed(int(cfg.get("routing_features", {}).get("seed", 42)))
 
     datasets = cfg.get("datasets", [])
     grid     = cfg.get("bm25_optimization", {}) or {}

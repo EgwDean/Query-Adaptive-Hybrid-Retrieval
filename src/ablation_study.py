@@ -240,7 +240,7 @@ def _make_plot(full_score, lof_results, log_results, out_path):
     ]
 
     for ax, results, atype, title in panels:
-        # Sort descending so highest score is at top
+        # Sort ascending; barh plots first item at bottom, so highest score ends up at top
         sorted_res = sorted(results, key=lambda r: r["macro_ndcg10"])
         labels = [r["removed_label"] for r in sorted_res]
         scores = [r["macro_ndcg10"] for r in sorted_res]

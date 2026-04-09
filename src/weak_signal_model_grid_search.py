@@ -372,6 +372,31 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
     ce_alpha = float(routing_cfg.get("ce_smoothing_alpha", 1.0))
     use_stemming = bm25_params["use_stemming"]
 
+    # Feature/label cache keyed by all parameters that affect X and y.
+    _cache_key_str = json.dumps({
+        "bm25": bm25_paths["bm25_signature"],
+        "top_k": top_k,
+        "ndcg_k": ndcg_k,
+        "overlap_k": overlap_k,
+        "feature_stat_k": feature_stat_k,
+        "epsilon": epsilon,
+        "ce_alpha": ce_alpha,
+    }, sort_keys=True)
+    _feature_hash = hashlib.md5(_cache_key_str.encode()).hexdigest()[:12]
+    features_cache_pkl = os.path.join(ds_dir, f"features_labels_{_feature_hash}.pkl")
+
+    if file_exists(features_cache_pkl):
+        print(f"  Loading cached features+labels for {dataset_name}")
+        _cached = load_pickle(features_cache_pkl)
+        return {
+            "X": _cached["X"],
+            "y": _cached["y"],
+            "qids": _cached["qids"],
+            "bm25_results": bm25_results,
+            "dense_results": dense_results,
+            "qrels": qrels,
+        }
+
     english_sw = ensure_english_stopwords()
     if use_stemming:
         stemmer = SnowballStemmer(stemmer_lang)
@@ -397,11 +422,13 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
         # Soft label
         sp_ndcg = query_ndcg_at_k(bm25_results.get(qid, []), qrels.get(qid, {}), ndcg_k)
         de_ndcg = query_ndcg_at_k(dense_results.get(qid, []), qrels.get(qid, {}), ndcg_k)
-        label = 0.5 * ((sp_ndcg - de_ndcg) / (sp_ndcg + de_ndcg + epsilon) + 1.0)
+        label = 0.5 * ((sp_ndcg - de_ndcg) / (max(sp_ndcg, de_ndcg) + epsilon) + 1.0)
         labels.append(float(np.clip(label, 0.0, 1.0)))
 
     X = np.asarray(feat_rows, dtype=np.float32)
     y = np.asarray(labels, dtype=np.float32)
+
+    save_pickle({"X": X, "y": y, "qids": qids}, features_cache_pkl)
 
     return {
         "X": X,
