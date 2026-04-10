@@ -23,77 +23,109 @@ Outputs: `data/results/ablation_study.csv`, `data/results/ablation_study.png`
 
 ---
 
-## Result: full model wins
+## Result: two features are net noise
 
-The full model (all 16 features) achieved the highest macro NDCG@10 of **0.3851**.
-Every ablation configuration scored lower, confirming that all features and all
-groups carry at least some signal and that none are harmful noise.
+The full model (all 16 features) achieved macro NDCG@10 of **0.3858**.
+Most ablation configurations score lower, but **two features improve performance
+when removed**: `query_length` (+0.0003) and `average_idf` (+0.0003). All other
+features hurt when dropped, confirming they carry genuine signal.
 
 ---
 
 ## Leave-one-feature-out
 
-Sorted by performance drop (largest drop = most important feature).
+Sorted by delta vs full model (most negative = most important; positive = net noise).
 
-| Feature | Macro NDCG@10 | Drop |
+| Feature | Macro NDCG@10 | Delta |
 |---|---|---|
-| `sparse_entropy_topk` | 0.3825 | −0.0026 |
-| `top_dense_score` | 0.3829 | −0.0022 |
-| `first_shared_doc_rank` | 0.3835 | −0.0016 |
-| `stopword_ratio` | 0.3836 | −0.0015 |
-| `max_idf` | 0.3838 | −0.0013 |
-| `dense_entropy_topk` | 0.3839 | −0.0012 |
-| `spearman_topk` | 0.3839 | −0.0012 |
-| `top_sparse_score` | 0.3842 | −0.0008 |
-| `rare_term_ratio` | 0.3843 | −0.0008 |
-| `dense_confidence` | 0.3844 | −0.0007 |
-| `query_length` | 0.3846 | −0.0005 |
-| `has_question_word` | 0.3846 | −0.0005 |
-| `average_idf` | 0.3847 | −0.0004 |
-| `sparse_confidence` | 0.3847 | −0.0004 |
-| `overlap_at_k` | 0.3847 | −0.0004 |
-| `cross_entropy` | 0.3849 | −0.0002 |
+| `top_dense_score` | 0.3833 | −0.0025 |
+| `sparse_entropy_topk` | 0.3837 | −0.0021 |
+| `dense_entropy_topk` | 0.3841 | −0.0017 |
+| `sparse_confidence` | 0.3842 | −0.0016 |
+| `stopword_ratio` | 0.3843 | −0.0015 |
+| `first_shared_doc_rank` | 0.3843 | −0.0015 |
+| `rare_term_ratio` | 0.3847 | −0.0011 |
+| `dense_confidence` | 0.3847 | −0.0011 |
+| `spearman_topk` | 0.3847 | −0.0011 |
+| `max_idf` | 0.3850 | −0.0008 |
+| `has_question_word` | 0.3853 | −0.0005 |
+| `overlap_at_k` | 0.3853 | −0.0005 |
+| `cross_entropy` | 0.3854 | −0.0004 |
+| `top_sparse_score` | 0.3855 | −0.0003 |
+| `average_idf` | 0.3861 | **+0.0003** |
+| `query_length` | 0.3861 | **+0.0003** |
 
-The most impactful individual features are `sparse_entropy_topk` and
-`top_dense_score`. The distribution shape of the BM25 ranking (entropy) and the
-raw normalized top score from the dense retriever both carry signal that the model
-relies on. The least impactful is `cross_entropy`, which overlaps informationally
-with IDF-based features.
+The most impactful individual features are `top_dense_score` and
+`sparse_entropy_topk`. The raw normalized top score from the dense retriever
+and the entropy of the BM25 score distribution directly encode retriever
+reliability per query. The least impactful useful feature is `top_sparse_score`.
+
+`query_length` and `average_idf` are mildly harmful: including them adds noise
+the model has to route around. This is consistent with other features already
+capturing the relevant signal — `stopword_ratio`, `rare_term_ratio`, and `max_idf`
+subsume what `query_length` and `average_idf` were trying to express.
 
 ---
 
 ## Leave-one-group-out
 
-Sorted by performance drop (largest drop = most important group).
+Sorted by delta vs full model (largest drop = most important group).
 
-| Group | Macro NDCG@10 | Drop |
+| Group | Macro NDCG@10 | Delta |
 |---|---|---|
-| E: Distribution Shape | 0.3814 | −0.0037 |
-| D: Retriever Agreement | 0.3815 | −0.0036 |
-| B: Vocabulary Match | 0.3826 | −0.0025 |
-| C: Retriever Confidence | 0.3831 | −0.0020 |
-| A: Query Surface | 0.3835 | −0.0016 |
+| E: Distribution Shape | 0.3823 | −0.0035 |
+| C: Retriever Confidence | 0.3829 | −0.0029 |
+| D: Retriever Agreement | 0.3829 | −0.0029 |
+| A: Query Surface | 0.3834 | −0.0024 |
+| B: Vocabulary Match | 0.3839 | −0.0019 |
 
-Groups E and D are the most valuable, nearly tied. Removing either one causes the
-largest drop. This makes sense: the distribution shape features (entropy of the
-top-k score distributions) and the retriever agreement features (how much the two
-retrievers agree on document ranking) directly encode *when* one retriever is more
-reliable than the other, which is exactly the signal the router needs.
+Group E (Distribution Shape) is the single most important group. Removing both
+entropy features causes the largest aggregate drop, confirming that the shape of
+the retriever score distributions is the clearest signal for routing.
 
-Group A (query surface features: length, stopword ratio, question word) causes the
-smallest group-level drop, reflecting that surface-level query properties are
-weaker proxies for retriever preference than the retrieval outputs themselves.
+Groups C and D are nearly tied for second. Retriever Confidence (top scores,
+score gaps) and Retriever Agreement (overlap, shared-rank correlation) together
+directly encode *when one retriever is more reliable than the other* — which is
+exactly what the router needs to predict.
+
+Group B (Vocabulary Match) is the least important group. Two of its four
+features (`average_idf`, `cross_entropy`) carry marginal or slightly harmful
+signal, and the other two (`max_idf`, `rare_term_ratio`) are partially redundant
+with Group E and D features.
+
+---
+
+## Full vs smaller model comparison
+
+Following the leave-one-out results, a direct comparison was run between the
+full 16-feature model and a 14-feature model with both `query_length` and
+`average_idf` removed.
+
+Script: `src/full_vs_smaller_model_ablation_study.py`
+Outputs: `data/results/full_vs_smaller_ablation.csv`, `data/results/full_vs_smaller_ablation.png`
+
+| Model | Features | Macro NDCG@10 | Delta |
+|---|---|---|---|
+| Full | 16 | 0.3858 | — |
+| Reduced (no query_length, no average_idf) | 14 | 0.3844 | −0.0014 |
+
+Removing both features together hurts more than removing either one alone. The
+two features carry partially complementary signal: each individually is noise,
+but together they provide a weak compound proxy that the model exploits.
+
+**Decision**: remove only `query_length`, keeping `average_idf`. The
+15-feature model (no `query_length`) scores **0.3861** — the highest of all
+configurations tested — and retains the richer IDF-based vocabulary signal.
 
 ---
 
 ## Observations
 
-- No feature hurts — every removal reduces performance, so the feature set is
-  clean with no redundant or adversarial signals.
-- The differences are small in absolute terms (max drop 0.0037), which is
-  expected: XGBoost is robust to mildly redundant features, and the 16 features
-  encode complementary but correlated signals.
+- The full model is not the optimal feature set: `query_length` is net noise
+  and its removal (+0.0003) represents the best single-feature configuration.
+- The differences are small in absolute terms (max group drop 0.0035), which is
+  expected: XGBoost is robust to mildly redundant features.
 - Group-level drops are consistently larger than single-feature drops, confirming
   that within each group the features carry partially independent information.
-- The full model is therefore the right choice for the next step (hyperparameter
-  fine-tuning).
+- The 15-feature model (all features except `query_length`) is used for all
+  subsequent steps (per-dataset hyperparameter search and final evaluation).

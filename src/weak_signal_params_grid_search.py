@@ -40,12 +40,18 @@ os.chdir(PROJECT_ROOT)
 import torch
 from src.utils import ensure_dir, get_config_path, load_config
 from src.weak_signal_model_grid_search import (
+    FEATURE_NAMES,
     dataset_seed_offset,
     load_dataset_for_grid_search,
     query_ndcg_at_k,
     set_global_seed,
     zscore_stats,
 )
+
+# Features excluded from the router based on the ablation study.
+# `query_length` was the only feature whose removal improved macro NDCG@10.
+REMOVED_FEATURES = ["query_length"]
+ACTIVE_COLS = [i for i, n in enumerate(FEATURE_NAMES) if n not in set(REMOVED_FEATURES)]
 
 
 # ── wRRF scoring ──────────────────────────────────────────────────────────────
@@ -132,6 +138,7 @@ def main():
     combos = _build_grid(grid_cfg)
     param_keys = sorted(grid_cfg.keys())
 
+    print(f"Features  : {len(ACTIVE_COLS)} / {len(FEATURE_NAMES)}  (removed: {REMOVED_FEATURES})")
     print(f"Grid size : {len(combos)} combinations per dataset")
     print(f"CV folds  : {n_folds}")
     print(f"Test hold : {int(test_frac * 100)} %")
@@ -153,7 +160,7 @@ def main():
 
     for ds_name in dataset_names:
         ds = datasets_data[ds_name]
-        X, y      = ds["X"], ds["y"]
+        X, y      = ds["X"][:, ACTIVE_COLS], ds["y"]
         qids      = ds["qids"]
         bm25_res  = ds["bm25_results"]
         dense_res = ds["dense_results"]
