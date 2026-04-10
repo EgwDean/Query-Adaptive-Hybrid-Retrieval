@@ -3,10 +3,12 @@
 # ============================================================
 #
 # This file controls every tunable aspect of the pipeline.
-# Edit the settings below, then run:
-#     python src/pipeline.py
+# Edit the settings below, then run the scripts in order:
+#     python src/download.py
+#     python src/preprocess.py
+#     python src/weak_signal_model_grid_search.py
 #
-# The pipeline automatically detects which processing steps
+# Each script automatically detects which processing steps
 # have already been completed and skips them.  If you change
 # the dataset list or the embedding model, all cached
 # artifacts for the affected dataset(s) are rebuilt.
@@ -129,8 +131,8 @@ ablation_study:
 # Per-dataset XGBoost hyperparameter search  (Step 7)
 # Used by: python src/weak_signal_params_grid_search.py
 #
-# Split: 70% train / 15% dev / 15% test (fixed per dataset)
-# Grid search selects best params on the dev set.
+# Split: 85% train+dev / 15% test (fixed per dataset)
+# Grid search selects best params via 10-fold 80/20 CV on the 85%.
 # Test set is evaluated exactly once with the best params.
 #
 # Total combinations: ~6 480 per dataset (8× the model selection grid)
@@ -158,7 +160,6 @@ routing_features:
   feature_stat_k: 10
   epsilon: 1.0e-8
   ce_smoothing_alpha: 1.0
-  feature_workers: 8
   seed: 42
 
 # ------------------------------------------------------------

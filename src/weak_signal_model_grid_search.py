@@ -598,7 +598,7 @@ def evaluate_combination(
                 mdl = create_model(model_name, params, seed)
                 mdl.fit(X_tr_z, y_fit)
                 alphas = predict_alpha(mdl, X_te_z, model_name)
-            except (ValueError, np.linalg.LinAlgError):
+            except (ValueError, np.linalg.LinAlgError, IndexError):
                 # Degenerate fold (e.g. single class for a classifier); treat as RRF
                 alphas = np.full(len(test_qids), 0.5, dtype=np.float32)
 
