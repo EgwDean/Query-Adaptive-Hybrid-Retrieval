@@ -218,6 +218,81 @@ routing_features:
 # Each combo: 10 folds × 5 datasets = 50 train/eval cycles
 # Output:    data/results/model_grid_search_top100.csv
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# Strong-signal model selection grid search  (Step 9)
+# Used by: python src/strong_signal_model_grid_search.py
+#
+# Input: query embedding vectors (~1024 dims from bge-m3)
+# Same 10-fold 80/20 Monte Carlo CV, same fold seeds as model_grid_search
+# so weak-signal vs strong-signal scores are directly comparable.
+#
+# Total combinations: ~470
+# Output: data/results/strong_signal_grid_search_top100.csv
+# ------------------------------------------------------------
+strong_signal_model_grid_search:
+  n_folds: 10
+  train_fraction: 0.8
+  top_n: 100
+  n_jobs: -1
+
+  models:
+    ridge:
+      alpha: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+
+    elasticnet:
+      alpha: [0.001, 0.01, 0.1, 1.0, 10.0]
+      l1_ratio: [0.1, 0.3, 0.5, 0.7, 0.9]
+
+    # SVR: grid is deliberately small — O(n²) training cost.
+    svr:
+      C: [0.1, 1.0, 10.0, 100.0]
+      gamma: ["scale", "auto"]
+      epsilon: [0.01, 0.1, 0.2]
+
+    knn:
+      n_neighbors: [3, 5, 7, 10, 15, 20]
+      weights: ["uniform", "distance"]
+
+    # MLP: hidden sizes scaled to the ~1024-dim embedding input.
+    mlp:
+      hidden_layer_sizes: [[512], [256], [128], [512, 256], [256, 128], [128, 64]]
+      alpha: [0.0001, 0.001, 0.01, 0.1]
+      learning_rate_init: [0.001, 0.0001]
+      batch_size: [32, 64]
+
+    # XGBoost: colsample_bytree shifted lower than the weak-signal grid
+    # because random subsampling of embedding dimensions is more beneficial
+    # than for 15 hand-crafted features.
+    xgboost:
+      n_estimators: [100, 300]
+      max_depth: [4, 6, 8]
+      learning_rate: [0.05, 0.1, 0.3]
+      subsample: [0.8]
+      colsample_bytree: [0.1, 0.3, 0.5, 0.8]
+      min_child_weight: [1, 3]
+
+    # RF/ET: max_features as fractions instead of "log2" — with ~1024 features,
+    # "log2" (≈10) would be too aggressive; 0.1 (≈102) and 0.3 (≈307) are better.
+    random_forest:
+      n_estimators: [100, 200, 500]
+      max_depth: [null, 8, 16]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ["sqrt", 0.1, 0.3]
+
+    extra_trees:
+      n_estimators: [100, 200, 500]
+      max_depth: [null, 8, 16]
+      min_samples_leaf: [1, 2, 4]
+      max_features: ["sqrt", 0.1, 0.3]
+
+# ------------------------------------------------------------
+# Model selection grid search  (Step 5)
+# Used by: python src/weak_signal_model_grid_search.py
+#
+# Total combinations: ~2 600
+# Each combo: 10 folds × 5 datasets = 50 train/eval cycles
+# Output:    data/results/model_grid_search_top100.csv
+# ------------------------------------------------------------
 model_grid_search:
   n_folds: 10
   train_fraction: 0.8
