@@ -322,7 +322,10 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
     raw_queries = load_queries(queries_jsonl)
     qrels = load_qrels(qrels_tsv)
 
-    query_tokens = load_pickle(bm25_paths["query_tokens_pkl"])
+    try:
+        query_tokens = load_pickle(bm25_paths["query_tokens_pkl"])
+    except Exception:
+        query_tokens = None
     if not isinstance(query_tokens, dict):
         stemmer = SnowballStemmer(stemmer_lang) if bm25_params["use_stemming"] else None
         query_tokens = {qid: stem_and_tokenize(t, stemmer) for qid, t in raw_queries.items()}
@@ -332,10 +335,14 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
     doc_freq, total_docs = load_pickle(bm25_paths["doc_freq_pkl"])
 
     # ── BM25 retrieval (cached) ───────────────────────────────
-    if file_exists(bm25_results_pkl):
-        print(f"  Loading cached BM25 results for {dataset_name}")
-        bm25_results = load_pickle(bm25_results_pkl)
-    else:
+    bm25_results = None
+    if file_exists(bm25_results_pkl) and os.path.getsize(bm25_results_pkl) > 0:
+        try:
+            print(f"  Loading cached BM25 results for {dataset_name}")
+            bm25_results = load_pickle(bm25_results_pkl)
+        except Exception as exc:
+            print(f"  [WARN] BM25 results cache corrupt for {dataset_name}; rebuilding. ({exc})")
+    if bm25_results is None:
         print(f"  Running BM25 retrieval for {dataset_name} ...")
         bm25 = load_pickle(bm25_paths["bm25_pkl"])
         bm25_doc_ids = load_pickle(bm25_paths["bm25_docids_pkl"])
@@ -346,10 +353,14 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
         save_pickle(bm25_results, bm25_results_pkl)
 
     # ── Dense retrieval (cached) ──────────────────────────────
-    if file_exists(dense_results_pkl):
-        print(f"  Loading cached dense results for {dataset_name}")
-        dense_results = load_pickle(dense_results_pkl)
-    else:
+    dense_results = None
+    if file_exists(dense_results_pkl) and os.path.getsize(dense_results_pkl) > 0:
+        try:
+            print(f"  Loading cached dense results for {dataset_name}")
+            dense_results = load_pickle(dense_results_pkl)
+        except Exception as exc:
+            print(f"  [WARN] Dense results cache corrupt for {dataset_name}; rebuilding. ({exc})")
+    if dense_results is None:
         print(f"  Running dense retrieval for {dataset_name} ...")
         corpus_embeddings = torch.load(corpus_emb_pt, weights_only=True)
         if device.type == "cuda":
@@ -373,8 +384,11 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
     use_stemming = bm25_params["use_stemming"]
 
     # Feature/label cache keyed by all parameters that affect X and y.
+    # stemmer_lang is included because different languages produce different tokens,
+    # which affects all Group-B features and the stopword stems.
     _cache_key_str = json.dumps({
         "bm25": bm25_paths["bm25_signature"],
+        "stemmer_lang": stemmer_lang,
         "top_k": top_k,
         "ndcg_k": ndcg_k,
         "overlap_k": overlap_k,
@@ -382,20 +396,25 @@ def load_dataset_for_grid_search(dataset_name, cfg, device):
         "epsilon": epsilon,
         "ce_alpha": ce_alpha,
     }, sort_keys=True)
-    _feature_hash = hashlib.md5(_cache_key_str.encode()).hexdigest()[:12]
+    _feature_hash = hashlib.md5(
+        _cache_key_str.encode(), usedforsecurity=False
+    ).hexdigest()[:12]
     features_cache_pkl = os.path.join(ds_dir, f"features_labels_{_feature_hash}.pkl")
 
-    if file_exists(features_cache_pkl):
-        print(f"  Loading cached features+labels for {dataset_name}")
-        _cached = load_pickle(features_cache_pkl)
-        return {
-            "X": _cached["X"],
-            "y": _cached["y"],
-            "qids": _cached["qids"],
-            "bm25_results": bm25_results,
-            "dense_results": dense_results,
-            "qrels": qrels,
-        }
+    if file_exists(features_cache_pkl) and os.path.getsize(features_cache_pkl) > 0:
+        try:
+            print(f"  Loading cached features+labels for {dataset_name}")
+            _cached = load_pickle(features_cache_pkl)
+            return {
+                "X": _cached["X"],
+                "y": _cached["y"],
+                "qids": _cached["qids"],
+                "bm25_results": bm25_results,
+                "dense_results": dense_results,
+                "qrels": qrels,
+            }
+        except Exception as exc:
+            print(f"  [WARN] Feature cache corrupt for {dataset_name}; recomputing. ({exc})")
 
     english_sw = ensure_english_stopwords()
     if use_stemming:

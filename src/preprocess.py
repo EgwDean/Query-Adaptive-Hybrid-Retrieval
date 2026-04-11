@@ -371,7 +371,7 @@ def run_for_dataset(dataset_name, cfg, model, device):
         return
 
     # 2) Export corpus/queries/qrels once
-    if file_exists(corpus_jsonl) and file_exists(queries_jsonl) and file_exists(qrels_tsv):
+    if _is_nonempty_file(corpus_jsonl) and _is_nonempty_file(queries_jsonl) and _is_nonempty_file(qrels_tsv):
         print("[1/6] Corpus/queries/qrels already cached. Skipping.")
     else:
         print("[1/6] Loading BEIR data and writing corpus/queries/qrels ...")

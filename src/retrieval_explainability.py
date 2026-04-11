@@ -120,10 +120,13 @@ def _save_shap_plot(mdl, X_all_z, dataset_name, out_path):
         show=False,
         max_display=len(ACTIVE_FEATURE_NAMES),
     )
-    plt.title(f"SHAP Feature Importance — {dataset_name}", fontsize=12, pad=14)
+    # Get figure reference explicitly — plt.title() would target the colorbar
+    # axes (last axes created by SHAP); suptitle targets the whole figure.
+    fig = plt.gcf()
+    fig.suptitle(f"SHAP Feature Importance — {dataset_name}", fontsize=12, y=1.01)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close("all")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
     print(f"  SHAP plot saved: {out_path}")
 
 
@@ -250,7 +253,11 @@ def main():
         X_all_z      = (X_all             - mu) / sigma  # used for SHAP
 
         # ── Train XGBoost with per-dataset best params ─────────────────────────
-        xgb_params = dict(per_ds_params.get(ds_name, cfg["xgboost_best"]))
+        if ds_name in per_ds_params:
+            xgb_params = dict(per_ds_params[ds_name])
+        else:
+            print(f"  [WARN] No per-dataset params found for {ds_name}; using global xgboost_best.")
+            xgb_params = dict(cfg["xgboost_best"])
         print(f"  XGBoost params: {xgb_params}")
 
         mdl = xgb.XGBRegressor(

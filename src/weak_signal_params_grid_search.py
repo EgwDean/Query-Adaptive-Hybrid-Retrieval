@@ -150,7 +150,7 @@ def main():
         print(f"\n--- {ds} ---")
         datasets_data[ds] = load_dataset_for_grid_search(ds, cfg, device)
         n_q = len(datasets_data[ds]["qids"])
-        print(f"  {n_q} queries, {datasets_data[ds]['X'].shape[1]} features")
+        print(f"  {n_q} queries, {len(ACTIVE_COLS)} active features (of {len(FEATURE_NAMES)} total)")
 
     if device.type == "cuda":
         torch.cuda.empty_cache()

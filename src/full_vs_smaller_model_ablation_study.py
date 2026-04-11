@@ -263,7 +263,7 @@ def main():
     ]
 
     print("\n=== Evaluating full vs reduced model ===")
-    results = Parallel(n_jobs=min(2, n_jobs if n_jobs > 0 else 2), prefer="threads")(
+    results = Parallel(n_jobs=2, prefer="threads")(
         delayed(evaluate_model)(
             name, cols, datasets_data, fold_indices,
             xgb_params, seed, rrf_k, ndcg_k,

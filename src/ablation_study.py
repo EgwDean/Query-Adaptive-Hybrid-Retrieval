@@ -378,7 +378,9 @@ def main():
     print(f"\nCSV saved to: {csv_path}")
 
     # ── Print summary ──────────────────────────────────────────────────────────
-    full_row = next(r for r in results if r["ablation_type"] == "full")
+    full_row = next((r for r in results if r["ablation_type"] == "full"), None)
+    if full_row is None:
+        raise RuntimeError("Full-model result missing from ablation output.")
     full_score = full_row["macro_ndcg10"]
 
     print(f"\nFull model macro NDCG@10: {full_score:.4f}")
