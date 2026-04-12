@@ -105,10 +105,10 @@ def load_embeddings_for_dataset(dataset_name, cfg, device):
             f"in query_vectors.pt: {missing[:5]}"
         )
 
-    X_emb = np.stack(
-        [q_vecs[qid_to_idx[qid]].numpy() for qid in ds["qids"]],
-        axis=0,
-    ).astype(np.float32)
+    # Vectorised reordering: build index list then use tensor fancy indexing
+    # rather than a Python loop that calls .numpy() on each row individually.
+    indices = [qid_to_idx[qid] for qid in ds["qids"]]
+    X_emb = q_vecs[indices].numpy().astype(np.float32)
 
     return {
         "X":            X_emb,
@@ -370,18 +370,19 @@ def main():
     ]
     model_order = [m for m in model_order if m in model_cfgs]
 
-    total_combos = sum(len(build_param_grid(model_cfgs[m])) for m in model_order)
+    # Precompute all grids once — used for the count summary and evaluation.
+    all_grids    = {m: build_param_grid(model_cfgs[m]) for m in model_order}
+    total_combos = sum(len(g) for g in all_grids.values())
     print(f"\n=== Grid search: {total_combos} total combinations ===")
     for m in model_order:
-        n = len(build_param_grid(model_cfgs[m]))
-        print(f"  {m:<20}: {n} combinations")
+        print(f"  {m:<20}: {len(all_grids[m])} combinations")
 
     # ── Evaluate ───────────────────────────────────────────────────────────────
     all_results = []
     t0_total = time.time()
 
     for model_name in model_order:
-        combos   = build_param_grid(model_cfgs[model_name])
+        combos   = all_grids[model_name]
         n_combos = len(combos)
         print(f"\n[{model_name}] {n_combos} combinations ...", flush=True)
         t0 = time.time()
