@@ -254,6 +254,30 @@ strong_signal_xgboost_per_dataset:
     gamma: 0.0
 
 # ------------------------------------------------------------
+# MLP per-dataset hyperparameter search  (Step 12)
+# Used by: python src/mlp_params_grid_search.py
+#
+# Input: query embedding vectors (~1024 dims from bge-m3)
+# Split: 85% train+dev / 15% test (same seeds as all other scripts)
+# Model: PyTorch MLP, GELU activations, Adam + cosine LR, MSE loss
+# Grid: 96 combinations per dataset
+# hidden_sizes encoded in CSV as "512-256" (dash-separated layer widths)
+# Output: data/results/mlp_per_dataset_best_params.csv
+# ------------------------------------------------------------
+mlp_params_grid:
+  n_folds:        10
+  test_fraction:  0.15
+  n_jobs:         -1
+  n_epochs:       200
+  batch_size:     64
+
+  hidden_sizes:   [[128], [256], [512, 256], [256, 64]]
+  dropout:        [0.1, 0.3, 0.5]
+  use_batchnorm:  [true, false]
+  learning_rate:  [0.001, 0.0001]
+  weight_decay:   [0.0001, 0.001]
+
+# ------------------------------------------------------------
 # Per-dataset XGBoost hyperparameter search  (Step 7)
 # Used by: python src/weak_signal_params_grid_search.py
 #
