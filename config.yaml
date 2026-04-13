@@ -176,6 +176,36 @@ ablation_study:
   n_jobs: -1
 
 # ------------------------------------------------------------
+# Strong-signal per-dataset XGBoost hyperparameter search  (Step 10)
+# Used by: python src/strong_signal_params_grid_search.py
+#
+# Split: 85% train+dev / 15% test (fixed per dataset, same seeds as
+#        xgboost_params_grid so test queries are identical — fair comparison)
+# Grid search selects best params via 10-fold 80/20 CV on the 85%.
+# Test set is evaluated exactly once with the best params.
+#
+# Grid is intentionally tight (96 combos vs 6 480 for weak signal) because:
+#   - XGBoost on 1024-dim embeddings is ~100× slower per fit than on 15 features
+#   - The strong_signal_model_grid_search already identified the settled axes:
+#       n_estimators=300, subsample=0.8, min_child_weight=1 dominate all top-100
+#   - Only the axes that showed genuine variation across datasets are kept open
+#
+# Output: data/results/strong_signal_per_dataset_best_params.csv
+# ------------------------------------------------------------
+strong_signal_params_grid:
+  n_folds:       10
+  test_fraction: 0.15
+  n_jobs:        -1
+
+  n_estimators:     [100, 300]
+  max_depth:        [4, 6, 8]
+  learning_rate:    [0.1, 0.3]
+  subsample:        [0.8]
+  colsample_bytree: [0.1, 0.3, 0.5, 0.8]
+  min_child_weight: [1]
+  gamma:            [0.0, 0.1]
+
+# ------------------------------------------------------------
 # Per-dataset XGBoost hyperparameter search  (Step 7)
 # Used by: python src/weak_signal_params_grid_search.py
 #
