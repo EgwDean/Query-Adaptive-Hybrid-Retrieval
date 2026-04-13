@@ -206,6 +206,54 @@ strong_signal_params_grid:
   gamma:            [0.0, 0.1]
 
 # ------------------------------------------------------------
+# Strong-signal per-dataset XGBoost parameters  (from Step 11 grid search)
+# Used by: python src/xgboost_retrieval.py
+# Input: query embedding vectors (~1024 dims from bge-m3)
+# Split: 85% train+dev / 15% test (same seeds as strong_signal_params_grid_search)
+# ------------------------------------------------------------
+strong_signal_xgboost_per_dataset:
+  scifact:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.3
+    min_child_weight: 1
+    gamma: 0.0
+  nfcorpus:
+    n_estimators: 300
+    max_depth: 8
+    learning_rate: 0.3
+    subsample: 0.8
+    colsample_bytree: 0.8
+    min_child_weight: 1
+    gamma: 0.0
+  arguana:
+    n_estimators: 300
+    max_depth: 8
+    learning_rate: 0.3
+    subsample: 0.8
+    colsample_bytree: 0.3
+    min_child_weight: 1
+    gamma: 0.0
+  fiqa:
+    n_estimators: 300
+    max_depth: 8
+    learning_rate: 0.3
+    subsample: 0.8
+    colsample_bytree: 0.5
+    min_child_weight: 1
+    gamma: 0.0
+  scidocs:
+    n_estimators: 300
+    max_depth: 6
+    learning_rate: 0.3
+    subsample: 0.8
+    colsample_bytree: 0.1
+    min_child_weight: 1
+    gamma: 0.0
+
+# ------------------------------------------------------------
 # Per-dataset XGBoost hyperparameter search  (Step 7)
 # Used by: python src/weak_signal_params_grid_search.py
 #
