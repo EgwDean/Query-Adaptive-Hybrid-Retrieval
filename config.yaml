@@ -278,6 +278,31 @@ mlp_params_grid:
   weight_decay:   [0.0001, 0.001]
 
 # ------------------------------------------------------------
+# Equal-data controlled comparison (Step 12)
+# Used by: python src/both_models_small_data_retrieval.py
+#
+# All datasets truncated to n_queries=300 (size of smallest dataset).
+# Split: 85% train+dev / 15% test; 10-fold CV ensemble on traindev.
+# Shared XGBoost config for both weak-signal and strong-signal models.
+# colsample_bytree=0.5 is a compromise between 15 weak features and
+# 1024 strong features — reasonable regularisation for both inputs.
+# Output: data/results/small_data_retrieval_comparison.{csv,png}
+# ------------------------------------------------------------
+small_data_experiment:
+  n_queries:        300
+  truncation_seed:  31415
+  n_folds:          10
+  test_fraction:    0.15
+  xgboost:
+    n_estimators:     300
+    max_depth:        6
+    learning_rate:    0.1
+    subsample:        0.8
+    colsample_bytree: 0.5
+    min_child_weight: 1
+    gamma:            0.0
+
+# ------------------------------------------------------------
 # Per-dataset XGBoost hyperparameter search  (Step 7)
 # Used by: python src/weak_signal_params_grid_search.py
 #
