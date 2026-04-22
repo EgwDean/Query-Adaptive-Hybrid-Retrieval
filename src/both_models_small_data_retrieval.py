@@ -1,28 +1,33 @@
 """
 both_models_small_data_retrieval.py
 
-Controlled equal-data comparison of weak-signal and strong-signal XGBoost
-routers under identical small-data training conditions.
+Cross-dataset generalisation comparison of weak-signal and strong-signal
+XGBoost routers trained on a merged pool of all datasets.
 
 All datasets are truncated to n_queries (default 300 = scifact, the smallest
-dataset) using a fixed random seed.  This eliminates training-data size as a
-confounding variable and allows a direct comparison of the two input
-representations under matched conditions.
+dataset).  The traindev portions from every dataset are concatenated into a
+single training pool (5 × 255 = ~1275 queries), so one shared model is
+trained on all datasets jointly.  Each dataset's 15% test set is then
+evaluated independently.
+
+This tests cross-dataset generalisation: does a router trained on all
+domains simultaneously retain per-domain routing quality?  It also eliminates
+training-data size as a confounding variable — every dataset contributes an
+equal number of queries to the shared training pool.
 
 Both routers use the same shared XGBoost hyperparameters
 (small_data_experiment.xgboost in config.yaml), so the comparison is purely
 about the input representation, not model configuration.
 
-Routing alpha predictions are produced by a 10-fold CV ensemble: 10 XGBoost
-models are trained on independent random 80/20 splits of the 85% traindev set;
-their test-set predictions are averaged for a more stable final alpha.
+A 10-fold CV ensemble is trained once on the merged traindev pool; each fold
+model is then applied to every dataset's test set and predictions are averaged.
 
-Methods compared on the 15% held-out test set:
+Methods compared on each dataset's 15% held-out test set:
   BM25-only            : sparse retrieval, no fusion
   Dense-only           : dense retrieval, no fusion
   Static RRF           : wRRF with α = 0.5 for every query
-  wRRF (weak signal)   : 15 hand-crafted features → XGBoost CV ensemble
-  wRRF (strong signal) : ~1024-dim embeddings     → XGBoost CV ensemble
+  wRRF (weak signal)   : 15 hand-crafted features → merged XGBoost CV ensemble
+  wRRF (strong signal) : ~1024-dim embeddings     → merged XGBoost CV ensemble
 
 Outputs:
   data/results/small_data_retrieval_comparison.csv
@@ -68,24 +73,22 @@ ACTIVE_COLS      = [i for i, n in enumerate(FEATURE_NAMES)
                     if n not in set(REMOVED_FEATURES)]
 
 
-# ── CV-ensemble router ────────────────────────────────────────────────────────
+# ── CV-ensemble: train on merged pool, apply per-dataset ─────────────────────
 
-def _cv_ensemble_alphas(X_traindev, y_traindev, X_test,
-                        fold_indices, xgb_params, seed, xgb_device):
+def _train_cv_ensemble(X_traindev, y_traindev, fold_indices,
+                       xgb_params, seed, xgb_device):
     """
-    Train one XGBoost per fold on that fold's 80 % training portion.
-    Return the mean of all 10 models' predictions on X_test.
+    Train one XGBoost per fold on that fold's 80% of the merged traindev pool.
+    Returns a list of (model, mu, sigma) — one entry per fold.
 
-    Each fold fits its own z-score normaliser on the fold training data
-    and applies those stats to X_test, so there is no leakage from the
-    validation or test portions into normalisation.
+    Each fold fits its own z-score normaliser on the fold training data,
+    so there is no leakage from the validation portion into normalisation.
     """
-    test_preds = []
+    fold_models = []
     for tr_idx, _ in fold_indices:
         X_tr, y_tr = X_traindev[tr_idx], y_traindev[tr_idx]
         mu, sigma  = zscore_stats(X_tr)
-        X_tr_z     = (X_tr   - mu) / sigma
-        X_te_z     = (X_test - mu) / sigma
+        X_tr_z     = (X_tr - mu) / sigma
 
         mdl = xgb.XGBRegressor(
             objective    = "binary:logistic",
@@ -98,8 +101,21 @@ def _cv_ensemble_alphas(X_traindev, y_traindev, X_test,
             **xgb_params,
         )
         mdl.fit(X_tr_z, y_tr)
-        test_preds.append(mdl.predict(X_te_z).astype(np.float32))
+        fold_models.append((mdl, mu, sigma))
 
+    return fold_models
+
+
+def _apply_ensemble(fold_models, X_test):
+    """
+    Apply a trained ensemble to X_test.
+    Each fold model normalises X_test with its own z-score stats.
+    Returns clipped mean predictions.
+    """
+    test_preds = []
+    for mdl, mu, sigma in fold_models:
+        X_te_z = (X_test - mu) / sigma
+        test_preds.append(mdl.predict(X_te_z).astype(np.float32))
     return np.clip(np.mean(test_preds, axis=0), 0.0, 1.0)
 
 
@@ -178,7 +194,7 @@ def _save_comparison_plot(rows, ndcg_k, n_queries, out_path):
     ax.set_xticklabels(groups, fontsize=10)
     ax.set_ylabel(f"NDCG@{ndcg_k}", fontsize=10)
     ax.set_title(
-        f"Equal-Data Retrieval Comparison (n={n_queries} queries per dataset)"
+        f"Cross-Dataset Retrieval Comparison — merged training (n={n_queries} per dataset)"
         f" — NDCG@{ndcg_k}",
         fontsize=12,
     )
@@ -223,35 +239,25 @@ def main():
     print(f"Truncating all datasets to {n_queries} queries")
     print(f"Shared XGBoost params: {xgb_params}")
 
-    # ── Load all datasets ──────────────────────────────────────────────────────
-    print("\n=== Loading datasets ===")
-    weak_data   = {}
-    strong_data = {}
-    for ds in dataset_names:
-        print(f"\n--- {ds} ---")
-        weak_data[ds]   = load_dataset_for_grid_search(ds, cfg, device)
-        strong_data[ds] = load_embeddings_for_dataset(ds, cfg, device)
-        n_q = len(weak_data[ds]["qids"])
-        print(f"  {n_q} queries  (truncating to {min(n_queries, n_q)})")
+    # ── Load and split all datasets ────────────────────────────────────────────
+    print("\n=== Loading and splitting datasets ===")
 
-    if cuda_available:
-        torch.cuda.empty_cache()
+    per_ds = {}   # per_ds[ds] = dict with traindev/test arrays and retrieval data
 
-    # ── Per-dataset evaluation ─────────────────────────────────────────────────
-    comparison_rows = []
+    X_weak_traindev_parts   = []
+    X_strong_traindev_parts = []
+    y_traindev_parts        = []
 
     for ds_name in dataset_names:
-        print(f"\n{'=' * 60}")
-        print(f"Dataset: {ds_name}")
+        print(f"\n--- {ds_name} ---")
+        wd = load_dataset_for_grid_search(ds_name, cfg, device)
+        sd = load_embeddings_for_dataset(ds_name, cfg, device)
 
-        wd       = weak_data[ds_name]
-        sd       = strong_data[ds_name]
         n_q_full = len(wd["qids"])
+        n_use    = min(n_queries, n_q_full)
+        print(f"  {n_q_full} queries  (truncating to {n_use})")
 
-        # ── Truncation ─────────────────────────────────────────────────────────
-        # Use a per-dataset seed so each dataset gets a different subsample
-        # while remaining reproducible.
-        n_use     = min(n_queries, n_q_full)
+        # Per-dataset seed keeps subsamples reproducible and independent.
         rng_trunc = np.random.RandomState(trunc_seed + dataset_seed_offset(ds_name))
         trunc_idx = np.sort(rng_trunc.choice(n_q_full, size=n_use, replace=False))
 
@@ -259,62 +265,90 @@ def main():
         X_strong_full = sd["X"][trunc_idx]
         y_full        = wd["y"][trunc_idx]
         qids_full     = [wd["qids"][i] for i in trunc_idx]
-        bm25_res      = wd["bm25_results"]
-        dense_res     = wd["dense_results"]
-        qrels         = wd["qrels"]
 
-        print(f"  Truncated : {n_use} / {n_q_full} queries")
-        print(f"  Weak dim  : {X_weak_full.shape[1]}   "
-              f"Strong dim: {X_strong_full.shape[1]}")
+        # 85 / 15 split — same seed formula as all other scripts.
+        split_seed = seed + dataset_seed_offset(ds_name)
+        rng_split  = np.random.RandomState(split_seed)
+        perm       = rng_split.permutation(n_use)
+        n_test     = max(1, int(test_frac * n_use))
+        n_traindev = n_use - n_test
 
-        # ── 85 / 15 split on the truncated set ─────────────────────────────────
-        split_seed   = seed + dataset_seed_offset(ds_name)
-        rng_split    = np.random.RandomState(split_seed)
-        perm         = rng_split.permutation(n_use)
-        n_test       = max(1, int(test_frac * n_use))
-        n_traindev   = n_use - n_test
         traindev_idx = perm[:n_traindev]
         test_idx     = perm[n_traindev:]
 
-        X_weak_traindev   = X_weak_full[traindev_idx]
-        X_strong_traindev = X_strong_full[traindev_idx]
-        y_traindev        = y_full[traindev_idx]
-        te_qids           = [qids_full[i] for i in test_idx]
-        X_weak_test       = X_weak_full[test_idx]
-        X_strong_test     = X_strong_full[test_idx]
-
         print(f"  Train+dev : {n_traindev}  |  Test: {n_test}")
 
-        # ── 10-fold CV splits (same formula as all other scripts) ──────────────
-        fold_indices = []
-        for fi in range(n_folds):
-            rng  = np.random.RandomState(
-                seed + fi * 1000 + dataset_seed_offset(ds_name)
-            )
-            p    = rng.permutation(n_traindev)
-            n_tr = max(1, min(n_traindev - 1, int(0.8 * n_traindev)))
-            fold_indices.append((p[:n_tr], p[n_tr:]))
+        X_weak_traindev_parts.append(X_weak_full[traindev_idx])
+        X_strong_traindev_parts.append(X_strong_full[traindev_idx])
+        y_traindev_parts.append(y_full[traindev_idx])
 
-        # ── CV-ensemble routing ────────────────────────────────────────────────
-        print(f"  Training weak-signal ensemble  ({n_folds} folds) ...")
-        weak_alphas = _cv_ensemble_alphas(
-            X_weak_traindev, y_traindev, X_weak_test,
-            fold_indices, xgb_params, seed, xgb_device,
-        )
+        per_ds[ds_name] = {
+            "X_weak_test":   X_weak_full[test_idx],
+            "X_strong_test": X_strong_full[test_idx],
+            "te_qids":       [qids_full[i] for i in test_idx],
+            "bm25_res":      wd["bm25_results"],
+            "dense_res":     wd["dense_results"],
+            "qrels":         wd["qrels"],
+        }
 
-        print(f"  Training strong-signal ensemble ({n_folds} folds) ...")
-        strong_alphas = _cv_ensemble_alphas(
-            X_strong_traindev, y_traindev, X_strong_test,
-            fold_indices, xgb_params, seed, xgb_device,
-        )
+    if cuda_available:
+        torch.cuda.empty_cache()
 
-        # ── Evaluate all 5 methods on the held-out test set ────────────────────
+    # ── Merge traindev pools ───────────────────────────────────────────────────
+    X_weak_merged   = np.vstack(X_weak_traindev_parts)
+    X_strong_merged = np.vstack(X_strong_traindev_parts)
+    y_merged        = np.concatenate(y_traindev_parts)
+    n_merged        = len(y_merged)
+
+    print(f"\n=== Merged training pool ===")
+    print(f"  Total traindev queries : {n_merged}")
+    print(f"  Weak feature dim       : {X_weak_merged.shape[1]}")
+    print(f"  Strong feature dim     : {X_strong_merged.shape[1]}")
+
+    # ── 10-fold CV splits on merged pool (no dataset seed offset) ─────────────
+    fold_indices = []
+    for fi in range(n_folds):
+        rng  = np.random.RandomState(seed + fi * 1000)
+        p    = rng.permutation(n_merged)
+        n_tr = max(1, min(n_merged - 1, int(0.8 * n_merged)))
+        fold_indices.append((p[:n_tr], p[n_tr:]))
+
+    # ── Train one ensemble per representation on the merged pool ──────────────
+    print(f"\n=== Training merged CV ensembles ({n_folds} folds each) ===")
+
+    print("  Training weak-signal ensemble ...")
+    weak_fold_models = _train_cv_ensemble(
+        X_weak_merged, y_merged, fold_indices, xgb_params, seed, xgb_device,
+    )
+
+    print("  Training strong-signal ensemble ...")
+    strong_fold_models = _train_cv_ensemble(
+        X_strong_merged, y_merged, fold_indices, xgb_params, seed, xgb_device,
+    )
+
+    # ── Per-dataset evaluation ─────────────────────────────────────────────────
+    print("\n=== Per-dataset evaluation ===")
+    comparison_rows = []
+
+    for ds_name in dataset_names:
+        print(f"\n{'=' * 60}")
+        print(f"Dataset: {ds_name}")
+        ds = per_ds[ds_name]
+
+        weak_alphas   = _apply_ensemble(weak_fold_models,   ds["X_weak_test"])
+        strong_alphas = _apply_ensemble(strong_fold_models, ds["X_strong_test"])
+
+        bm25_res  = ds["bm25_res"]
+        dense_res = ds["dense_res"]
+        qrels     = ds["qrels"]
+        te_qids   = ds["te_qids"]
+
         bm25_score   = _bm25_ndcg(te_qids, bm25_res, qrels, ndcg_k)
         dense_score  = _dense_ndcg(te_qids, dense_res, qrels, ndcg_k)
         srrf_alphas  = np.full(len(te_qids), 0.5, dtype=np.float32)
-        srrf_score   = _wrrf_ndcg(srrf_alphas,  te_qids, bm25_res, dense_res, qrels, rrf_k, ndcg_k)
-        wrrf_w_score = _wrrf_ndcg(weak_alphas,   te_qids, bm25_res, dense_res, qrels, rrf_k, ndcg_k)
-        wrrf_s_score = _wrrf_ndcg(strong_alphas, te_qids, bm25_res, dense_res, qrels, rrf_k, ndcg_k)
+        srrf_score   = _wrrf_ndcg(srrf_alphas,    te_qids, bm25_res, dense_res, qrels, rrf_k, ndcg_k)
+        wrrf_w_score = _wrrf_ndcg(weak_alphas,    te_qids, bm25_res, dense_res, qrels, rrf_k, ndcg_k)
+        wrrf_s_score = _wrrf_ndcg(strong_alphas,  te_qids, bm25_res, dense_res, qrels, rrf_k, ndcg_k)
 
         print(f"  BM25-only          NDCG@{ndcg_k} = {bm25_score:.4f}")
         print(f"  Dense-only         NDCG@{ndcg_k} = {dense_score:.4f}")
@@ -341,7 +375,7 @@ def main():
 
     print(f"\n{'=' * 60}")
     print(f"Macro averages across {n_evaluated} datasets "
-          f"(n={n_queries} queries each):")
+          f"(n={n_queries} per dataset, merged training):")
     print(f"  BM25-only          NDCG@{ndcg_k} = {macro['bm25']:.4f}")
     print(f"  Dense-only         NDCG@{ndcg_k} = {macro['dense']:.4f}")
     print(f"  Static RRF         NDCG@{ndcg_k} = {macro['static_rrf']:.4f}")
