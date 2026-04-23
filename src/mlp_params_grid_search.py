@@ -107,7 +107,7 @@ def _train_mlp(model: AlphaMLP,
     y_t = torch.from_numpy(y_tr.astype(np.float32)).to(device)
 
     # Cap batch size so it never exceeds the dataset size.
-    bs = min(batch_size, len(X_t))
+    bs = max(1, min(batch_size, len(X_t)))
     loader = DataLoader(TensorDataset(X_t, y_t), batch_size=bs, shuffle=True)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
