@@ -18,11 +18,17 @@ Meta-learner grid search
   10-round Monte Carlo CV on the traindev meta-features.
   Each round: random split where dev ≈ 15 % of total (= 15/85 of traindev).
   Metric: mean NDCG@10 on dev queries using actual BM25 / dense results.
-  4 model families, 48 hyperparameter combinations total:
-    Ridge       (6)  — features: [aw, as, |aw−as|]
-    ElasticNet (12)  — features: [aw, as, |aw−as|]
-    XGBoost    (18)  — features: [aw, as]          (tree can infer difference)
-    SVR        (12)  — features: [aw, as, |aw−as|]
+  10 model families, 145 hyperparameter combinations total:
+    Ridge        ( 8)  — features: [aw, as, |aw−as|]
+    Lasso        ( 6)  — features: [aw, as, |aw−as|]
+    ElasticNet   (20)  — features: [aw, as, |aw−as|]
+    SVR          (20)  — features: [aw, as, |aw−as|]
+    KNN          (10)  — features: [aw, as, |aw−as|]
+    RandomForest (12)  — features: [aw, as]  (tree infers difference)
+    ExtraTrees   (12)  — features: [aw, as]
+    MLP          (12)  — features: [aw, as, |aw−as|]
+    XGBoost      (27)  — features: [aw, as]
+    LightGBM     (18)  — features: [aw, as]
 
 Final model: best combo retrained on full traindev meta-features,
 evaluated once on test meta-features.
@@ -53,9 +59,18 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 from joblib import Parallel, delayed
-from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.linear_model import ElasticNet, Lasso, Ridge
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.neural_network import MLPRegressor
 from sklearn.svm import SVR
 import xgboost as xgb
+
+try:
+    import lightgbm as lgb
+    _HAS_LGB = True
+except ImportError:
+    _HAS_LGB = False
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -79,9 +94,12 @@ REMOVED_FEATURES = ["query_length"]
 ACTIVE_COLS      = [i for i, n in enumerate(FEATURE_NAMES)
                     if n not in set(REMOVED_FEATURES)]
 
-# Model families that receive the 3-feature input [aw, as, |aw−as|].
-# XGBoost uses only [aw, as] — the tree can split on the difference implicitly.
-LINEAR_MODELS = {"ridge", "elasticnet", "svr"}
+# Models that receive 3 features [aw, as, |aw−as|]: all non-tree families.
+# Tree models (xgboost, lightgbm, random_forest, extra_trees) use only [aw, as]
+# — they create their own interaction splits implicitly.
+NON_TREE_MODELS = {"ridge", "lasso", "elasticnet", "svr", "knn", "mlp"}
+# Keep the old alias so the decision-boundary helper still works unchanged.
+LINEAR_MODELS = NON_TREE_MODELS
 
 DS_PALETTE = {
     "scifact":  "#4878D0",
@@ -148,6 +166,8 @@ def _meta_features(aw, as_, model_name):
 def _fit_meta(model_name, params, X, y):
     if model_name == "ridge":
         mdl = Ridge(alpha=float(params["alpha"]))
+    elif model_name == "lasso":
+        mdl = Lasso(alpha=float(params["alpha"]), max_iter=5000)
     elif model_name == "elasticnet":
         mdl = ElasticNet(
             alpha=float(params["alpha"]),
@@ -159,6 +179,34 @@ def _fit_meta(model_name, params, X, y):
             C=float(params["C"]),
             epsilon=float(params["epsilon"]),
             kernel="rbf",
+        )
+    elif model_name == "knn":
+        mdl = KNeighborsRegressor(
+            n_neighbors=int(params["n_neighbors"]),
+            weights=str(params["weights"]),
+        )
+    elif model_name == "random_forest":
+        mdl = RandomForestRegressor(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=params["max_depth"],
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            random_state=42,
+            n_jobs=1,
+        )
+    elif model_name == "extra_trees":
+        mdl = ExtraTreesRegressor(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=params["max_depth"],
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            random_state=42,
+            n_jobs=1,
+        )
+    elif model_name == "mlp":
+        mdl = MLPRegressor(
+            hidden_layer_sizes=tuple(int(x) for x in params["hidden_layer_sizes"]),
+            alpha=float(params["alpha"]),
+            max_iter=2000,
+            random_state=42,
         )
     elif model_name == "xgboost":
         mdl = xgb.XGBRegressor(
@@ -176,6 +224,20 @@ def _fit_meta(model_name, params, X, y):
             n_estimators    = int(params["n_estimators"]),
             max_depth       = int(params["max_depth"]),
             learning_rate   = float(params["learning_rate"]),
+        )
+    elif model_name == "lightgbm":
+        if not _HAS_LGB:
+            raise RuntimeError("lightgbm is not installed; remove it from the grid or install it.")
+        mdl = lgb.LGBMRegressor(
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            learning_rate=float(params["learning_rate"]),
+            subsample=0.8,
+            colsample_bytree=1.0,
+            min_child_samples=5,
+            random_state=42,
+            n_jobs=1,
+            verbose=-1,
         )
     else:
         raise ValueError(f"Unknown meta-model: {model_name}")
@@ -391,11 +453,54 @@ def _build_combos(grid_cfg):
     for alpha in grid_cfg["ridge"]["alpha"]:
         combos.append(("ridge", {"alpha": alpha}))
 
+    for alpha in grid_cfg["lasso"]["alpha"]:
+        combos.append(("lasso", {"alpha": alpha}))
+
     for alpha, l1_ratio in itertools.product(
         grid_cfg["elasticnet"]["alpha"],
         grid_cfg["elasticnet"]["l1_ratio"],
     ):
         combos.append(("elasticnet", {"alpha": alpha, "l1_ratio": l1_ratio}))
+
+    for C, epsilon in itertools.product(
+        grid_cfg["svr"]["C"],
+        grid_cfg["svr"]["epsilon"],
+    ):
+        combos.append(("svr", {"C": C, "epsilon": epsilon}))
+
+    for n_neighbors, weights in itertools.product(
+        grid_cfg["knn"]["n_neighbors"],
+        grid_cfg["knn"]["weights"],
+    ):
+        combos.append(("knn", {"n_neighbors": n_neighbors, "weights": weights}))
+
+    for n_est, depth, msl in itertools.product(
+        grid_cfg["random_forest"]["n_estimators"],
+        grid_cfg["random_forest"]["max_depth"],
+        grid_cfg["random_forest"]["min_samples_leaf"],
+    ):
+        combos.append(("random_forest", {
+            "n_estimators":     n_est,
+            "max_depth":        depth,
+            "min_samples_leaf": msl,
+        }))
+
+    for n_est, depth, msl in itertools.product(
+        grid_cfg["extra_trees"]["n_estimators"],
+        grid_cfg["extra_trees"]["max_depth"],
+        grid_cfg["extra_trees"]["min_samples_leaf"],
+    ):
+        combos.append(("extra_trees", {
+            "n_estimators":     n_est,
+            "max_depth":        depth,
+            "min_samples_leaf": msl,
+        }))
+
+    for hls, alpha in itertools.product(
+        grid_cfg["mlp"]["hidden_layer_sizes"],
+        grid_cfg["mlp"]["alpha"],
+    ):
+        combos.append(("mlp", {"hidden_layer_sizes": hls, "alpha": alpha}))
 
     for n_est, depth, lr in itertools.product(
         grid_cfg["xgboost"]["n_estimators"],
@@ -403,16 +508,24 @@ def _build_combos(grid_cfg):
         grid_cfg["xgboost"]["learning_rate"],
     ):
         combos.append(("xgboost", {
-            "n_estimators": n_est,
-            "max_depth":    depth,
+            "n_estimators":  n_est,
+            "max_depth":     depth,
             "learning_rate": lr,
         }))
 
-    for C, epsilon in itertools.product(
-        grid_cfg["svr"]["C"],
-        grid_cfg["svr"]["epsilon"],
-    ):
-        combos.append(("svr", {"C": C, "epsilon": epsilon}))
+    if _HAS_LGB:
+        for n_est, depth, lr in itertools.product(
+            grid_cfg["lightgbm"]["n_estimators"],
+            grid_cfg["lightgbm"]["max_depth"],
+            grid_cfg["lightgbm"]["learning_rate"],
+        ):
+            combos.append(("lightgbm", {
+                "n_estimators":  n_est,
+                "max_depth":     depth,
+                "learning_rate": lr,
+            }))
+    else:
+        print("  [warning] lightgbm not installed — skipping LightGBM combos")
 
     return combos
 

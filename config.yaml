@@ -328,8 +328,10 @@ small_data_experiment:
 #   - 10-round Monte Carlo CV on traindev (70% train / 15% dev of total)
 #   - dev_fraction_of_traindev = 15/85 ≈ 0.176 ensures dev ≈ 15% of total
 #   - Metric: mean NDCG@10 on dev queries (actual retrieval results)
-# Models: Ridge (6), ElasticNet (12), XGBoost/shallow (18), SVR (12) = 48 combos
-# Linear models use [alpha_weak, alpha_strong, |alpha_weak−alpha_strong|]
+# Models: Ridge (8), Lasso (6), ElasticNet (20), SVR (20), KNN (10),
+#         RandomForest (12), ExtraTrees (12), MLP (12), XGBoost (27),
+#         LightGBM (18) = 145 combos total
+# Linear/distance models use [alpha_weak, alpha_strong, |alpha_weak−alpha_strong|]
 # Tree models use [alpha_weak, alpha_strong]
 # Outputs: data/results/meta_learner_dataset.csv
 #          data/results/meta_learner_best_params.csv
@@ -347,20 +349,46 @@ meta_learner_moe:
 
   grid:
     ridge:
+      alpha: [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+
+    lasso:
       alpha: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
 
     elasticnet:
       alpha:    [0.001, 0.01, 0.1, 1.0]
-      l1_ratio: [0.1, 0.5, 0.9]
+      l1_ratio: [0.1, 0.3, 0.5, 0.7, 0.9]
+
+    svr:
+      C:       [0.01, 0.1, 1.0, 10.0, 100.0]
+      epsilon: [0.005, 0.01, 0.05, 0.1]
+
+    knn:
+      n_neighbors: [3, 5, 10, 20, 50]
+      weights:     ["uniform", "distance"]
+
+    random_forest:
+      n_estimators:     [100, 200]
+      max_depth:        [2, 3, 5]
+      min_samples_leaf: [1, 3]
+
+    extra_trees:
+      n_estimators:     [100, 200]
+      max_depth:        [2, 3, 5]
+      min_samples_leaf: [1, 3]
+
+    mlp:
+      hidden_layer_sizes: [[32], [64], [32, 16], [64, 32]]
+      alpha:              [0.001, 0.01, 0.1]
 
     xgboost:
       n_estimators:  [50, 100, 200]
-      max_depth:     [2, 3]
+      max_depth:     [2, 3, 4]
       learning_rate: [0.05, 0.1, 0.3]
 
-    svr:
-      C:       [0.01, 0.1, 1.0, 10.0]
-      epsilon: [0.01, 0.05, 0.1]
+    lightgbm:
+      n_estimators:  [50, 100, 200]
+      max_depth:     [2, 3]
+      learning_rate: [0.05, 0.1, 0.3]
 
 # ------------------------------------------------------------
 # Per-dataset XGBoost hyperparameter search  (Step 7)
