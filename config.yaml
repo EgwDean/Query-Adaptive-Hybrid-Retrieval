@@ -318,6 +318,51 @@ small_data_experiment:
       cv_ndcg_at_10:    0.391612
 
 # ------------------------------------------------------------
+# MoE Meta-Learner stacking experiment (Step 13)
+# Used by: python src/meta_learner_moe_grid_search.py
+#
+# Zero-leakage meta-dataset construction:
+#   - Standard 10-fold OOF on traindev for base model predictions
+#   - Base models retrained on full traindev → test predictions
+# Meta-learner grid search:
+#   - 10-round Monte Carlo CV on traindev (70% train / 15% dev of total)
+#   - dev_fraction_of_traindev = 15/85 ≈ 0.176 ensures dev ≈ 15% of total
+#   - Metric: mean NDCG@10 on dev queries (actual retrieval results)
+# Models: Ridge (6), ElasticNet (12), XGBoost/shallow (18), SVR (12) = 48 combos
+# Linear models use [alpha_weak, alpha_strong, |alpha_weak−alpha_strong|]
+# Tree models use [alpha_weak, alpha_strong]
+# Outputs: data/results/meta_learner_dataset.csv
+#          data/results/meta_learner_best_params.csv
+#          data/results/meta_learner_retrieval_comparison.{csv,png}
+#          data/results/meta_learner_decision_boundary.png
+# ------------------------------------------------------------
+meta_learner_moe:
+  n_queries:               300
+  truncation_seed:         31415
+  test_fraction:           0.15
+  dev_fraction_of_traindev: 0.176   # 15/85 — gives dev ≈ 15% of total in MC CV
+  n_cv_rounds:             10
+  n_oof_folds:             10
+  n_jobs:                  -1
+
+  grid:
+    ridge:
+      alpha: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+
+    elasticnet:
+      alpha:    [0.001, 0.01, 0.1, 1.0]
+      l1_ratio: [0.1, 0.5, 0.9]
+
+    xgboost:
+      n_estimators:  [50, 100, 200]
+      max_depth:     [2, 3]
+      learning_rate: [0.05, 0.1, 0.3]
+
+    svr:
+      C:       [0.01, 0.1, 1.0, 10.0]
+      epsilon: [0.01, 0.05, 0.1]
+
+# ------------------------------------------------------------
 # Per-dataset XGBoost hyperparameter search  (Step 7)
 # Used by: python src/weak_signal_params_grid_search.py
 #
