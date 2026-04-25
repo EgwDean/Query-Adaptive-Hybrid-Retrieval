@@ -14,6 +14,7 @@ rank_bm25
 # Embeddings & deep learning
 sentence-transformers
 torch
+FlagEmbedding
 
 # Scientific computing
 numpy
