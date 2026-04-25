@@ -47,6 +47,7 @@ Usage
 """
 
 import csv
+import hashlib
 import itertools
 import json
 import os
@@ -425,7 +426,8 @@ def _eval_combo(
         try:
             mdl   = _fit_meta(model_name, params, X_tr, y_tr)
             preds = _pred_meta(mdl, X_dv)
-        except Exception:
+        except Exception as exc:
+            print(f"[WARN] _eval_combo: {model_name} {params} failed: {exc}")
             round_scores.append(0.0)
             continue
 
@@ -672,6 +674,10 @@ def main():
     results_folder = get_config_path(cfg, "results_folder", "data/results")
     ensure_dir(results_folder)
     cache_path = os.path.join(results_folder, "meta_learner_dataset.csv")
+    cache_hash_path = cache_path + ".params_hash"
+    _params_hash = hashlib.md5(
+        json.dumps({"weak": weak_params, "strong": strong_params}, sort_keys=True).encode()
+    ).hexdigest()
 
     # ── Load all datasets ─────────────────────────────────────────────────────
     print("\n=== Loading datasets ===")
@@ -751,7 +757,14 @@ def main():
     print(f"  Strong dim      : {X_strong_td.shape[1]}")
 
     # ── Load or build meta-dataset ────────────────────────────────────────────
-    if os.path.exists(cache_path):
+    _cache_valid = (
+        os.path.exists(cache_path)
+        and os.path.exists(cache_hash_path)
+        and open(cache_hash_path).read().strip() == _params_hash
+    )
+    if not _cache_valid and os.path.exists(cache_path):
+        print("[WARN] Meta-dataset cache exists but base-model params have changed — rebuilding.")
+    if _cache_valid:
         print(f"\n=== Loading meta-dataset from cache ===")
         print(f"  {cache_path}")
         cached = _load_meta_dataset(cache_path)
@@ -815,6 +828,8 @@ def main():
                          "alpha_strong": float(te_as[i]),
                          "alpha_gt": float(y_te[i])})
         _save_meta_dataset(rows, cache_path)
+        with open(cache_hash_path, "w", encoding="utf-8") as _hf:
+            _hf.write(_params_hash)
         print(f"  Meta-dataset cached: {cache_path}")
 
     # ── MC CV fold indices for meta-learner ───────────────────────────────────

@@ -147,7 +147,9 @@ def _save_comparison_plot(rows, dataset_names, ndcg_k, out_path):
 
     by_method = {m: [] for m in methods}
     for grp in groups:
-        row = next(r for r in rows if r["group"] == grp)
+        row = next((r for r in rows if r["group"] == grp), None)
+        if row is None:
+            raise ValueError(f"Group '{grp}' not found in bar-chart data rows.")
         for m in methods:
             by_method[m].append(row[m])
 

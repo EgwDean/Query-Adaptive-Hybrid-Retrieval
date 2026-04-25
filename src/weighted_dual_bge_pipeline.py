@@ -748,7 +748,8 @@ def _eval_meta_combo(
         try:
             mdl   = _fit_meta(model_name, params, X_tr, td_gt[tr_idx])
             preds = _pred_meta(mdl, X_dv)
-        except Exception:
+        except Exception as exc:
+            print(f"[WARN] _eval_meta_combo: {model_name} {params} failed: {exc}")
             round_scores.append(0.0)
             continue
 
@@ -966,6 +967,7 @@ def main():
     results_folder = get_config_path(cfg, "results_folder", "data/results")
     ensure_dir(results_folder)
     meta_cache = os.path.join(results_folder, "bge_dual_meta_dataset.csv")
+    meta_cache_hash_path = meta_cache + ".params_hash"
 
     # ── Phase 1-3: Load datasets ──────────────────────────────────────────────
     print("\n=== Phase 1-3: Loading datasets ===")
@@ -1080,7 +1082,18 @@ def main():
     print(f"  Saved: {strong_params_out}")
 
     # ── Phase 7: OOF meta-dataset ─────────────────────────────────────────────
-    if os.path.exists(meta_cache):
+    _meta_params_hash = hashlib.md5(
+        json.dumps({"weak": weak_params, "strong": strong_params}, sort_keys=True).encode(),
+        usedforsecurity=False,
+    ).hexdigest()
+    _meta_cache_valid = (
+        os.path.exists(meta_cache)
+        and os.path.exists(meta_cache_hash_path)
+        and open(meta_cache_hash_path).read().strip() == _meta_params_hash
+    )
+    if not _meta_cache_valid and os.path.exists(meta_cache):
+        print("[WARN] Meta-dataset cache exists but base-model params have changed — rebuilding.")
+    if _meta_cache_valid:
         print(f"\n=== Phase 7: Loading meta-dataset from cache ===")
         cached = _load_meta_dataset(meta_cache)
 
@@ -1131,6 +1144,8 @@ def main():
                          "alpha_weak": float(te_aw[i]), "alpha_strong": float(te_as[i]),
                          "alpha_gt": float(y_te[i])})
         _save_meta_dataset(rows, meta_cache)
+        with open(meta_cache_hash_path, "w", encoding="utf-8") as _hf:
+            _hf.write(_meta_params_hash)
         print(f"  Meta-dataset cached: {meta_cache}")
 
     # ── Phase 8: MoE meta-learner grid search ─────────────────────────────────
