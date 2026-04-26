@@ -710,7 +710,7 @@ def _fit_meta(model_name, params, X, y):
             raise RuntimeError("lightgbm is not installed.")
         mdl = lgb.LGBMRegressor(
             n_estimators=int(params["n_estimators"]),
-            max_depth=int(params["max_depth"]),
+            max_depth=None if params["max_depth"] is None else int(params["max_depth"]),
             learning_rate=float(params["learning_rate"]),
             subsample=0.8, colsample_bytree=1.0,
             min_child_samples=5, random_state=42, n_jobs=1, verbose=-1,
@@ -1089,7 +1089,7 @@ def main():
     _meta_cache_valid = (
         os.path.exists(meta_cache)
         and os.path.exists(meta_cache_hash_path)
-        and open(meta_cache_hash_path).read().strip() == _meta_params_hash
+        and open(meta_cache_hash_path, encoding="utf-8").read().strip() == _meta_params_hash
     )
     if not _meta_cache_valid and os.path.exists(meta_cache):
         print("[WARN] Meta-dataset cache exists but base-model params have changed — rebuilding.")
