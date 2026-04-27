@@ -4,7 +4,7 @@ rerank_evaluation.py
 Applies a cross-encoder re-ranker to candidate pools from all 6 retrieval
 methods and measures NDCG@10 before and after re-ranking.
 
-Cross-encoder: cross-encoder/ms-marco-MiniLM-L-6-v2
+Cross-encoder: cross-encoder/ms-marco-MiniLM-L-6-v2 / BAAI/bge-reranker-base
   (download once via sentence-transformers on first run)
 
 Efficiency:
@@ -68,7 +68,7 @@ from src.meta_learner_moe_grid_search import (
     _pred_meta,
 )
 
-CE_MODEL           = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CE_MODEL           = "BAAI/bge-reranker-base"
 CE_BATCH_CUDA      = 128
 CE_BATCH_CPU       = 32
 METHODS            = ["bm25", "dense", "static_rrf", "wrrf_weak", "wrrf_strong", "moe"]
