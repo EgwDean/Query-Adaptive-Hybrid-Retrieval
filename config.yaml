@@ -1,69 +1,45 @@
 # ============================================================
-# RAG-LLM Hybrid Retrieval Pipeline -- Configuration
+# Query-Adaptive Hybrid Retrieval — Pipeline Configuration
 # ============================================================
+# This is the configuration file for the unified pipeline that
+# rebuilds the entire experiment on top of *oracle* alpha labels
+# obtained by per-query grid search (instead of soft NDCG-based
+# estimates as in the legacy version).
 #
-# This file controls every tunable aspect of the pipeline.
-# Edit the settings below, then run the scripts in order:
-#     python src/download.py
-#     python src/preprocess.py
-#     python src/weak_signal_model_grid_search.py
+# Run order:
+#     python src/cleanup.py        # one-time cleanup of stale artefacts
+#     python src/pipeline.py       # end-to-end training + evaluation
 #
-# Each script automatically detects which processing steps
-# have already been completed and skips them.  If you change
-# the dataset list or the embedding model, all cached
-# artifacts for the affected dataset(s) are rebuilt.
+# Every section of pipeline.py caches its outputs to disk; rerunning
+# the pipeline skips already-completed sections automatically.
 # ============================================================
 
 # ------------------------------------------------------------
-# Datasets
+# Datasets — five BEIR datasets that are concatenated into a
+# single 5x300 = 1500-query "merged" working dataset.
 # ------------------------------------------------------------
 # Stats: (test queries | corpus docs | avg relevant docs per query)
-#
-# -- Small (fast) ------------------------------------------------
 #   scifact            300 queries  |    5 084 docs |  1.1 avg
 #   nfcorpus           323 queries  |    3 633 docs | 38.2 avg
 #   arguana          1 406 queries  |    8 674 docs |  1.0 avg
-#
-# -- Medium -------------------------------------------------------
 #   fiqa               648 queries  |   57 638 docs |  2.6 avg
 #   scidocs          1 000 queries  |   25 657 docs |  4.9 avg
-#   webis-touche2020    49 queries  |  382 545 docs | 19.0 avg
-#   trec-covid          50 queries  |  171 332 docs |493.5 avg
-#
-# -- Large (slow, high memory) ------------------------------------
-#   nq               3 452 queries  |    2.68M docs |  1.2 avg
-#   quora            10 000 queries |  522 931 docs |  1.6 avg  (split: dev)
-#   climate-fever     1 535 queries |    5.42M docs |  3.0 avg
-#   hotpotqa          7 405 queries |    5.23M docs |  2.0 avg
-#   fever             6 666 queries |    5.42M docs |  1.2 avg
-#   dbpedia-entity      400 queries |    4.63M docs | 38.2 avg  (split: dev)
-#   msmarco           6 980 queries |    8.84M docs |  1.1 avg  (split: dev)
-# -----------------------------------------------------------------
+# ------------------------------------------------------------
 datasets:
   - scifact
   - nfcorpus
   - arguana
   - fiqa
   - scidocs
-  #- webis-touche2020
-  #- trec-covid
-  #- nq
-  #- quora
-  #- climate-fever
-  #- hotpotqa
-  #- fever
-  #- dbpedia-entity
-  #- msmarco
 
 # ------------------------------------------------------------
 # Paths (relative to the project root)
 # ------------------------------------------------------------
-# These are base directories; per-dataset sub-paths are built
-# at runtime by the pipeline.
 paths:
-  datasets_folder: "data/datasets"
-  results_folder:  "data/results"
-  processed_folder: "data/processed_data"
+  datasets_folder:  "data/datasets"     # BEIR raw datasets
+  processed_folder: "data/processed"    # tokenised corpora, indices, embeddings
+  results_folder:   "data/results"      # csv/json/png outputs
+  models_folder:    "data/models"       # final pickled models
 
 # ------------------------------------------------------------
 # Preprocessing
@@ -72,7 +48,9 @@ preprocessing:
   stemmer_language: "english"
 
 # ------------------------------------------------------------
-# BM25 (sparse retrieval)
+# BM25 — initial defaults; Step 3 grid-searches and overwrites
+# the values written into  data/results/bm25_best_params.json.
+# Steps 4+ then read that JSON and use the best parameters.
 # ------------------------------------------------------------
 bm25:
   k1: 1.5
@@ -80,487 +58,226 @@ bm25:
   use_stemming: true
 
 # ------------------------------------------------------------
-# Embedding model
+# Embedding model (BAAI/bge-m3 dense head)
 # ------------------------------------------------------------
 embeddings:
   model_name: "BAAI/bge-m3"
-  batch_size: 64   # lower to 8-16 for large models on GPU with long documents
-  
+  batch_size: 64
+
 # ------------------------------------------------------------
 # Dense search
 # ------------------------------------------------------------
 dense_search:
-  query_chunk_size: 100
+  query_chunk_size:  100
   corpus_chunk_size: 50000
 
 # ------------------------------------------------------------
-# Benchmark / evaluation
+# Benchmark / evaluation constants
 # ------------------------------------------------------------
 benchmark:
-  top_k: 100
-  ndcg_k: 10
+  top_k:  100      # candidate-pool size for retrieval
+  ndcg_k: 10       # primary evaluation cut-off
   rrf:
-    k: 60               # RRF damping constant (Cormack et al. 2009)
+    k: 60          # RRF damping constant (Cormack et al. 2009)
 
 # ------------------------------------------------------------
-# Best XGBoost configuration  (from model selection step)
-# Used by: python src/ablation_study.py
+# Sampling and split — defines the 1500-query merged dataset
+# Train / Dev / Test = 70 / 15 / 15  (stratified per dataset)
+# 10-fold CV runs on the (train + dev) = 85% portion.
 # ------------------------------------------------------------
-xgboost_best:
-  n_estimators: 300
-  max_depth: 8
-  learning_rate: 0.1
-  subsample: 0.8
-  colsample_bytree: 0.8
-  min_child_weight: 1
+sampling:
+  n_queries_per_dataset: 300
+  truncation_seed:       31415
+  test_fraction:         0.15
+  dev_fraction:          0.15
+  cv_n_folds:            10
+  random_seed:           42
 
 # ------------------------------------------------------------
-# Per-dataset best XGBoost parameters  (from Step 7 grid search)
-# Used by: python src/retrieval_explainability.py
-# Feature set: 15 features (query_length excluded per ablation study)
-# Split: 85% train+dev / 15% test (fixed per dataset)
+# Step 3 — BM25 grid search (k1, b, use_stemming)
+# Macro NDCG@10 across the 1500-query merged dataset.
 # ------------------------------------------------------------
-xgboost_per_dataset:
-  scifact:
-    n_estimators: 100
-    max_depth: 8
-    learning_rate: 0.3
-    subsample: 0.8
-    colsample_bytree: 0.8
-    min_child_weight: 1
-    gamma: 0.0
-  nfcorpus:
-    n_estimators: 100
-    max_depth: 4
-    learning_rate: 0.2
-    subsample: 0.9
-    colsample_bytree: 0.8
-    min_child_weight: 1
-    gamma: 0.1
-  arguana:
-    n_estimators: 500
-    max_depth: 10
-    learning_rate: 0.3
-    subsample: 0.7
-    colsample_bytree: 0.9
-    min_child_weight: 1
-    gamma: 0.0
-  fiqa:
-    n_estimators: 500
-    max_depth: 10
-    learning_rate: 0.2
-    subsample: 0.9
-    colsample_bytree: 0.8
-    min_child_weight: 1
-    gamma: 0.0
-  scidocs:
-    n_estimators: 100
-    max_depth: 6
-    learning_rate: 0.2
-    subsample: 0.8
-    colsample_bytree: 0.7
-    min_child_weight: 2
-    gamma: 0.0
+bm25_grid_search:
+  k1_values:           [0.8, 1.2, 1.5, 1.6, 2.0]
+  b_values:            [0.0, 0.25, 0.5, 0.75, 1.0]
+  use_stemming_values: [true, false]
 
 # ------------------------------------------------------------
-# Ablation study  (Step 6)
-# Used by: python src/ablation_study.py
-# Output:  data/results/ablation_study.csv
-#          data/results/ablation_study.png
+# Step 4 — Oracle alpha grid search
+# Per-query brute-force search over [alpha_min, alpha_max] in
+# steps of alpha_step.  101 alphas with the defaults below.
 # ------------------------------------------------------------
-ablation_study:
-  n_folds: 10
-  train_fraction: 0.8
-  n_jobs: -1
+oracle_alpha_search:
+  alpha_min:  0.0
+  alpha_max:  1.0
+  alpha_step: 0.01
 
 # ------------------------------------------------------------
-# Strong-signal per-dataset XGBoost hyperparameter search  (Step 10)
-# Used by: python src/strong_signal_params_grid_search.py
-#
-# Split: 85% train+dev / 15% test (fixed per dataset, same seeds as
-#        xgboost_params_grid so test queries are identical — fair comparison)
-# Grid search selects best params via 10-fold 80/20 CV on the 85%.
-# Test set is evaluated exactly once with the best params.
-#
-# Grid is intentionally tight (96 combos vs 6 480 for weak signal) because:
-#   - XGBoost on 1024-dim embeddings is ~100× slower per fit than on 15 features
-#   - The strong_signal_model_grid_search already identified the settled axes:
-#       n_estimators=300, subsample=0.8, min_child_weight=1 dominate all top-100
-#   - Only the axes that showed genuine variation across datasets are kept open
-#
-# Output: data/results/strong_signal_per_dataset_best_params.csv
+# Routing-feature parameters — used by the weak-model dataset
+# (Step 5)
 # ------------------------------------------------------------
-strong_signal_params_grid:
-  n_folds:       10
-  test_fraction: 0.15
-  n_jobs:        -1
-
-  n_estimators:     [100, 300]
-  max_depth:        [4, 6, 8]
-  learning_rate:    [0.1, 0.3]
-  subsample:        [0.8]
-  colsample_bytree: [0.1, 0.3, 0.5, 0.8]
-  min_child_weight: [1]
-  gamma:            [0.0, 0.1]
+routing_features:
+  overlap_k:          10
+  feature_stat_k:     10
+  epsilon:            1.0e-8
+  ce_smoothing_alpha: 1.0
 
 # ------------------------------------------------------------
-# Strong-signal per-dataset XGBoost parameters  (from Step 11 grid search)
-# Used by: python src/xgboost_retrieval.py
-# Input: query embedding vectors (~1024 dims from bge-m3)
-# Split: 85% train+dev / 15% test (same seeds as strong_signal_params_grid_search)
+# Cap on the size of every grid search.  Set generously to
+# satisfy the "<= 1500 trained models per grid" requirement.
+# Combos beyond this cap are not evaluated (deterministically
+# truncated by canonical iteration order).
 # ------------------------------------------------------------
-strong_signal_xgboost_per_dataset:
-  scifact:
-    n_estimators: 300
-    max_depth: 6
-    learning_rate: 0.1
-    subsample: 0.8
-    colsample_bytree: 0.3
-    min_child_weight: 1
-    gamma: 0.0
-  nfcorpus:
-    n_estimators: 300
-    max_depth: 8
-    learning_rate: 0.3
-    subsample: 0.8
-    colsample_bytree: 0.8
-    min_child_weight: 1
-    gamma: 0.0
-  arguana:
-    n_estimators: 300
-    max_depth: 8
-    learning_rate: 0.3
-    subsample: 0.8
-    colsample_bytree: 0.3
-    min_child_weight: 1
-    gamma: 0.0
-  fiqa:
-    n_estimators: 300
-    max_depth: 8
-    learning_rate: 0.3
-    subsample: 0.8
-    colsample_bytree: 0.5
-    min_child_weight: 1
-    gamma: 0.0
-  scidocs:
-    n_estimators: 300
-    max_depth: 6
-    learning_rate: 0.3
-    subsample: 0.8
-    colsample_bytree: 0.1
-    min_child_weight: 1
-    gamma: 0.0
+max_models_per_grid: 1500
 
 # ------------------------------------------------------------
-# MLP per-dataset hyperparameter search  (Step 12)
-# Used by: python src/mlp_params_grid_search.py
-#
-# Input: query embedding vectors (~1024 dims from bge-m3)
-# Split: 85% train+dev / 15% test (same seeds as all other scripts)
-# Model: PyTorch MLP, GELU activations, Adam + cosine LR, MSE loss
-# Grid: 96 combinations per dataset
-# hidden_sizes encoded in CSV as "512-256" (dash-separated layer widths)
-# Output: data/results/mlp_per_dataset_best_params.csv
+# Step 6 — Weak-model grid search
+# 16 hand-crafted features as input.
 # ------------------------------------------------------------
-mlp_params_grid:
-  n_folds:        10
-  test_fraction:  0.15
-  n_jobs:         -1
-  n_epochs:       200
-  batch_size:     64
+weak_model_grid_search:
+  models:
+    logistic_regression:
+      C: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
 
-  hidden_sizes:   [[128], [256], [512, 256], [256, 64]]
-  dropout:        [0.1, 0.3, 0.5]
-  use_batchnorm:  [true, false]
-  learning_rate:  [0.001, 0.0001]
-  weight_decay:   [0.0001, 0.001]
+    random_forest:
+      n_estimators:     [100, 300]
+      max_depth:        [5, 10, null]
+      min_samples_leaf: [1, 2]
+      max_features:     ["sqrt"]
 
-# ------------------------------------------------------------
-# Equal-data controlled comparison (Step 12)
-# Used by: python src/both_models_small_data_retrieval.py
-#
-# All datasets truncated to n_queries=300 (size of smallest dataset).
-# Traindev portions are merged into one pool (~1 275 queries) and a
-# separate grid search is run for each model:
-#   Weak signal  → xgboost_params_grid      (6 480 combos)
-#   Strong signal→ strong_signal_params_grid (   96 combos)
-# Best params selected by mean NDCG@10 over 10-fold CV on merged pool.
-# Split: 85% train+dev / 15% test (same seed formula as all scripts).
-# Output: data/results/small_data_best_params.csv
-#         data/results/small_data_retrieval_comparison.{csv,png}
-# ------------------------------------------------------------
-small_data_experiment:
-  n_queries:        300
-  truncation_seed:  31415
-  n_folds:          10
-  test_fraction:    0.15
-  # Best params found by grid search on merged pool (all 5 datasets, n=300 each)
-  best_params:
-    weak_signal:
-      n_estimators:     300
-      max_depth:        10
-      learning_rate:    0.3
-      subsample:        0.8
-      colsample_bytree: 0.9
-      min_child_weight: 1
-      gamma:            0.0
-      cv_ndcg_at_10:    0.392891
-    strong_signal:
-      n_estimators:     300
-      max_depth:        8
-      learning_rate:    0.3
-      subsample:        0.8
-      colsample_bytree: 0.8
-      min_child_weight: 1
-      gamma:            0.0
-      cv_ndcg_at_10:    0.391612
+    extra_trees:
+      n_estimators:     [100, 300]
+      max_depth:        [5, 10, null]
+      min_samples_leaf: [1, 2]
+      max_features:     ["sqrt"]
+
+    xgboost:
+      n_estimators:     [100, 300]
+      max_depth:        [4, 6, 8]
+      learning_rate:    [0.05, 0.1, 0.3]
+      subsample:        [0.8]
+      colsample_bytree: [0.8]
+      min_child_weight: [1]
+      gamma:            [0.0]
+
+    lightgbm:
+      n_estimators:  [100, 300]
+      num_leaves:    [15, 31]
+      learning_rate: [0.05, 0.1, 0.3]
+
+    mlp:
+      hidden_layer_sizes: [[64], [128], [64, 32]]
+      alpha:              [0.001, 0.01]
+      learning_rate_init: [0.001]
+      batch_size:         [32]
+      activation:         ["relu"]
 
 # ------------------------------------------------------------
-# MoE Meta-Learner stacking experiment (Step 13)
-# Used by: python src/meta_learner_moe_grid_search.py
-#
-# Zero-leakage meta-dataset construction:
-#   - Standard 10-fold OOF on traindev for base model predictions
-#   - Base models retrained on full traindev → test predictions
-# Meta-learner grid search:
-#   - 10-round Monte Carlo CV on traindev (70% train / 15% dev of total)
-#   - dev_fraction_of_traindev = 15/85 ≈ 0.176 ensures dev ≈ 15% of total
-#   - Metric: mean NDCG@10 on dev queries (actual retrieval results)
-# Models: Ridge (8), Lasso (6), ElasticNet (20), SVR (20), KNN (10),
-#         RandomForest (12), ExtraTrees (12), MLP (12), XGBoost (27),
-#         LightGBM (18) = 145 combos total
-# Linear/distance models use [alpha_weak, alpha_strong, |alpha_weak−alpha_strong|]
-# Tree models use [alpha_weak, alpha_strong]
-# Outputs: data/results/meta_learner_dataset.csv
-#          data/results/meta_learner_best_params.csv
-#          data/results/meta_learner_retrieval_comparison.{csv,png}
-#          data/results/meta_learner_decision_boundary.png
+# Step 12 — Strong-model grid search
+# Input: 1024-dim BGE-M3 query embeddings.
 # ------------------------------------------------------------
-meta_learner_moe:
-  n_queries:               300
-  truncation_seed:         31415
-  test_fraction:           0.15
-  dev_fraction_of_traindev: 0.176   # 15/85 — gives dev ≈ 15% of total in MC CV
-  n_cv_rounds:             10
-  n_oof_folds:             10
-  n_jobs:                  -1
-
-  grid:
+strong_model_grid_search:
+  models:
     ridge:
-      alpha: [0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
-
-    lasso:
-      alpha: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+      alpha: [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 
     elasticnet:
       alpha:    [0.001, 0.01, 0.1, 1.0]
-      l1_ratio: [0.1, 0.3, 0.5, 0.7, 0.9]
-
-    svr:
-      C:       [0.01, 0.1, 1.0, 10.0, 100.0]
-      epsilon: [0.005, 0.01, 0.05, 0.1]
+      l1_ratio: [0.1, 0.5, 0.9]
 
     knn:
-      n_neighbors: [3, 5, 10, 20, 50]
+      n_neighbors: [5, 10, 20, 50]
+      weights:     ["uniform", "distance"]
+
+    svr:
+      C:       [0.1, 1.0, 10.0]
+      gamma:   ["scale"]
+      epsilon: [0.01, 0.1]
+
+    mlp:
+      hidden_layer_sizes: [[256], [512], [256, 128], [512, 256]]
+      alpha:              [0.001, 0.01]
+      learning_rate_init: [0.001, 0.0001]
+      batch_size:         [32, 64]
+
+    xgboost:
+      n_estimators:     [100, 300]
+      max_depth:        [4, 6, 8]
+      learning_rate:    [0.1, 0.3]
+      subsample:        [0.8]
+      colsample_bytree: [0.1, 0.3]
+
+    random_forest:
+      n_estimators:     [100, 300]
+      max_depth:        [null, 8]
+      min_samples_leaf: [1, 2]
+      max_features:     ["sqrt", 0.1]
+
+    extra_trees:
+      n_estimators:     [100, 300]
+      max_depth:        [null, 8]
+      min_samples_leaf: [1, 2]
+      max_features:     ["sqrt", 0.1]
+
+# ------------------------------------------------------------
+# Step 16 — MoE meta-learner grid search
+# Inputs: 2 alphas (alpha_weak, alpha_strong) + abs(diff) for
+# the non-tree models.  Simpler grids since input is 2-D.
+# ------------------------------------------------------------
+moe_grid_search:
+  models:
+    ridge:
+      alpha: [0.001, 0.01, 0.1, 1.0, 10.0]
+
+    lasso:
+      alpha: [0.001, 0.01, 0.1, 1.0]
+
+    elasticnet:
+      alpha:    [0.001, 0.01, 0.1, 1.0]
+      l1_ratio: [0.1, 0.5, 0.9]
+
+    svr:
+      C:       [0.1, 1.0, 10.0]
+      epsilon: [0.01, 0.05, 0.1]
+
+    knn:
+      n_neighbors: [5, 10, 20]
       weights:     ["uniform", "distance"]
 
     random_forest:
       n_estimators:     [100, 200]
-      max_depth:        [2, 3, 5]
+      max_depth:        [3, 5, null]
       min_samples_leaf: [1, 3]
 
     extra_trees:
       n_estimators:     [100, 200]
-      max_depth:        [2, 3, 5]
+      max_depth:        [3, 5, null]
       min_samples_leaf: [1, 3]
 
     mlp:
-      hidden_layer_sizes: [[32], [64], [32, 16], [64, 32]]
-      alpha:              [0.001, 0.01, 0.1]
+      hidden_layer_sizes: [[16], [32], [16, 8], [32, 16]]
+      alpha:              [0.001, 0.01]
 
     xgboost:
       n_estimators:  [50, 100, 200]
       max_depth:     [2, 3, 4]
-      learning_rate: [0.05, 0.1, 0.3]
+      learning_rate: [0.05, 0.1]
 
     lightgbm:
       n_estimators:  [50, 100, 200]
       max_depth:     [2, 3]
-      learning_rate: [0.05, 0.1, 0.3]
+      learning_rate: [0.05, 0.1]
 
 # ------------------------------------------------------------
-# Per-dataset XGBoost hyperparameter search  (Step 7)
-# Used by: python src/weak_signal_params_grid_search.py
-#
-# Split: 85% train+dev / 15% test (fixed per dataset)
-# Grid search selects best params via 10-fold 80/20 CV on the 85%.
-# Test set is evaluated exactly once with the best params.
-#
-# Total combinations: ~6 480 per dataset (8× the model selection grid)
-# New axes vs model selection: gamma  (not tuned before)
-# Output: data/results/per_dataset_best_params.csv
+# Step 21 — Cross-encoder reranker
 # ------------------------------------------------------------
-xgboost_params_grid:
-  n_folds:       10
-  test_fraction: 0.15
-  n_jobs:        -1
-
-  n_estimators:     [100, 200, 300, 500]
-  max_depth:        [4, 6, 8, 10]
-  learning_rate:    [0.01, 0.05, 0.1, 0.2, 0.3]
-  subsample:        [0.7, 0.8, 0.9]
-  colsample_bytree: [0.7, 0.8, 0.9]
-  min_child_weight: [1, 2, 3]
-  gamma:            [0.0, 0.1, 0.5]
+reranker:
+  model_name:      "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  batch_size_cuda: 128
+  batch_size_cpu:  32
 
 # ------------------------------------------------------------
-# Routing feature construction
+# Step 22 — Paired significance test
 # ------------------------------------------------------------
-routing_features:
-  overlap_k: 10
-  feature_stat_k: 10
-  epsilon: 1.0e-8
-  ce_smoothing_alpha: 1.0
-  seed: 42
-
-# ------------------------------------------------------------
-# Model selection grid search  (Step 5)
-# Used by: python src/weak_signal_model_grid_search.py
-#
-# Total combinations: ~2 600
-# Each combo: 10 folds × 5 datasets = 50 train/eval cycles
-# Output:    data/results/model_grid_search_top100.csv
-# ------------------------------------------------------------
-# ------------------------------------------------------------
-# Strong-signal model selection grid search  (Step 9)
-# Used by: python src/strong_signal_model_grid_search.py
-#
-# Input: query embedding vectors (~1024 dims from bge-m3)
-# Same 10-fold 80/20 Monte Carlo CV, same fold seeds as model_grid_search
-# so weak-signal vs strong-signal scores are directly comparable.
-#
-# Total combinations: ~470
-# Output: data/results/strong_signal_grid_search_top100.csv
-# ------------------------------------------------------------
-strong_signal_model_grid_search:
-  n_folds: 10
-  train_fraction: 0.8
-  top_n: 100
-  n_jobs: -1
-
-  models:
-    ridge:
-      alpha: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
-
-    elasticnet:
-      alpha: [0.001, 0.01, 0.1, 1.0, 10.0]
-      l1_ratio: [0.1, 0.3, 0.5, 0.7, 0.9]
-
-    # SVR: grid is deliberately small — O(n²) training cost.
-    svr:
-      C: [0.1, 1.0, 10.0, 100.0]
-      gamma: ["scale", "auto"]
-      epsilon: [0.01, 0.1, 0.2]
-
-    knn:
-      n_neighbors: [3, 5, 7, 10, 15, 20]
-      weights: ["uniform", "distance"]
-
-    # MLP: hidden sizes scaled to the ~1024-dim embedding input.
-    mlp:
-      hidden_layer_sizes: [[512], [256], [128], [512, 256], [256, 128], [128, 64]]
-      alpha: [0.0001, 0.001, 0.01, 0.1]
-      learning_rate_init: [0.001, 0.0001]
-      batch_size: [32, 64]
-
-    # XGBoost: colsample_bytree shifted lower than the weak-signal grid
-    # because random subsampling of embedding dimensions is more beneficial
-    # than for 15 hand-crafted features.
-    xgboost:
-      n_estimators: [100, 300]
-      max_depth: [4, 6, 8]
-      learning_rate: [0.05, 0.1, 0.3]
-      subsample: [0.8]
-      colsample_bytree: [0.1, 0.3, 0.5, 0.8]
-      min_child_weight: [1, 3]
-
-    # RF/ET: max_features as fractions instead of "log2" — with ~1024 features,
-    # "log2" (≈10) would be too aggressive; 0.1 (≈102) and 0.3 (≈307) are better.
-    random_forest:
-      n_estimators: [100, 200, 500]
-      max_depth: [null, 8, 16]
-      min_samples_leaf: [1, 2, 4]
-      max_features: ["sqrt", 0.1, 0.3]
-
-    extra_trees:
-      n_estimators: [100, 200, 500]
-      max_depth: [null, 8, 16]
-      min_samples_leaf: [1, 2, 4]
-      max_features: ["sqrt", 0.1, 0.3]
-
-# ------------------------------------------------------------
-# Model selection grid search  (Step 5)
-# Used by: python src/weak_signal_model_grid_search.py
-#
-# Total combinations: ~2 600
-# Each combo: 10 folds × 5 datasets = 50 train/eval cycles
-# Output:    data/results/model_grid_search_top100.csv
-# ------------------------------------------------------------
-model_grid_search:
-  n_folds: 10
-  train_fraction: 0.8
-  top_n: 100
-  n_jobs: -1            # outer parallelism across combos (-1 = all cores)
-
-  models:
-    logistic_regression:
-      C: [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
-
-    random_forest:
-      n_estimators: [50, 100, 200, 300, 500]
-      max_depth: [3, 5, 8, 12, null]
-      min_samples_split: [2, 5, 10]
-      min_samples_leaf: [1, 2, 4]
-      max_features: ["sqrt", "log2"]
-
-    extra_trees:
-      n_estimators: [50, 100, 200, 300, 500]
-      max_depth: [3, 5, 8, 12, null]
-      min_samples_split: [2, 5, 10]
-      min_samples_leaf: [1, 2, 4]
-      max_features: ["sqrt", "log2"]
-
-    xgboost:
-      n_estimators: [50, 100, 200, 300]
-      max_depth: [3, 4, 6, 8]
-      learning_rate: [0.01, 0.05, 0.1, 0.3]
-      subsample: [0.8, 1.0]
-      colsample_bytree: [0.8, 1.0]
-      min_child_weight: [1, 3, 5]
-
-    lightgbm:
-      n_estimators: [50, 100, 200, 300]
-      num_leaves: [15, 31, 63]
-      learning_rate: [0.01, 0.05, 0.1, 0.3]
-      subsample: [0.8, 1.0]
-      colsample_bytree: [0.8, 1.0]
-      min_child_weight: [1, 3, 5]
-
-    mlp:
-      hidden_layer_sizes: [[32], [64], [128], [256], [32, 16], [64, 32], [128, 64], [64, 32, 16]]
-      alpha: [0.0001, 0.001, 0.01, 0.1]
-      learning_rate_init: [0.001, 0.01]
-      batch_size: [16, 32]
-      activation: ["relu", "tanh"]
-
-    gaussian_nb:
-      var_smoothing: [1.0e-11, 1.0e-10, 1.0e-9, 1.0e-8, 1.0e-7]
-
-    adaboost:
-      n_estimators: [50, 100, 200, 300, 500]
-      learning_rate: [0.01, 0.05, 0.1, 0.5, 1.0]
-      base_max_depth: [1, 2, 3]
-
-    lda:
-      solver: ["svd", "lsqr", "eigen"]
-      shrinkage: [null, "auto", 0.1, 0.5, 0.9]
+significance_test:
+  alpha: 0.05

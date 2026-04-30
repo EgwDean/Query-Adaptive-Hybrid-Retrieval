@@ -1,0 +1,2 @@
+model,params_json,cv_ndcg@10
+svr,"{""C"": 0.1, ""epsilon"": 0.05}",0.399578

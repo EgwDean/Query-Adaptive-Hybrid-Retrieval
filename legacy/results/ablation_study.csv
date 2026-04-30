@@ -1,0 +1,23 @@
+config_name,ablation_type,removed,macro_ndcg10,scifact,nfcorpus,arguana,fiqa,scidocs
+no_query_length,leave_one_feature,query_length,0.386138,0.641479,0.335026,0.376145,0.405960,0.172079
+no_average_idf,leave_one_feature,average_idf,0.386088,0.641115,0.336711,0.375147,0.405298,0.172167
+full,full,—,0.385801,0.639183,0.335729,0.374615,0.407258,0.172222
+no_top_sparse_score,leave_one_feature,top_sparse_score,0.385496,0.640049,0.334112,0.374973,0.406150,0.172194
+no_cross_entropy,leave_one_feature,cross_entropy,0.385355,0.639041,0.334857,0.375182,0.405573,0.172122
+no_overlap_at_k,leave_one_feature,overlap_at_k,0.385333,0.636700,0.335846,0.376309,0.405324,0.172485
+no_has_question_word,leave_one_feature,has_question_word,0.385274,0.637497,0.336380,0.375978,0.405149,0.171367
+no_max_idf,leave_one_feature,max_idf,0.384968,0.635349,0.337132,0.374236,0.405861,0.172264
+no_spearman_topk,leave_one_feature,spearman_topk,0.384737,0.637065,0.336271,0.372456,0.405176,0.172716
+no_dense_confidence,leave_one_feature,dense_confidence,0.384732,0.639780,0.335920,0.372990,0.403592,0.171379
+no_rare_term_ratio,leave_one_feature,rare_term_ratio,0.384674,0.638820,0.335643,0.372874,0.403098,0.172934
+no_first_shared_doc_rank,leave_one_feature,first_shared_doc_rank,0.384300,0.639819,0.332336,0.374503,0.403569,0.171275
+no_stopword_ratio,leave_one_feature,stopword_ratio,0.384287,0.636023,0.335856,0.373878,0.403447,0.172232
+no_sparse_confidence,leave_one_feature,sparse_confidence,0.384214,0.635127,0.335758,0.373729,0.403196,0.173260
+no_dense_entropy_topk,leave_one_feature,dense_entropy_topk,0.384078,0.638047,0.334218,0.375005,0.401254,0.171867
+no_group_B,leave_one_group,B: Vocabulary Match,0.383948,0.638809,0.333777,0.371531,0.401659,0.173963
+no_sparse_entropy_topk,leave_one_feature,sparse_entropy_topk,0.383659,0.632405,0.335087,0.375480,0.402444,0.172879
+no_group_A,leave_one_group,A: Query Surface,0.383433,0.634331,0.335533,0.374465,0.401907,0.170929
+no_top_dense_score,leave_one_feature,top_dense_score,0.383326,0.636010,0.332024,0.374752,0.403000,0.170841
+no_group_D,leave_one_group,D: Retriever Agreement,0.382930,0.635797,0.331046,0.373709,0.403106,0.170993
+no_group_C,leave_one_group,C: Retriever Confidence,0.382852,0.636891,0.333019,0.373852,0.400061,0.170434
+no_group_E,leave_one_group,E: Distribution Shape,0.382256,0.631595,0.332901,0.374496,0.398898,0.173388

@@ -1,0 +1,6 @@
+dataset,colsample_bytree,gamma,learning_rate,max_depth,min_child_weight,n_estimators,subsample,cv_ndcg@10,test_ndcg@10
+scifact,0.8,0.0,0.3,8,1,100,0.8,0.690760,0.662781
+nfcorpus,0.8,0.1,0.2,4,1,100,0.9,0.301817,0.353779
+arguana,0.9,0.0,0.3,10,1,500,0.7,0.381304,0.362858
+fiqa,0.8,0.0,0.2,10,1,500,0.9,0.398027,0.467917
+scidocs,0.7,0.0,0.2,6,2,100,0.8,0.176254,0.156720
