@@ -120,7 +120,7 @@ def step_01_download(cfg: dict) -> Tuple[dict, dict, dict]:
         download_beir_dataset(DATASET_NAME, datasets_root)
     else:
         print(f"  [SKIP] {ds_path} already exists.")
-    corpus, queries, qrels = load_beir_dataset(ds_path)
+    corpus, queries, qrels, _ = load_beir_dataset(ds_path)
     n_judgments = sum(len(v) for v in qrels.values())
     print(f"  corpus={len(corpus):,}  queries={len(queries):,}  "
           f"judgments={n_judgments:,}")
