@@ -15,15 +15,19 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# Datasets — five BEIR datasets that are concatenated into a
-# single 5x300 = 1500-query "merged" working dataset.
+# Datasets — six BEIR datasets that are concatenated into a
+# single merged working dataset.  The first five contribute
+# 300 queries each (1500 total); trec-covid contributes all
+# 50 of its queries (sampling cap = min(300, available)).
+# Grand total: 1550 queries.
 # ------------------------------------------------------------
 # Stats: (test queries | corpus docs | avg relevant docs per query)
-#   scifact            300 queries  |    5 084 docs |  1.1 avg
-#   nfcorpus           323 queries  |    3 633 docs | 38.2 avg
-#   arguana          1 406 queries  |    8 674 docs |  1.0 avg
-#   fiqa               648 queries  |   57 638 docs |  2.6 avg
-#   scidocs          1 000 queries  |   25 657 docs |  4.9 avg
+#   scifact              300 queries  |     5 084 docs |   1.1 avg
+#   nfcorpus             323 queries  |     3 633 docs |  38.2 avg
+#   arguana            1 406 queries  |     8 674 docs |   1.0 avg
+#   fiqa                 648 queries  |    57 638 docs |   2.6 avg
+#   scidocs            1 000 queries  |    25 657 docs |   4.9 avg
+#   trec-covid            50 queries  |   171 332 docs |  49.1 avg
 # ------------------------------------------------------------
 datasets:
   - scifact
@@ -31,6 +35,7 @@ datasets:
   - arguana
   - fiqa
   - scidocs
+  - trec-covid
 
 # ------------------------------------------------------------
 # Paths (relative to the project root)

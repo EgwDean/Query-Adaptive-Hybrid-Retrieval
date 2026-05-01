@@ -3,7 +3,7 @@ pipeline.py
 ===========
 
 End-to-end orchestrator for the 22-step Query-Adaptive Hybrid Retrieval
-experiment.  The pipeline is implemented as a sequence of
+experiment across 6 BEIR datasets.  The pipeline is implemented as a sequence of
 ``step_NN_xxx`` functions, each of which:
 
   1. Prints a clear header with the step number and title.
@@ -156,11 +156,12 @@ METHOD_COLORS_6 = [
 
 # Dataset palette used in the MoE decision heatmap.
 DS_PALETTE = {
-    "scifact":  "#4878D0",
-    "nfcorpus": "#EE854A",
-    "arguana":  "#6ACC65",
-    "fiqa":     "#D65F5F",
-    "scidocs":  "#B47CC7",
+    "scifact":    "#4878D0",
+    "nfcorpus":   "#EE854A",
+    "arguana":    "#6ACC65",
+    "fiqa":       "#D65F5F",
+    "scidocs":    "#B47CC7",
+    "trec-covid": "#17BECF",
 }
 
 
