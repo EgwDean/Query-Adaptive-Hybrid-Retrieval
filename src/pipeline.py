@@ -2,7 +2,7 @@
 pipeline.py
 ===========
 
-End-to-end orchestrator for the 22-step Query-Adaptive Hybrid Retrieval
+End-to-end orchestrator for the 23-step Query-Adaptive Hybrid Retrieval
 experiment across 6 BEIR datasets.  The pipeline is implemented as a sequence of
 ``step_NN_xxx`` functions, each of which:
 
@@ -22,7 +22,6 @@ fractions, grid sizes, model lists, etc.) live in ``config.yaml``.
 
 from __future__ import annotations
 
-import csv
 import itertools
 import json
 import math
@@ -31,7 +30,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -70,7 +69,6 @@ from src.utils import (
     load_pickle,
     load_qrels,
     load_queries,
-    md5_of_obj,
     model_short_name,
     paired_t_test,
     query_ndcg_at_k,
@@ -525,7 +523,13 @@ def _preprocess_queries(queries_jsonl: str, tokenized_queries_jsonl: str,
 
 
 def _encode_with_oom_retry(model, texts, device, batch_size):
-    """Embed *texts* with OOM-resilient batch shrinking and CPU fallback."""
+    """Embed *texts* with OOM-resilient batch shrinking and CPU fallback.
+
+    A successful sub-batch keeps the (possibly reduced) ``bs`` rather than
+    resetting to ``batch_size`` — otherwise every following batch would
+    trigger the same OOM and waste a halving cycle.  Only a CPU fallback
+    restores the original batch size.
+    """
     results = []
     start = 0
     bs = batch_size
@@ -538,8 +542,6 @@ def _encode_with_oom_retry(model, texts, device, batch_size):
                                 show_progress_bar=False, device=cur_device)
             results.append(embs.cpu())
             start = end
-            if cur_device == device:
-                bs = batch_size
         except torch.cuda.OutOfMemoryError:
             try: torch.cuda.empty_cache()
             except Exception: pass
@@ -775,15 +777,15 @@ def step_03_optimize_bm25(cfg: dict, device: torch.device) -> None:
     datasets = cfg["datasets"]
     samp     = cfg["sampling"]
     n_per_ds = int(samp["n_queries_per_dataset"])
-    trunc_seed = int(samp["truncation_seed"])
     ndcg_k = int(cfg["benchmark"]["ndcg_k"])
 
-    # Pick the same 300 queries per dataset that all later steps use.
+    # Pick the same queries per dataset that all later steps use.
     selected_qids = _select_merged_qids(cfg)
+    total_selected = sum(len(v) for v in selected_qids.values())
 
     combos = list(itertools.product(k1_vals, b_vals, stem_vals))
     print(f"  Grid: {len(combos)} combos (k1={len(k1_vals)} × b={len(b_vals)} × stem={len(stem_vals)})")
-    print(f"  Per dataset: {n_per_ds} queries (merged 5x{n_per_ds} = {5 * n_per_ds})")
+    print(f"  Datasets: {len(datasets)}  |  cap per dataset: {n_per_ds}  |  total selected: {total_selected}")
 
     macro_rows = []
     for (k1, b, use_stemming) in tqdm(combos, desc="BM25 grid", dynamic_ncols=True):
@@ -1578,6 +1580,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
             ds["X_td"], ds["y_td"], ds["qids_td"], ds["ds_td"],
             list(range(len(FEATURE_NAMES))), retrieval, folds, seed, rrf_k, ndcg_k,
         )
+        full_pq_mean = float(np.mean(full_pq))
 
         rows_p2: List[dict] = []
         if not nondamaging:
@@ -1616,7 +1619,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
                     "n_removed":         len(subset),
                     "n_features":        len(cols),
                     f"cv_ndcg@{ndcg_k}": mean_score,
-                    "delta":             mean_score - full_score,
+                    "delta":             mean_score - full_pq_mean,
                     "t":                 ttest["t"],
                     "p_value":           ttest["p"],
                     "sig_better":        sig_better,
@@ -1630,7 +1633,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
              "delta", "t", "p_value", "sig_better", "feature_cols_json"],
             p2_csv,
         )
-        _plot_ablation_combos(rows_p2, full_score, ndcg_k, sig_alpha, p2_png)
+        _plot_ablation_combos(rows_p2, full_pq_mean, ndcg_k, sig_alpha, p2_png)
         print(f"  Phase 2 plot saved: {p2_png}")
         for r in rows_p2:
             print(f"    remove=[{r['removed']}]  "
@@ -2957,11 +2960,16 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
     moe_alphas    = _predict_moe(cfg)
 
     # Collect per-query NDCG@10 across all test queries (merged).
+    # Skip queries with no relevant docs — every method scores 0 on them, which
+    # collapses paired diffs to 0 and artificially inflates the t-statistic.
+    # Matches the filter used in steps 4, 20, and 21.
     per_method_scores: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
     for ds_name in cfg["datasets"]:
         bm25_res, dense_res, qrels = _load_active_retrieval(cfg, ds_name, device)
         for qid in split[ds_name]["test"]:
             qrel = qrels.get(qid, {})
+            if not qrel or all(g <= 0 for g in qrel.values()):
+                continue
             bm = bm25_res.get(qid, [])
             de = dense_res.get(qid, [])
             method_ranked = {
@@ -2996,6 +3004,280 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
     for r in rows:
         print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
               f"Δ={r['mean_diff']:+.4f}  p={r['p_value']:.4f}  significant={r['significant']}")
+
+
+# ------------------------------------------------------------
+# STEP 23 — End-to-end retrieval latency (ms / query)
+# ------------------------------------------------------------
+
+def _bm25_search_one(q_text: str, bm25, doc_ids: list, stemmer, top_k: int):
+    """Single-query BM25 retrieval — used both for timing and reuse."""
+    tokens = stem_and_tokenize(q_text, stemmer)
+    scores = bm25.get_scores(tokens)
+    k = min(top_k, len(scores))
+    if k <= 0:
+        return [], tokens
+    idx = np.argpartition(scores, -k)[-k:]
+    idx = idx[np.argsort(scores[idx])[::-1]]
+    pairs = [(doc_ids[i], float(scores[i])) for i in idx]
+    return pairs, tokens
+
+
+def _dense_search_one(q_text: str, st_model, corpus_embs: torch.Tensor,
+                      doc_ids: list, top_k: int, c_chunk: int, device: torch.device):
+    """Single-query dense retrieval — encodes the query then runs semantic search."""
+    from sentence_transformers import util as st_util
+    with torch.no_grad():
+        q_vec = st_model.encode([q_text], convert_to_tensor=True,
+                                show_progress_bar=False, device=str(device))
+    hits = st_util.semantic_search(q_vec, corpus_embs, top_k=top_k,
+                                    corpus_chunk_size=c_chunk)[0]
+    pairs = [(doc_ids[h["corpus_id"]], float(h["score"])) for h in hits]
+    return pairs, q_vec
+
+
+def _plot_latency(rows: List[dict], out_path: str) -> None:
+    """Per-dataset grouped bar chart of mean latency in ms (no NDCG-style cap)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups = [r["group"] for r in rows]
+    x = np.arange(len(groups))
+    n_m = len(METHOD_KEYS_6)
+    width = 0.85 / max(n_m, 1)
+    offsets = np.linspace(-(n_m - 1) / 2, (n_m - 1) / 2, n_m) * width
+    all_vals = [float(r[m]) for r in rows for m in METHOD_KEYS_6]
+    y_max = max(all_vals) * 1.18 if all_vals else 1.0
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    for method, label, color, off in zip(METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6, offsets):
+        vals = [float(r[method]) for r in rows]
+        bars = ax.bar(x + off, vals, width, label=label, color=color,
+                      alpha=0.85, edgecolor="white")
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, h + y_max * 0.005,
+                    f"{h:.1f}", ha="center", va="bottom", fontsize=6, rotation=90)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, fontsize=10)
+    ax.set_ylabel("Mean latency (ms / query)", fontsize=10)
+    ax.set_title("End-to-end Retrieval Latency per Method (mean over test queries)",
+                 fontsize=12)
+    ax.legend(fontsize=9, loc="upper left")
+    ax.set_ylim(0, y_max)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    ensure_dir(os.path.dirname(out_path))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def step_23_latency(cfg: dict, device: torch.device) -> None:
+    """End-to-end retrieval latency for the 6 methods on every test query.
+
+    Each method is timed *independently* (re-running BM25 / dense / model
+    inference per call) so the reported number reflects the cost of a
+    standalone deployment of that method.  CUDA work is synchronised before
+    and after each timed block.  A 3-query warmup primes the GPU and any
+    JIT caches.
+    """
+    print_step_header(23, "Retrieval latency (ms / query, all 6 methods)")
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    out_csv = os.path.join(results_root, "latency.csv")
+    out_png = os.path.join(results_root, "latency.png")
+    if file_exists(out_csv) and file_exists(out_png):
+        print(f"  [SKIP] {out_csv} already exists.")
+        return
+
+    from sentence_transformers import SentenceTransformer
+
+    # Pre-load all router models (kept in memory for the full step).
+    models_root = get_config_path(cfg, "models_folder", "data/models")
+    weak_b   = load_pickle(os.path.join(models_root, "weak_model.pkl"))
+    strong_b = load_pickle(os.path.join(models_root, "strong_model.pkl"))
+    moe_b    = load_pickle(os.path.join(models_root, "moe_model.pkl"))
+
+    # Sentence transformer for query encoding (single shared instance).
+    st_model = SentenceTransformer(cfg["embeddings"]["model_name"], device=str(device))
+
+    bm25_params = get_active_bm25_params(cfg)
+    use_stemming = bm25_params["use_stemming"]
+    stemmer_lang = cfg["preprocessing"]["stemmer_language"]
+    english_sw = ensure_english_stopwords()
+    if use_stemming:
+        from nltk.stem.snowball import SnowballStemmer
+        stemmer = SnowballStemmer(stemmer_lang)
+        stopword_stems = frozenset(stemmer.stem(w) for w in english_sw)
+    else:
+        stemmer = None
+        stopword_stems = frozenset(w.lower() for w in english_sw)
+
+    rcfg = cfg.get("routing_features", {}) or {}
+    overlap_k      = int(rcfg.get("overlap_k", 10))
+    feature_stat_k = int(rcfg.get("feature_stat_k", 10))
+    epsilon        = float(rcfg.get("epsilon", 1e-8))
+    ce_alpha       = float(rcfg.get("ce_smoothing_alpha", 1.0))
+
+    rrf_k = int(cfg["benchmark"]["rrf"]["k"])
+    top_k = int(cfg["benchmark"]["top_k"])
+    dense_cfg = cfg.get("dense_search", {}) or {}
+    c_chunk = int(dense_cfg.get("corpus_chunk_size", 50000))
+
+    split = _load_split(cfg)
+
+    def _sync():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+    rows: List[dict] = []
+    macro_lat: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+
+    for ds_name in cfg["datasets"]:
+        print(f"\n  --- {ds_name} ---")
+        ds_dir = dataset_processed_dir(cfg, ds_name)
+        sparse = bm25_artifact_paths(ds_dir, **bm25_params)
+        bm25 = load_pickle(sparse["bm25_pkl"])
+        doc_ids = load_pickle(sparse["bm25_docids_pkl"])
+        word_freq, total_corpus_tokens = load_pickle(sparse["word_freq_pkl"])
+        doc_freq, total_docs           = load_pickle(sparse["doc_freq_pkl"])
+
+        # Move corpus embeddings to GPU once (or stay on CPU if OOM).
+        corpus_embs = torch.load(os.path.join(ds_dir, "corpus_embeddings.pt"),
+                                 weights_only=True)
+        cur_device = device
+        if cur_device.type == "cuda":
+            try:
+                corpus_embs = corpus_embs.to(cur_device)
+            except torch.cuda.OutOfMemoryError:
+                print("  [WARN] CUDA OOM; using CPU for dense search.")
+                cur_device = torch.device("cpu")
+                torch.cuda.empty_cache()
+
+        queries = load_queries(os.path.join(ds_dir, "queries.jsonl"))
+        test_qids = split[ds_name]["test"]
+
+        # Warmup (excluded from measurements).
+        for qid in test_qids[:min(3, len(test_qids))]:
+            q_text = queries[qid]
+            _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                              top_k, c_chunk, cur_device)
+        _sync()
+
+        lat: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+
+        for qid in tqdm(test_qids, desc=f"  latency [{ds_name}]", dynamic_ncols=True):
+            q_text = queries[qid]
+
+            # ---------------- bm25 ----------------
+            t0 = time.perf_counter()
+            _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            lat["bm25"].append((time.perf_counter() - t0) * 1000.0)
+
+            # ---------------- dense ----------------
+            _sync(); t0 = time.perf_counter()
+            _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                              top_k, c_chunk, cur_device)
+            _sync(); lat["dense"].append((time.perf_counter() - t0) * 1000.0)
+
+            # ---------------- static_rrf ----------------
+            _sync(); t0 = time.perf_counter()
+            bm_p, _ = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_p, _ = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                         top_k, c_chunk, cur_device)
+            wrrf_top_k(0.5, bm_p, de_p, rrf_k, top_k)
+            _sync(); lat["static_rrf"].append((time.perf_counter() - t0) * 1000.0)
+
+            # ---------------- wrrf_weak ----------------
+            _sync(); t0 = time.perf_counter()
+            bm_p, q_tokens = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_p, _ = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                         top_k, c_chunk, cur_device)
+            feats = _compute_query_features(
+                q_text, q_tokens, bm_p, de_p,
+                word_freq, total_corpus_tokens, doc_freq, total_docs,
+                stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
+            )
+            X = np.array([[feats[n] for n in FEATURE_NAMES]], dtype=np.float32)
+            X = X[:, weak_b["feature_cols"]]
+            X = (X - weak_b["scaler_mu"]) / weak_b["scaler_sigma"]
+            a_w = float(predict_alpha_from_model(weak_b["model"], X, weak_b["model_name"])[0])
+            wrrf_top_k(a_w, bm_p, de_p, rrf_k, top_k)
+            _sync(); lat["wrrf_weak"].append((time.perf_counter() - t0) * 1000.0)
+
+            # ---------------- wrrf_strong ----------------
+            _sync(); t0 = time.perf_counter()
+            bm_p, _ = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_p, q_vec = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                             top_k, c_chunk, cur_device)
+            X_s = q_vec.detach().cpu().numpy().astype(np.float32)
+            X_s = (X_s - strong_b["scaler_mu"]) / strong_b["scaler_sigma"]
+            a_s = float(predict_alpha_from_model(strong_b["model"], X_s, strong_b["model_name"])[0])
+            wrrf_top_k(a_s, bm_p, de_p, rrf_k, top_k)
+            _sync(); lat["wrrf_strong"].append((time.perf_counter() - t0) * 1000.0)
+
+            # ---------------- moe ----------------
+            _sync(); t0 = time.perf_counter()
+            bm_p, q_tokens = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_p, q_vec = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                             top_k, c_chunk, cur_device)
+            feats = _compute_query_features(
+                q_text, q_tokens, bm_p, de_p,
+                word_freq, total_corpus_tokens, doc_freq, total_docs,
+                stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
+            )
+            Xw = np.array([[feats[n] for n in FEATURE_NAMES]], dtype=np.float32)
+            Xw = Xw[:, weak_b["feature_cols"]]
+            Xw = (Xw - weak_b["scaler_mu"]) / weak_b["scaler_sigma"]
+            a_w = float(predict_alpha_from_model(weak_b["model"], Xw, weak_b["model_name"])[0])
+            Xs = q_vec.detach().cpu().numpy().astype(np.float32)
+            Xs = (Xs - strong_b["scaler_mu"]) / strong_b["scaler_sigma"]
+            a_s = float(predict_alpha_from_model(strong_b["model"], Xs, strong_b["model_name"])[0])
+            Xm = _moe_features(np.array([a_w], dtype=np.float32),
+                               np.array([a_s], dtype=np.float32),
+                               moe_b["model_name"])
+            a_m = float(predict_alpha_from_model(moe_b["model"], Xm, moe_b["model_name"])[0])
+            wrrf_top_k(a_m, bm_p, de_p, rrf_k, top_k)
+            _sync(); lat["moe"].append((time.perf_counter() - t0) * 1000.0)
+
+        # Free GPU memory before the next dataset.
+        del corpus_embs
+        if cur_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        for m in METHOD_KEYS_6:
+            macro_lat[m].extend(lat[m])
+
+        row = {"group": ds_name, "n": len(lat[METHOD_KEYS_6[0]])}
+        print(f"    {'method':<22}  {'mean':>8}  {'median':>8}  {'p95':>8}")
+        for m, lab in zip(METHOD_KEYS_6, METHOD_LABELS_6):
+            arr = np.array(lat[m], dtype=np.float64)
+            row[m]              = float(arr.mean())
+            row[f"{m}_median"]  = float(np.median(arr))
+            row[f"{m}_p95"]     = float(np.percentile(arr, 95))
+            print(f"    {lab:<22}  {row[m]:>7.2f}ms  "
+                  f"{row[f'{m}_median']:>7.2f}ms  {row[f'{m}_p95']:>7.2f}ms")
+        rows.append(row)
+
+    # Macro across all datasets (concatenated per-query latencies).
+    macro_row = {"group": "MACRO",
+                 "n": len(macro_lat[METHOD_KEYS_6[0]])}
+    for m in METHOD_KEYS_6:
+        arr = np.array(macro_lat[m], dtype=np.float64)
+        macro_row[m]             = float(arr.mean())
+        macro_row[f"{m}_median"] = float(np.median(arr))
+        macro_row[f"{m}_p95"]    = float(np.percentile(arr, 95))
+    rows.append(macro_row)
+
+    fieldnames = ["group", "n"] + [
+        col for m in METHOD_KEYS_6 for col in (m, f"{m}_median", f"{m}_p95")
+    ]
+    save_csv_dicts(rows, fieldnames, out_csv)
+    _plot_latency(rows, out_png)
+    print(f"\n  Latency CSV: {out_csv}")
+    print(f"  Latency PNG: {out_png}")
 
 
 # ============================================================
@@ -3037,6 +3319,7 @@ def main() -> None:
     step_20_recall_at_100(cfg, device)
     step_21_rerank(cfg, device)
     step_22_significance(cfg, device)
+    step_23_latency(cfg, device)
 
     print("\n\nPipeline complete.")
 
