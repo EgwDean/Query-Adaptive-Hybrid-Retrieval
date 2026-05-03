@@ -1,6 +1,0 @@
-dataset,dropout,hidden_sizes,learning_rate,use_batchnorm,weight_decay,cv_ndcg@10,test_ndcg@10
-scifact,0.1,256-64,0.001,True,0.0001,0.672603,0.639588
-nfcorpus,0.3,128,0.0001,True,0.001,0.292836,0.341863
-arguana,0.1,256,0.001,True,0.0001,0.374744,0.360794
-fiqa,0.5,128,0.001,False,0.0001,0.377090,0.439178
-scidocs,0.1,512-256,0.0001,True,0.0001,0.175164,0.158737

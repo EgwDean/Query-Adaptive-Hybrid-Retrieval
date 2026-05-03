@@ -15,19 +15,17 @@
 # ============================================================
 
 # ------------------------------------------------------------
-# Datasets — six BEIR datasets that are concatenated into a
-# single merged working dataset.  The first five contribute
-# 300 queries each (1500 total); trec-covid contributes all
-# 50 of its queries (sampling cap = min(300, available)).
-# Grand total: 1550 queries.
+# Datasets — BEIR datasets that are concatenated into a single
+# merged working dataset.  Each dataset contributes
+# min(n_queries_per_dataset, available) test queries.  The
+# pipeline reads this list with no hardcoded length anywhere.
 # ------------------------------------------------------------
 # Stats: (test queries | corpus docs | avg relevant docs per query)
-#   scifact              300 queries  |     5 084 docs |   1.1 avg
-#   nfcorpus             323 queries  |     3 633 docs |  38.2 avg
-#   arguana            1 406 queries  |     8 674 docs |   1.0 avg
-#   fiqa                 648 queries  |    57 638 docs |   2.6 avg
-#   scidocs            1 000 queries  |    25 657 docs |   4.9 avg
-#   trec-covid            50 queries  |   171 332 docs |  49.1 avg
+#   scifact            300 queries  |    5 084 docs |  1.1 avg
+#   nfcorpus           323 queries  |    3 633 docs | 38.2 avg
+#   arguana          1 406 queries  |    8 674 docs |  1.0 avg
+#   fiqa               648 queries  |   57 638 docs |  2.6 avg
+#   scidocs          1 000 queries  |   25 657 docs |  4.9 avg
 # ------------------------------------------------------------
 datasets:
   - scifact
@@ -81,9 +79,13 @@ dense_search:
 # ------------------------------------------------------------
 benchmark:
   top_k:  100      # candidate-pool size for retrieval
-  ndcg_k: 10       # primary evaluation cut-off
+  ndcg_k: 100      # primary evaluation cut-off (NDCG / MRR)
   rrf:
     k: 60          # RRF damping constant (Cormack et al. 2009)
+  bootstrap:
+    n_resamples: 1000       # bootstrap iterations for the 95% CIs
+    ci:          0.95
+    seed:        42
 
 # ------------------------------------------------------------
 # Sampling and split — defines the 1500-query merged dataset

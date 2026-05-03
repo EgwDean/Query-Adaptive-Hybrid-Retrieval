@@ -2,8 +2,8 @@
 pipeline.py
 ===========
 
-End-to-end orchestrator for the 23-step Query-Adaptive Hybrid Retrieval
-experiment across 6 BEIR datasets.  The pipeline is implemented as a sequence of
+End-to-end orchestrator for the 25-step Query-Adaptive Hybrid Retrieval
+experiment across the BEIR datasets listed in config.yaml.  The pipeline is implemented as a sequence of
 ``step_NN_xxx`` functions, each of which:
 
   1. Prints a clear header with the step number and title.
@@ -67,10 +67,13 @@ from src.utils import (
     load_full_corpus,
     load_json,
     load_pickle,
+    bootstrap_ci_mean,
+    holm_correction,
     load_qrels,
     load_queries,
     model_short_name,
     paired_t_test,
+    query_mrr_at_k,
     query_ndcg_at_k,
     query_recall_at_k,
     run_bm25_retrieval,
@@ -142,6 +145,12 @@ QUESTION_WORDS = frozenset(
 CLASSIFIER_MODELS = {"logistic_regression", "gaussian_nb", "lda"}
 
 # Method labels for retrieval comparisons.
+# Routers are the three thesis contributions; baselines are the off-the-shelf
+# retrievers (and the static RRF benchmark).  Pairwise t-tests focus on
+# router-vs-baseline and router-vs-router comparisons (baseline-vs-baseline
+# pairs are skipped — they don't speak to the thesis claim).
+BASELINE_METHODS = ["bm25", "dense", "static_rrf"]
+ROUTER_METHODS   = ["wrrf_weak", "wrrf_strong", "moe"]
 METHOD_KEYS_6 = ["bm25", "dense", "static_rrf", "wrrf_weak", "wrrf_strong", "moe"]
 METHOD_LABELS_6 = [
     "BM25", "Dense", "Static RRF (α=0.5)",
@@ -152,7 +161,9 @@ METHOD_COLORS_6 = [
     "#D65F5F", "#B47CC7", "#956CB4",
 ]
 
-# Dataset palette used in the MoE decision heatmap.
+# Dataset color preferences used in the MoE decision heatmap.
+# Lookups fall back to a default gray so any dataset listed in config.yaml
+# can be plotted without requiring a hardcoded entry here.
 DS_PALETTE = {
     "scifact":    "#4878D0",
     "nfcorpus":   "#EE854A",
@@ -161,6 +172,7 @@ DS_PALETTE = {
     "scidocs":    "#B47CC7",
     "trec-covid": "#17BECF",
 }
+DS_DEFAULT_COLOR = "#888888"
 
 
 # ============================================================
@@ -365,6 +377,98 @@ def predict_alpha_from_model(model, X, model_name: str) -> np.ndarray:
         return proba[:, 1].astype(np.float32)
     preds = model.predict(X).astype(np.float32)
     return np.clip(preds, 0.0, 1.0)
+
+
+def _scoped_pairwise_method_pairs() -> List[Tuple[str, str]]:
+    """Pairs to compare in every metric's pairwise t-test.
+
+    Includes every (router, baseline) pair (router on the left so a positive
+    mean_diff means the router wins) and every (router, router) pair.
+    Excludes baseline-vs-baseline pairs (e.g. bm25 vs dense) — those do not
+    address the thesis claim.  Total: 9 + 3 = 12 unique pairs.
+    """
+    pairs: List[Tuple[str, str]] = []
+    for r in ROUTER_METHODS:
+        for b in BASELINE_METHODS:
+            pairs.append((r, b))
+    for i, ri in enumerate(ROUTER_METHODS):
+        for rj in ROUTER_METHODS[i + 1:]:
+            pairs.append((ri, rj))
+    return pairs
+
+
+def _bootstrap_ci(scores: Sequence[float], cfg: dict) -> Tuple[float, float, float]:
+    """Bootstrap CI helper that reads its parameters from cfg['benchmark']['bootstrap'].
+
+    Returns (mean, ci_low, ci_high).
+    """
+    bcfg = (cfg.get("benchmark", {}) or {}).get("bootstrap", {}) or {}
+    n_res = int(bcfg.get("n_resamples", 1000))
+    ci    = float(bcfg.get("ci", 0.95))
+    seed  = int(bcfg.get("seed", 42))
+    return bootstrap_ci_mean(scores, n_resamples=n_res, ci=ci, seed=seed)
+
+
+def _scoped_pairwise_tests(per_method_scores: Dict[str, list],
+                            sig_alpha: float,
+                            comparison_tag: str = "") -> List[dict]:
+    """Run paired t-tests on the scoped (router-vs-baseline + router-vs-router)
+    pairs and apply Holm correction across that family of tests.
+
+    Each row contains: method_a, method_b, n, mean_diff, t, p_value,
+    cohens_d, p_holm, significant, significant_holm, plus an optional
+    comparison column when *comparison_tag* is provided.
+    """
+    pairs = _scoped_pairwise_method_pairs()
+    raw: List[Optional[dict]] = []
+    p_values: List[float] = []
+    for m_a, m_b in pairs:
+        a = per_method_scores.get(m_a, [])
+        b = per_method_scores.get(m_b, [])
+        n = min(len(a), len(b))
+        if n == 0:
+            raw.append(None)
+            p_values.append(1.0)
+            continue
+        res = paired_t_test(a[:n], b[:n])
+        raw.append(res)
+        p_values.append(res["p"])
+
+    rejected, p_adj = holm_correction(p_values, alpha=sig_alpha)
+
+    rows: List[dict] = []
+    for (m_a, m_b), res, rej, p_a in zip(pairs, raw, rejected, p_adj):
+        if res is None:
+            row = {
+                "method_a": m_a, "method_b": m_b,
+                "n": 0, "mean_diff": 0.0, "t": 0.0, "p_value": 1.0,
+                "cohens_d": 0.0, "p_holm": 1.0,
+                "significant": "no", "significant_holm": "no",
+            }
+        else:
+            row = {
+                "method_a":         m_a,
+                "method_b":         m_b,
+                "n":                res["n"],
+                "mean_diff":        res["mean_diff"],
+                "t":                res["t"],
+                "p_value":          res["p"],
+                "cohens_d":         res["d"],
+                "p_holm":           float(p_a),
+                "significant":      "yes" if res["p"] <= sig_alpha else "no",
+                "significant_holm": "yes" if bool(rej) else "no",
+            }
+        if comparison_tag:
+            row["comparison"] = comparison_tag
+        rows.append(row)
+    return rows
+
+
+TTEST_FIELDS_BASE = [
+    "method_a", "method_b", "n",
+    "mean_diff", "t", "p_value", "cohens_d", "p_holm",
+    "significant", "significant_holm",
+]
 
 
 def expand_grid(grid_cfg: dict) -> List[Tuple[str, dict]]:
@@ -838,9 +942,9 @@ def step_03_optimize_bm25(cfg: dict, device: torch.device) -> None:
 
 def _select_merged_qids(cfg: dict) -> Dict[str, List[str]]:
     """
-    Deterministically pick `n_queries_per_dataset` query IDs per dataset.
-    Cached as data/results/merged_qids.json so that every subsequent step
-    works on the same 1500 queries.
+    Deterministically pick min(n_queries_per_dataset, available) query IDs
+    per dataset.  Cached as data/results/merged_qids.json so that every
+    subsequent step works on exactly the same merged query set.
     """
     results_root = get_config_path(cfg, "results_folder", "data/results")
     cache_path   = os.path.join(results_root, "merged_qids.json")
@@ -1559,19 +1663,24 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
     else:
         print(f"  [SKIP] Phase 1 already done ({p1_csv}).")
 
-    # ── Phase 2: all subsets of non-damaging features ────────────────────
+    # ── Phase 2: all subsets of non-damaging features AND non-damaging groups ──
     if not (file_exists(p2_csv) and file_exists(p2_png)):
-        print(f"\n  --- Phase 2: combination ablation of non-damaging features ---")
+        print(f"\n  --- Phase 2: combination ablation of non-damaging features + groups ---")
         rows_p1    = load_csv_dicts(p1_csv)
         full_score = float(next(r[f"cv_ndcg@{ndcg_k}"] for r in rows_p1
                                 if r["ablation_type"] == "full"))
         lof_rows   = [r for r in rows_p1 if r["ablation_type"] == "leave_one_feature"]
-        # Features with delta >= 0 when removed (zero or positive change).
-        nondamaging = [r["removed"] for r in lof_rows
-                       if float(r[f"cv_ndcg@{ndcg_k}"]) >= full_score]
+        log_rows   = [r for r in rows_p1 if r["ablation_type"] == "leave_one_group"]
+        # Items with delta >= 0 when removed (zero or positive change).
+        nondamaging_features = [r["removed"] for r in lof_rows
+                                if float(r[f"cv_ndcg@{ndcg_k}"]) >= full_score]
+        nondamaging_groups   = [r["removed"] for r in log_rows
+                                if float(r[f"cv_ndcg@{ndcg_k}"]) >= full_score]
         print(f"  Full model CV NDCG@{ndcg_k}: {full_score:.4f}")
-        print(f"  Non-damaging features (delta>=0 when removed): "
-              f"{nondamaging if nondamaging else '(none)'}")
+        print(f"  Non-damaging features: "
+              f"{nondamaging_features if nondamaging_features else '(none)'}")
+        print(f"  Non-damaging groups:   "
+              f"{nondamaging_groups   if nondamaging_groups   else '(none)'}")
 
         # Per-query CV scores for the full model (needed for t-tests).
         print("  Computing per-query CV scores for full model ...")
@@ -1582,19 +1691,46 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
         )
         full_pq_mean = float(np.mean(full_pq))
 
+        # Each "atom" is something we can remove: a single feature or an entire group.
+        # Phase 2 then enumerates every non-empty combination of atoms.  Combinations
+        # that map to the same set of removed features are deduplicated (e.g.
+        # removing all 3 features of group A individually == removing group A).
+        atoms: List[Tuple[str, frozenset]] = []
+        for f in nondamaging_features:
+            atoms.append((f, frozenset({f})))
+        for g_full in nondamaging_groups:
+            g_short = g_full.split(":")[0].strip()
+            atoms.append((f"group_{g_short}", frozenset(FEATURE_GROUPS[g_full])))
+
         rows_p2: List[dict] = []
-        if not nondamaging:
-            print("  No non-damaging features found — phase 2 produces no combos.")
+        n_total_features = len(FEATURE_NAMES)
+        if not atoms:
+            print("  No non-damaging atoms (features or groups) found — "
+                  "phase 2 produces no combos.")
+            combo_labels: List[str] = []
+            combo_feats:  List[frozenset] = []
+            combo_cols_list: List[list] = []
         else:
-            combos_to_remove: List[List[str]] = []
-            for r in range(1, len(nondamaging) + 1):
-                for subset in itertools.combinations(nondamaging, r):
-                    combos_to_remove.append(list(subset))
-            combo_cols_list = [
-                [i for i, n in enumerate(FEATURE_NAMES) if n not in set(subset)]
-                for subset in combos_to_remove
-            ]
-            print(f"  Combinations to test: {len(combos_to_remove)}")
+            seen: set = set()
+            combo_labels = []
+            combo_feats  = []
+            combo_cols_list = []
+            for r in range(1, len(atoms) + 1):
+                for subset in itertools.combinations(atoms, r):
+                    feats = frozenset().union(*[a[1] for a in subset])
+                    if not feats:
+                        continue
+                    if len(feats) >= n_total_features:
+                        continue  # would leave the model with no features
+                    if feats in seen:
+                        continue
+                    seen.add(feats)
+                    combo_labels.append(",".join(a[0] for a in subset))
+                    combo_feats.append(feats)
+                    combo_cols_list.append(
+                        [i for i, n in enumerate(FEATURE_NAMES) if n not in feats]
+                    )
+            print(f"  Unique combinations to test: {len(combo_cols_list)}")
 
             t0 = time.time()
             pq_list = list(tqdm(
@@ -1610,18 +1746,30 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
             ))
             print(f"  Phase 2 elapsed: {time.time() - t0:.1f}s")
 
-            for subset, cols, pq in zip(combos_to_remove, combo_cols_list, pq_list):
+            # Run all t-tests, then apply Holm correction across the family
+            # of combo tests so that family-wise error stays controlled.
+            ttests = [paired_t_test(pq.tolist(), full_pq.tolist()) for pq in pq_list]
+            p_raw = [t["p"] for t in ttests]
+            rejected_holm, p_holm = holm_correction(p_raw, alpha=sig_alpha)
+
+            for (label, feats, cols, pq, ttest, rej_h, p_h) in zip(
+                combo_labels, combo_feats, combo_cols_list, pq_list,
+                ttests, rejected_holm, p_holm,
+            ):
                 mean_score = float(np.mean(pq))
-                ttest      = paired_t_test(pq.tolist(), full_pq.tolist())
-                sig_better = bool((ttest["p"] <= sig_alpha) and (ttest["mean_diff"] > 0))
+                # sig_better uses the Holm-corrected p-value (more conservative);
+                # the raw p-value is also reported for transparency.
+                sig_better = bool(rej_h and (ttest["mean_diff"] > 0))
                 rows_p2.append({
-                    "removed":           ",".join(subset),
-                    "n_removed":         len(subset),
+                    "removed":           label,
+                    "n_removed":         len(feats),
                     "n_features":        len(cols),
                     f"cv_ndcg@{ndcg_k}": mean_score,
                     "delta":             mean_score - full_pq_mean,
                     "t":                 ttest["t"],
                     "p_value":           ttest["p"],
+                    "p_holm":            float(p_h),
+                    "cohens_d":          ttest["d"],
                     "sig_better":        sig_better,
                     "feature_cols_json": json.dumps(cols),
                 })
@@ -1630,7 +1778,8 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
         save_csv_dicts(
             rows_p2,
             ["removed", "n_removed", "n_features", f"cv_ndcg@{ndcg_k}",
-             "delta", "t", "p_value", "sig_better", "feature_cols_json"],
+             "delta", "t", "p_value", "p_holm", "cohens_d",
+             "sig_better", "feature_cols_json"],
             p2_csv,
         )
         _plot_ablation_combos(rows_p2, full_pq_mean, ndcg_k, sig_alpha, p2_png)
@@ -2537,7 +2686,8 @@ def step_17_moe_decision_heatmap(cfg: dict) -> None:
     plt.colorbar(cf, ax=ax,
                  label="Predicted α  (1 = prefer BM25,  0 = prefer Dense)")
 
-    for ds_name, color in DS_PALETTE.items():
+    for ds_name in cfg["datasets"]:
+        color = DS_PALETTE.get(ds_name, DS_DEFAULT_COLOR)
         mask_td = np.array([d == ds_name for d in moe["ds_td"]])
         mask_te = np.array([d == ds_name for d in moe["ds_te"]])
         if mask_td.any():
@@ -2638,10 +2788,12 @@ def step_19_plot_moe_alphas(cfg: dict) -> None:
 def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
     print_step_header(20, "Recall@100 (test set)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
-    out_csv   = os.path.join(results_root, "recall_at_100.csv")
-    out_png   = os.path.join(results_root, "recall_at_100.png")
-    ttest_csv = os.path.join(results_root, "recall_ttest.csv")
-    if file_exists(out_csv) and file_exists(out_png) and file_exists(ttest_csv):
+    out_csv    = os.path.join(results_root, "recall_at_100.csv")
+    out_png    = os.path.join(results_root, "recall_at_100.png")
+    ttest_csv  = os.path.join(results_root, "recall_ttest.csv")
+    ci_csv     = os.path.join(results_root, "recall_ci.csv")
+    if (file_exists(out_csv) and file_exists(out_png)
+            and file_exists(ttest_csv) and file_exists(ci_csv)):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2658,14 +2810,16 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
     colors  = METHOD_COLORS_6 + ["#BBBBBB"]
 
     rows: List[dict] = []
-    # Accumulate per-query recall across all datasets for pairwise t-tests.
-    # Only METHOD_KEYS_6 (not union) participate in t-tests.
+    # Accumulate per-query recall across all datasets for pairwise t-tests
+    # (only METHOD_KEYS_6 — union is a ceiling reference, not a method).
     all_recalls: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    # Per-dataset per-method recalls for bootstrap CIs.
+    perdata_recalls: Dict[str, Dict[str, List[float]]] = {}
 
     for ds_name in cfg["datasets"]:
         bm25_res, dense_res, qrels = _load_active_retrieval(cfg, ds_name, device)
         test_qids = split[ds_name]["test"]
-        recalls = {m: [] for m in methods}
+        recalls: Dict[str, List[float]] = {m: [] for m in methods}
         for qid in test_qids:
             qrel = qrels.get(qid, {})
             if not qrel or all(g <= 0 for g in qrel.values()):
@@ -2682,11 +2836,11 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
             }
             cands["union"] = list({d for d, _ in bm} | {d for d, _ in de})
 
-            # Compute all METHOD_KEYS_6 recalls together so alignment is guaranteed.
-            pq_recalls = {}
+            # Compute all METHOD_KEYS_6 recalls together so per-query alignment
+            # across methods is guaranteed (paired t-tests need this).
+            pq_recalls: Dict[str, Optional[float]] = {}
             for m in METHOD_KEYS_6:
-                r = query_recall_at_k(cands[m], qrel, len(cands[m]))
-                pq_recalls[m] = r
+                pq_recalls[m] = query_recall_at_k(cands[m], qrel, len(cands[m]))
             if all(v is not None for v in pq_recalls.values()):
                 for m in METHOD_KEYS_6:
                     recalls[m].append(pq_recalls[m])
@@ -2695,6 +2849,8 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
             r_union = query_recall_at_k(cands["union"], qrel, len(cands["union"]))
             if r_union is not None:
                 recalls["union"].append(r_union)
+
+        perdata_recalls[ds_name] = recalls
 
         row = {"group": ds_name}
         for m in methods:
@@ -2714,44 +2870,90 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
     for r in rows:
         print(f"    {r['group']:<10} " + " ".join(f"{m}={r[m]:.3f}" for m in methods))
 
-    # Pairwise paired t-tests on per-query Recall@top_k (all test queries merged).
-    ttest_rows: List[dict] = []
-    for i, m_a in enumerate(METHOD_KEYS_6):
-        for m_b in METHOD_KEYS_6[i + 1:]:
-            res = paired_t_test(all_recalls[m_a], all_recalls[m_b])
-            sig = "yes" if res["p"] <= sig_alpha else "no"
-            ttest_rows.append({
-                "method_a":    m_a,
-                "method_b":    m_b,
-                "n":           res["n"],
-                "mean_diff":   res["mean_diff"],
-                "t":           res["t"],
-                "p_value":     res["p"],
-                "significant": sig,
-            })
-    save_csv_dicts(
-        ttest_rows,
-        ["method_a", "method_b", "n", "mean_diff", "t", "p_value", "significant"],
-        ttest_csv,
-    )
+    # ---- Bootstrap 95% CIs per (dataset, method) + macro ----
+    ci_rows: List[dict] = []
+    for ds_name in cfg["datasets"]:
+        for m in METHOD_KEYS_6:
+            mean, lo, hi = _bootstrap_ci(perdata_recalls[ds_name][m], cfg)
+            ci_rows.append({"group": ds_name, "method": m,
+                            "n": len(perdata_recalls[ds_name][m]),
+                            "mean": mean, "ci_low": lo, "ci_high": hi})
+    for m in METHOD_KEYS_6:
+        mean, lo, hi = _bootstrap_ci(all_recalls[m], cfg)
+        ci_rows.append({"group": "MACRO", "method": m,
+                        "n": len(all_recalls[m]),
+                        "mean": mean, "ci_low": lo, "ci_high": hi})
+    save_csv_dicts(ci_rows,
+                   ["group", "method", "n", "mean", "ci_low", "ci_high"], ci_csv)
+    print(f"  Recall@{top_k} bootstrap CIs saved to {ci_csv}")
+
+    # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
+    ttest_rows = _scoped_pairwise_tests(all_recalls, sig_alpha)
+    save_csv_dicts(ttest_rows, TTEST_FIELDS_BASE, ttest_csv)
     print(f"  Recall@{top_k} t-tests saved to {ttest_csv}")
     for r in ttest_rows:
         print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
-              f"Δ={r['mean_diff']:+.4f}  p={r['p_value']:.4f}  significant={r['significant']}")
+              f"Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
+              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
+              f"sig={r['significant']}/{r['significant_holm']}")
 
 
 # ------------------------------------------------------------
 # STEP 21 — Cross-encoder reranking
 # ------------------------------------------------------------
 
+def _rerank_vs_orig_rows(all_orig: Dict[str, List[float]],
+                          all_rer:  Dict[str, List[float]],
+                          methods: List[str],
+                          sig_alpha: float,
+                          metric_label: str) -> List[dict]:
+    """Per-method rerank-vs-original tests with Holm correction across the family."""
+    raws = []
+    p_values = []
+    for m in methods:
+        res = paired_t_test(all_rer[m], all_orig[m])
+        raws.append(res)
+        p_values.append(res["p"])
+    rejected, p_holm = holm_correction(p_values, alpha=sig_alpha)
+    rows = []
+    for m, res, rej, p_h in zip(methods, raws, rejected, p_holm):
+        rows.append({
+            "comparison":       "rerank_vs_orig",
+            "metric":           metric_label,
+            "method_a":         f"{m}_rerank",
+            "method_b":         f"{m}_orig",
+            "n":                res["n"],
+            "mean_diff":        res["mean_diff"],
+            "t":                res["t"],
+            "p_value":          res["p"],
+            "cohens_d":         res["d"],
+            "p_holm":           float(p_h),
+            "significant":      "yes" if res["p"] <= sig_alpha else "no",
+            "significant_holm": "yes" if bool(rej) else "no",
+        })
+    return rows
+
+
+TTEST_FIELDS_RERANK = [
+    "comparison", "metric", "method_a", "method_b", "n",
+    "mean_diff", "t", "p_value", "cohens_d", "p_holm",
+    "significant", "significant_holm",
+]
+
+
 def step_21_rerank(cfg: dict, device: torch.device) -> None:
     print_step_header(21, "Cross-encoder reranking (test set)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
-    out_csv   = os.path.join(results_root, "rerank_ndcg.csv")
-    out_png   = os.path.join(results_root, "rerank_ndcg.png")
-    out_gain  = os.path.join(results_root, "rerank_gain.png")
-    ttest_csv = os.path.join(results_root, "rerank_ttest.csv")
-    if file_exists(out_csv) and file_exists(out_png) and file_exists(out_gain) and file_exists(ttest_csv):
+    out_csv     = os.path.join(results_root, "rerank_ndcg.csv")
+    out_png     = os.path.join(results_root, "rerank_ndcg.png")
+    out_gain    = os.path.join(results_root, "rerank_gain.png")
+    out_mrr_csv = os.path.join(results_root, "rerank_mrr.csv")
+    out_mrr_png = os.path.join(results_root, "rerank_mrr.png")
+    out_mrr_gn  = os.path.join(results_root, "rerank_mrr_gain.png")
+    ttest_csv   = os.path.join(results_root, "rerank_ttest.csv")
+    if (file_exists(out_csv) and file_exists(out_png) and file_exists(out_gain)
+            and file_exists(out_mrr_csv) and file_exists(out_mrr_png)
+            and file_exists(out_mrr_gn) and file_exists(ttest_csv)):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2775,10 +2977,13 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
 
     ce_short = ce_name.replace("/", "_").replace("-", "_")
 
-    rows: List[dict] = []
-    # Global per-query scores across all datasets for significance testing.
-    all_orig: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
-    all_rer:  Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    ndcg_rows: List[dict] = []
+    mrr_rows:  List[dict] = []
+    # Global per-query NDCG/MRR across all datasets for significance testing.
+    all_orig_n: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    all_rer_n:  Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    all_orig_m: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    all_rer_m:  Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
 
     for ds_name in cfg["datasets"]:
         print(f"\n  --- {ds_name} ---")
@@ -2811,8 +3016,11 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
             cache_path, ce_model, bs, queries, corpus, required_pairs,
         )
 
-        orig: Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
-        rer:  Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
+        # Per-method per-query NDCG and MRR (original wRRF rank vs reranked).
+        orig_n: Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
+        rer_n:  Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
+        orig_m: Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
+        rer_m:  Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
         for qid in test_qids:
             qrel = qrels.get(qid, {})
             if not qrel or all(g <= 0 for g in qrel.values()):
@@ -2820,91 +3028,114 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
             for m in METHOD_KEYS_6:
                 doc_ids    = method_cands_by_qid[qid][m]
                 orig_pairs = [(d, 0.0) for d in doc_ids]   # order = wRRF rank
-                o_score    = query_ndcg_at_k(orig_pairs, qrel, ndcg_k)
-                reranked   = sorted(
+                o_n = query_ndcg_at_k(orig_pairs, qrel, ndcg_k)
+                o_m = query_mrr_at_k(orig_pairs,  qrel, ndcg_k)
+                reranked = sorted(
                     [(d, score_map.get((qid, d), -1e9)) for d in doc_ids],
                     key=lambda t: t[1], reverse=True,
                 )
-                r_score = query_ndcg_at_k(reranked, qrel, ndcg_k)
-                orig[m].append(o_score)
-                rer[m].append(r_score)
-                all_orig[m].append(o_score)
-                all_rer[m].append(r_score)
+                r_n = query_ndcg_at_k(reranked, qrel, ndcg_k)
+                r_m = query_mrr_at_k(reranked,  qrel, ndcg_k)
+                orig_n[m].append(o_n);  rer_n[m].append(r_n)
+                orig_m[m].append(o_m);  rer_m[m].append(r_m)
+                all_orig_n[m].append(o_n);  all_rer_n[m].append(r_n)
+                all_orig_m[m].append(o_m);  all_rer_m[m].append(r_m)
 
-        row = {"group": ds_name}
+        row_n = {"group": ds_name}
+        row_m = {"group": ds_name}
         for m in METHOD_KEYS_6:
-            row[f"{m}_orig"]   = float(np.mean(orig[m])) if orig[m] else 0.0
-            row[f"{m}_rerank"] = float(np.mean(rer[m]))  if rer[m]  else 0.0
-        rows.append(row)
+            row_n[f"{m}_orig"]   = float(np.mean(orig_n[m])) if orig_n[m] else 0.0
+            row_n[f"{m}_rerank"] = float(np.mean(rer_n[m]))  if rer_n[m]  else 0.0
+            row_m[f"{m}_orig"]   = float(np.mean(orig_m[m])) if orig_m[m] else 0.0
+            row_m[f"{m}_rerank"] = float(np.mean(rer_m[m]))  if rer_m[m]  else 0.0
+        ndcg_rows.append(row_n)
+        mrr_rows.append(row_m)
         print(f"    {ds_name}:")
         for m, lab in zip(METHOD_KEYS_6, METHOD_LABELS_6):
-            print(f"      {lab:<22} {row[f'{m}_orig']:.4f} -> {row[f'{m}_rerank']:.4f}  "
-                  f"(Δ {row[f'{m}_rerank']-row[f'{m}_orig']:+.4f})")
+            print(f"      {lab:<22} "
+                  f"NDCG {row_n[f'{m}_orig']:.4f} -> {row_n[f'{m}_rerank']:.4f}  "
+                  f"(Δ {row_n[f'{m}_rerank']-row_n[f'{m}_orig']:+.4f})  |  "
+                  f"MRR  {row_m[f'{m}_orig']:.4f} -> {row_m[f'{m}_rerank']:.4f}  "
+                  f"(Δ {row_m[f'{m}_rerank']-row_m[f'{m}_orig']:+.4f})")
 
-    macro = {"group": "MACRO"}
+    macro_n = {"group": "MACRO"}
+    macro_m = {"group": "MACRO"}
     for m in METHOD_KEYS_6:
-        macro[f"{m}_orig"]   = float(np.mean([r[f'{m}_orig']   for r in rows]))
-        macro[f"{m}_rerank"] = float(np.mean([r[f'{m}_rerank'] for r in rows]))
-    rows.append(macro)
+        macro_n[f"{m}_orig"]   = float(np.mean([r[f'{m}_orig']   for r in ndcg_rows]))
+        macro_n[f"{m}_rerank"] = float(np.mean([r[f'{m}_rerank'] for r in ndcg_rows]))
+        macro_m[f"{m}_orig"]   = float(np.mean([r[f'{m}_orig']   for r in mrr_rows]))
+        macro_m[f"{m}_rerank"] = float(np.mean([r[f'{m}_rerank'] for r in mrr_rows]))
+    ndcg_rows.append(macro_n)
+    mrr_rows.append(macro_m)
 
-    fieldnames = ["group"] + [f"{m}_{k}" for m in METHOD_KEYS_6 for k in ("orig", "rerank")]
-    save_csv_dicts(rows, fieldnames, out_csv)
+    fields_orig_rerank = ["group"] + [f"{m}_{k}" for m in METHOD_KEYS_6
+                                       for k in ("orig", "rerank")]
+    save_csv_dicts(ndcg_rows, fields_orig_rerank, out_csv)
+    save_csv_dicts(mrr_rows,  fields_orig_rerank, out_mrr_csv)
 
-    plot_rows = [{"group": r["group"], **{m: r[f"{m}_rerank"] for m in METHOD_KEYS_6}} for r in rows]
-    grouped_bar_chart(plot_rows, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+    # NDCG plots
+    plot_n = [{"group": r["group"], **{m: r[f"{m}_rerank"] for m in METHOD_KEYS_6}}
+              for r in ndcg_rows]
+    grouped_bar_chart(plot_n, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
                       ylabel=f"NDCG@{ndcg_k}",
                       title=f"NDCG@{ndcg_k} after Cross-Encoder Reranking",
                       out_path=out_png)
-
-    gain_rows = [{"group": r["group"],
-                  **{m: r[f"{m}_rerank"] - r[f"{m}_orig"] for m in METHOD_KEYS_6}} for r in rows]
-    grouped_bar_chart(gain_rows, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+    gain_n = [{"group": r["group"],
+               **{m: r[f"{m}_rerank"] - r[f"{m}_orig"] for m in METHOD_KEYS_6}}
+              for r in ndcg_rows]
+    grouped_bar_chart(gain_n, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
                       ylabel=f"Δ NDCG@{ndcg_k}",
                       title=f"NDCG@{ndcg_k} Gain from Cross-Encoder Reranking",
                       out_path=out_gain, yzero=False)
+    # MRR plots
+    plot_m = [{"group": r["group"], **{m: r[f"{m}_rerank"] for m in METHOD_KEYS_6}}
+              for r in mrr_rows]
+    grouped_bar_chart(plot_m, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+                      ylabel=f"MRR@{ndcg_k}",
+                      title=f"MRR@{ndcg_k} after Cross-Encoder Reranking",
+                      out_path=out_mrr_png)
+    gain_m = [{"group": r["group"],
+               **{m: r[f"{m}_rerank"] - r[f"{m}_orig"] for m in METHOD_KEYS_6}}
+              for r in mrr_rows]
+    grouped_bar_chart(gain_m, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+                      ylabel=f"Δ MRR@{ndcg_k}",
+                      title=f"MRR@{ndcg_k} Gain from Cross-Encoder Reranking",
+                      out_path=out_mrr_gn, yzero=False)
 
-    # Paired t-tests: for each method, does CE reranking significantly improve NDCG?
-    ttest_rows: List[dict] = []
-    print("\n  Rerank significance tests (reranked vs original per method):")
-    for m, lab in zip(METHOD_KEYS_6, METHOD_LABELS_6):
-        res = paired_t_test(all_rer[m], all_orig[m])   # reranked - original
-        sig = "yes" if res["p"] <= sig_alpha else "no"
-        ttest_rows.append({
-            "comparison":  "rerank_vs_orig",
-            "method_a":    f"{m}_rerank",
-            "method_b":    f"{m}_orig",
-            "n":           res["n"],
-            "mean_diff":   res["mean_diff"],
-            "t":           res["t"],
-            "p_value":     res["p"],
-            "significant": sig,
-        })
-        print(f"    {lab:<22}  Δ={res['mean_diff']:+.4f}  p={res['p']:.4f}  significant={sig}")
+    # ---- T-tests with Cohen's d + Holm correction ----
+    # Family A: rerank-vs-original per method, NDCG (6 tests, Holm within family)
+    rows_a = _rerank_vs_orig_rows(all_orig_n, all_rer_n, METHOD_KEYS_6,
+                                   sig_alpha, f"NDCG@{ndcg_k}")
+    # Family B: rerank-vs-original per method, MRR  (6 tests, Holm within family)
+    rows_b = _rerank_vs_orig_rows(all_orig_m, all_rer_m, METHOD_KEYS_6,
+                                   sig_alpha, f"MRR@{ndcg_k}")
+    # Family C: scoped pairwise NDCG between reranked methods (12 tests, Holm)
+    rows_c = _scoped_pairwise_tests(all_rer_n, sig_alpha,
+                                     comparison_tag=f"reranked_pairwise_NDCG@{ndcg_k}")
+    for r in rows_c:
+        r["metric"]   = f"NDCG@{ndcg_k}"
+        r["method_a"] = f"{r['method_a']}_rerank"
+        r["method_b"] = f"{r['method_b']}_rerank"
+    # Family D: scoped pairwise MRR between reranked methods (12 tests, Holm)
+    rows_d = _scoped_pairwise_tests(all_rer_m, sig_alpha,
+                                     comparison_tag=f"reranked_pairwise_MRR@{ndcg_k}")
+    for r in rows_d:
+        r["metric"]   = f"MRR@{ndcg_k}"
+        r["method_a"] = f"{r['method_a']}_rerank"
+        r["method_b"] = f"{r['method_b']}_rerank"
 
-    # Pairwise t-tests among reranked methods (15 pairs).
-    print("\n  Reranked method pairwise t-tests:")
-    for i, m_a in enumerate(METHOD_KEYS_6):
-        for m_b in METHOD_KEYS_6[i + 1:]:
-            res = paired_t_test(all_rer[m_a], all_rer[m_b])
-            sig = "yes" if res["p"] <= sig_alpha else "no"
-            ttest_rows.append({
-                "comparison":  "reranked_pairwise",
-                "method_a":    f"{m_a}_rerank",
-                "method_b":    f"{m_b}_rerank",
-                "n":           res["n"],
-                "mean_diff":   res["mean_diff"],
-                "t":           res["t"],
-                "p_value":     res["p"],
-                "significant": sig,
-            })
-            print(f"    {m_a}_rerank vs {m_b}_rerank  "
-                  f"Δ={res['mean_diff']:+.4f}  p={res['p']:.4f}  significant={sig}")
-
-    save_csv_dicts(
-        ttest_rows,
-        ["comparison", "method_a", "method_b", "n", "mean_diff", "t", "p_value", "significant"],
-        ttest_csv,
-    )
+    ttest_rows = rows_a + rows_b + rows_c + rows_d
+    save_csv_dicts(ttest_rows, TTEST_FIELDS_RERANK, ttest_csv)
+    print(f"\n  Rerank-vs-original (NDCG@{ndcg_k}):")
+    for r in rows_a:
+        print(f"    {r['method_a']:<22}  Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
+              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
+              f"sig={r['significant']}/{r['significant_holm']}")
+    print(f"\n  Rerank-vs-original (MRR@{ndcg_k}):")
+    for r in rows_b:
+        print(f"    {r['method_a']:<22}  Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
+              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
+              f"sig={r['significant']}/{r['significant_holm']}")
     print(f"  Rerank t-tests saved to {ttest_csv}")
 
 
@@ -2945,27 +3176,31 @@ def _ensure_ce_scores(cache_path: str, ce_model, batch_size: int,
 # ------------------------------------------------------------
 
 def step_22_significance(cfg: dict, device: torch.device) -> None:
-    print_step_header(22, "Paired t-tests on per-query NDCG@10")
+    rrf_k     = int(cfg["benchmark"]["rrf"]["k"])
+    ndcg_k    = int(cfg["benchmark"]["ndcg_k"])
+    sig_alpha = float(cfg.get("significance_test", {}).get("alpha", 0.05))
+    print_step_header(22, f"Paired t-tests on per-query NDCG@{ndcg_k}")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "significance_tests.csv")
-    if file_exists(out_csv):
+    ci_csv  = os.path.join(results_root, "ndcg_ci.csv")
+    if file_exists(out_csv) and file_exists(ci_csv):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
-    rrf_k  = int(cfg["benchmark"]["rrf"]["k"])
-    ndcg_k = int(cfg["benchmark"]["ndcg_k"])
-    split  = _load_split(cfg)
+    split = _load_split(cfg)
     weak_alphas   = _predict_weak(cfg)
     strong_alphas = _predict_strong(cfg)
     moe_alphas    = _predict_moe(cfg)
 
-    # Collect per-query NDCG@10 across all test queries (merged).
-    # Skip queries with no relevant docs — every method scores 0 on them, which
-    # collapses paired diffs to 0 and artificially inflates the t-statistic.
-    # Matches the filter used in steps 4, 20, and 21.
+    # Collect per-query NDCG across all test queries (merged) AND per-dataset
+    # for bootstrap CIs.  Skip queries with no relevant docs — every method
+    # scores 0 on them, which collapses paired diffs to 0 and artificially
+    # inflates the t-statistic.  Matches the filter used in steps 4, 20, 21.
     per_method_scores: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    perdata_scores: Dict[str, Dict[str, List[float]]] = {}
     for ds_name in cfg["datasets"]:
         bm25_res, dense_res, qrels = _load_active_retrieval(cfg, ds_name, device)
+        ds_scores: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
         for qid in split[ds_name]["test"]:
             qrel = qrels.get(qid, {})
             if not qrel or all(g <= 0 for g in qrel.values()):
@@ -2981,33 +3216,268 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
                 "moe":         wrrf_fuse(moe_alphas[(ds_name, qid)],    bm, de, rrf_k),
             }
             for m in METHOD_KEYS_6:
-                per_method_scores[m].append(query_ndcg_at_k(method_ranked[m], qrel, ndcg_k))
+                v = query_ndcg_at_k(method_ranked[m], qrel, ndcg_k)
+                per_method_scores[m].append(v)
+                ds_scores[m].append(v)
+        perdata_scores[ds_name] = ds_scores
 
-    rows: List[dict] = []
-    for i, m_a in enumerate(METHOD_KEYS_6):
-        for m_b in METHOD_KEYS_6[i + 1:]:
-            res = paired_t_test(per_method_scores[m_a], per_method_scores[m_b])
-            sig = "yes" if res["p"] <= float(cfg.get("significance_test", {}).get("alpha", 0.05)) else "no"
-            rows.append({
-                "method_a": m_a, "method_b": m_b,
-                "n":         res["n"],
-                "mean_diff": res["mean_diff"],
-                "t":         res["t"],
-                "p_value":   res["p"],
-                "significant": sig,
-            })
-    save_csv_dicts(
-        rows, ["method_a", "method_b", "n", "mean_diff", "t", "p_value", "significant"],
-        out_csv,
-    )
+    # ---- Bootstrap 95% CIs per (dataset, method) + macro ----
+    ci_rows: List[dict] = []
+    for ds_name in cfg["datasets"]:
+        for m in METHOD_KEYS_6:
+            mean, lo, hi = _bootstrap_ci(perdata_scores[ds_name][m], cfg)
+            ci_rows.append({"group": ds_name, "method": m,
+                            "n": len(perdata_scores[ds_name][m]),
+                            "mean": mean, "ci_low": lo, "ci_high": hi})
+    for m in METHOD_KEYS_6:
+        mean, lo, hi = _bootstrap_ci(per_method_scores[m], cfg)
+        ci_rows.append({"group": "MACRO", "method": m,
+                        "n": len(per_method_scores[m]),
+                        "mean": mean, "ci_low": lo, "ci_high": hi})
+    save_csv_dicts(ci_rows,
+                   ["group", "method", "n", "mean", "ci_low", "ci_high"], ci_csv)
+    print(f"  NDCG@{ndcg_k} bootstrap CIs saved to {ci_csv}")
+
+    # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
+    rows = _scoped_pairwise_tests(per_method_scores, sig_alpha)
+    save_csv_dicts(rows, TTEST_FIELDS_BASE, out_csv)
     print(f"  Saved {len(rows)} paired tests to {out_csv}")
     for r in rows:
         print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
-              f"Δ={r['mean_diff']:+.4f}  p={r['p_value']:.4f}  significant={r['significant']}")
+              f"Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
+              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
+              f"sig={r['significant']}/{r['significant_holm']}")
 
 
 # ------------------------------------------------------------
-# STEP 23 — End-to-end retrieval latency (ms / query)
+# STEP 23 — MRR@k (all 6 methods, before reranking)
+# ------------------------------------------------------------
+
+def step_23_mrr(cfg: dict, device: torch.device) -> None:
+    ndcg_k    = int(cfg["benchmark"]["ndcg_k"])
+    sig_alpha = float(cfg.get("significance_test", {}).get("alpha", 0.05))
+    print_step_header(23, f"MRR@{ndcg_k}  (test set, before reranking)")
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    out_csv   = os.path.join(results_root, "mrr_at_100.csv")
+    out_png   = os.path.join(results_root, "mrr_at_100.png")
+    ttest_csv = os.path.join(results_root, "mrr_ttest.csv")
+    ci_csv    = os.path.join(results_root, "mrr_ci.csv")
+    if (file_exists(out_csv) and file_exists(out_png)
+            and file_exists(ttest_csv) and file_exists(ci_csv)):
+        print(f"  [SKIP] {out_csv} already exists.")
+        return
+
+    weak_alphas   = _predict_weak(cfg)
+    strong_alphas = _predict_strong(cfg)
+    moe_alphas    = _predict_moe(cfg)
+    split  = _load_split(cfg)
+    rrf_k  = int(cfg["benchmark"]["rrf"]["k"])
+
+    rows: List[dict] = []
+    all_mrr: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    perdata_mrr: Dict[str, Dict[str, List[float]]] = {}
+
+    for ds_name in cfg["datasets"]:
+        bm25_res, dense_res, qrels = _load_active_retrieval(cfg, ds_name, device)
+        ds_scores: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+        for qid in split[ds_name]["test"]:
+            qrel = qrels.get(qid, {})
+            if not qrel or all(g <= 0 for g in qrel.values()):
+                continue
+            bm = bm25_res.get(qid, [])
+            de = dense_res.get(qid, [])
+            method_ranked = {
+                "bm25":        bm,
+                "dense":       de,
+                "static_rrf":  wrrf_fuse(0.5, bm, de, rrf_k),
+                "wrrf_weak":   wrrf_fuse(weak_alphas[(ds_name, qid)],   bm, de, rrf_k),
+                "wrrf_strong": wrrf_fuse(strong_alphas[(ds_name, qid)], bm, de, rrf_k),
+                "moe":         wrrf_fuse(moe_alphas[(ds_name, qid)],    bm, de, rrf_k),
+            }
+            for m in METHOD_KEYS_6:
+                v = query_mrr_at_k(method_ranked[m], qrel, ndcg_k)
+                if v is None:
+                    continue
+                ds_scores[m].append(v)
+                all_mrr[m].append(v)
+
+        perdata_mrr[ds_name] = ds_scores
+        row = {"group": ds_name}
+        for m in METHOD_KEYS_6:
+            row[m] = float(np.mean(ds_scores[m])) if ds_scores[m] else 0.0
+        rows.append(row)
+
+    macro = {"group": "MACRO"}
+    for m in METHOD_KEYS_6:
+        macro[m] = float(np.mean([r[m] for r in rows])) if rows else 0.0
+    rows.append(macro)
+
+    save_csv_dicts(rows, ["group"] + METHOD_KEYS_6, out_csv)
+    grouped_bar_chart(rows, METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+                      ylabel=f"MRR@{ndcg_k}",
+                      title=f"MRR@{ndcg_k} by Retrieval Method (before reranking)",
+                      out_path=out_png)
+    for r in rows:
+        print(f"    {r['group']:<10} " + " ".join(f"{m}={r[m]:.4f}" for m in METHOD_KEYS_6))
+
+    # ---- Bootstrap 95% CIs per (dataset, method) + macro ----
+    ci_rows: List[dict] = []
+    for ds_name in cfg["datasets"]:
+        for m in METHOD_KEYS_6:
+            mean, lo, hi = _bootstrap_ci(perdata_mrr[ds_name][m], cfg)
+            ci_rows.append({"group": ds_name, "method": m,
+                            "n": len(perdata_mrr[ds_name][m]),
+                            "mean": mean, "ci_low": lo, "ci_high": hi})
+    for m in METHOD_KEYS_6:
+        mean, lo, hi = _bootstrap_ci(all_mrr[m], cfg)
+        ci_rows.append({"group": "MACRO", "method": m,
+                        "n": len(all_mrr[m]),
+                        "mean": mean, "ci_low": lo, "ci_high": hi})
+    save_csv_dicts(ci_rows,
+                   ["group", "method", "n", "mean", "ci_low", "ci_high"], ci_csv)
+    print(f"  MRR@{ndcg_k} bootstrap CIs saved to {ci_csv}")
+
+    # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
+    ttest_rows = _scoped_pairwise_tests(all_mrr, sig_alpha)
+    save_csv_dicts(ttest_rows, TTEST_FIELDS_BASE, ttest_csv)
+    print(f"  MRR@{ndcg_k} t-tests saved to {ttest_csv}")
+    for r in ttest_rows:
+        print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
+              f"Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
+              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
+              f"sig={r['significant']}/{r['significant_holm']}")
+
+
+# ------------------------------------------------------------
+# STEP 24 — Hardware / environment metadata
+# ------------------------------------------------------------
+
+def step_24_hardware(cfg: dict, device: torch.device) -> None:
+    """Snapshot the host environment so latency / wall-clock numbers can be
+    interpreted later.  All collection is best-effort — missing values are
+    recorded as null.  Saves to data/results/hardware.json.
+    """
+    print_step_header(24, "Hardware / environment metadata")
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    out_json = os.path.join(results_root, "hardware.json")
+    if file_exists(out_json):
+        print(f"  [SKIP] {out_json} already exists.")
+        return
+
+    import platform
+    import socket
+    info: Dict[str, object] = {}
+
+    # Python / OS
+    info["python_version"] = platform.python_version()
+    info["platform"]       = platform.platform()
+    info["uname"]          = " ".join(platform.uname())
+    try:
+        info["hostname"]   = socket.gethostname()
+    except Exception:
+        info["hostname"]   = None
+    info["cpu_count"]      = os.cpu_count()
+    info["processor"]      = platform.processor() or platform.machine()
+
+    # Linux: pull friendlier fields when available.
+    if platform.system() == "Linux":
+        try:
+            with open("/etc/os-release", "r", encoding="utf-8") as f:
+                osr = {}
+                for line in f:
+                    if "=" in line:
+                        k, v = line.strip().split("=", 1)
+                        osr[k] = v.strip().strip('"')
+            info["linux_distro"]    = osr.get("PRETTY_NAME", osr.get("NAME"))
+            info["linux_distro_id"] = osr.get("ID")
+        except Exception:
+            pass
+        try:
+            cpu_models = []
+            with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("model name"):
+                        cpu_models.append(line.split(":", 1)[1].strip())
+                        break
+            info["cpu_model"] = cpu_models[0] if cpu_models else None
+        except Exception:
+            info["cpu_model"] = None
+        try:
+            mem_total_kb = None
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem_total_kb = int(line.split()[1])
+                        break
+            info["mem_total_gb"] = round(mem_total_kb / 1024 / 1024, 2) if mem_total_kb else None
+        except Exception:
+            info["mem_total_gb"] = None
+
+    # Library versions
+    info["torch_version"] = torch.__version__
+    info["numpy_version"] = np.__version__
+    try:
+        import scipy
+        info["scipy_version"] = scipy.__version__
+    except Exception:
+        info["scipy_version"] = None
+    try:
+        import sklearn
+        info["sklearn_version"] = sklearn.__version__
+    except Exception:
+        info["sklearn_version"] = None
+    try:
+        import sentence_transformers
+        info["sentence_transformers_version"] = sentence_transformers.__version__
+    except Exception:
+        info["sentence_transformers_version"] = None
+
+    # CUDA / GPU
+    info["cuda_available"] = bool(torch.cuda.is_available())
+    info["device_used"]    = str(device)
+    if torch.cuda.is_available():
+        info["cuda_version"]   = torch.version.cuda
+        info["cudnn_version"]  = torch.backends.cudnn.version()
+        info["gpu_count"]      = torch.cuda.device_count()
+        info["gpu_devices"]    = []
+        for i in range(torch.cuda.device_count()):
+            try:
+                props = torch.cuda.get_device_properties(i)
+                info["gpu_devices"].append({
+                    "index":              i,
+                    "name":               props.name,
+                    "total_memory_gb":    round(props.total_memory / 1024 / 1024 / 1024, 2),
+                    "multi_processor_count": getattr(props, "multi_processor_count", None),
+                    "compute_capability": f"{props.major}.{props.minor}",
+                })
+            except Exception:
+                info["gpu_devices"].append({"index": i, "name": None})
+    else:
+        info["cuda_version"]  = None
+        info["cudnn_version"] = None
+        info["gpu_count"]     = 0
+        info["gpu_devices"]   = []
+
+    # Pipeline run config snapshot (for reproducibility)
+    info["datasets"]   = list(cfg.get("datasets", []) or [])
+    info["benchmark"]  = cfg.get("benchmark", {})
+    info["embeddings_model"] = (cfg.get("embeddings", {}) or {}).get("model_name")
+    info["reranker_model"]   = (cfg.get("reranker",   {}) or {}).get("model_name")
+
+    save_json(info, out_json)
+    print(f"  Saved environment metadata to {out_json}")
+    for k in ("hostname", "linux_distro", "cpu_model", "mem_total_gb",
+              "cuda_version", "gpu_count"):
+        if k in info:
+            print(f"    {k:<14} = {info[k]}")
+    if info.get("gpu_devices"):
+        for g in info["gpu_devices"]:
+            print(f"    GPU[{g.get('index')}]       = {g.get('name')}  "
+                  f"({g.get('total_memory_gb')} GB)")
+
+
+# ------------------------------------------------------------
+# STEP 25 — End-to-end retrieval latency (ms / query)
 # ------------------------------------------------------------
 
 def _bm25_search_one(q_text: str, bm25, doc_ids: list, stemmer, top_k: int):
@@ -3036,8 +3506,13 @@ def _dense_search_one(q_text: str, st_model, corpus_embs: torch.Tensor,
     return pairs, q_vec
 
 
-def _plot_latency(rows: List[dict], out_path: str) -> None:
-    """Per-dataset grouped bar chart of mean latency in ms (no NDCG-style cap)."""
+def _plot_latency(rows: List[dict], out_path: str,
+                  key_for_method, ylabel: str, title: str) -> None:
+    """Per-dataset grouped bar chart of mean latency in ms (no NDCG-style cap).
+
+    `key_for_method(m)` returns the column key in `rows` to plot for method `m`
+    (e.g. ``m`` for raw retrieval, ``f"{m}_rer"`` for retrieval+CE rerank).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -3047,12 +3522,14 @@ def _plot_latency(rows: List[dict], out_path: str) -> None:
     n_m = len(METHOD_KEYS_6)
     width = 0.85 / max(n_m, 1)
     offsets = np.linspace(-(n_m - 1) / 2, (n_m - 1) / 2, n_m) * width
-    all_vals = [float(r[m]) for r in rows for m in METHOD_KEYS_6]
+    all_vals = [float(r[key_for_method(m)]) for r in rows for m in METHOD_KEYS_6]
     y_max = max(all_vals) * 1.18 if all_vals else 1.0
 
     fig, ax = plt.subplots(figsize=(16, 6))
-    for method, label, color, off in zip(METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6, offsets):
-        vals = [float(r[method]) for r in rows]
+    for method, label, color, off in zip(METHOD_KEYS_6, METHOD_LABELS_6,
+                                          METHOD_COLORS_6, offsets):
+        col = key_for_method(method)
+        vals = [float(r[col]) for r in rows]
         bars = ax.bar(x + off, vals, width, label=label, color=color,
                       alpha=0.85, edgecolor="white")
         for bar in bars:
@@ -3062,8 +3539,54 @@ def _plot_latency(rows: List[dict], out_path: str) -> None:
 
     ax.set_xticks(x)
     ax.set_xticklabels(groups, fontsize=10)
-    ax.set_ylabel("Mean latency (ms / query)", fontsize=10)
-    ax.set_title("End-to-end Retrieval Latency per Method (mean over test queries)",
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(title, fontsize=12)
+    ax.legend(fontsize=9, loc="upper left")
+    ax.set_ylim(0, y_max)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    ensure_dir(os.path.dirname(out_path))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_latency_overhead(rows: List[dict], out_path: str) -> None:
+    """Stacked bar chart: retrieval latency at the bottom, CE rerank overhead on top.
+
+    Visualises *how much* CE reranking adds on top of each method's retrieval
+    cost.  One bar group per dataset (+ MACRO), 6 method bars per group.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups = [r["group"] for r in rows]
+    x = np.arange(len(groups))
+    n_m = len(METHOD_KEYS_6)
+    width = 0.85 / max(n_m, 1)
+    offsets = np.linspace(-(n_m - 1) / 2, (n_m - 1) / 2, n_m) * width
+    totals = [float(r[f"{m}_rer"]) for r in rows for m in METHOD_KEYS_6]
+    y_max = max(totals) * 1.18 if totals else 1.0
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    for method, label, color, off in zip(METHOD_KEYS_6, METHOD_LABELS_6,
+                                          METHOD_COLORS_6, offsets):
+        retr  = [float(r[method]) for r in rows]
+        ce    = [float(r[f"{method}_ce_only"]) for r in rows]
+        ax.bar(x + off, retr,  width, color=color, alpha=0.85,
+               edgecolor="white", label=label)
+        ax.bar(x + off, ce,    width, bottom=retr, color=color, alpha=0.40,
+               edgecolor="white", hatch="//")
+        for i, (r_v, c_v) in enumerate(zip(retr, ce)):
+            ax.text(x[i] + off, r_v + c_v + y_max * 0.005,
+                    f"{r_v + c_v:.0f}", ha="center", va="bottom",
+                    fontsize=6, rotation=90)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, fontsize=10)
+    ax.set_ylabel("Mean latency (ms / query)  —  retrieval + CE rerank", fontsize=10)
+    ax.set_title("Retrieval Latency with Cross-Encoder Reranking Overhead\n"
+                 "(solid = retrieval, hatched = CE rerank addition)",
                  fontsize=12)
     ax.legend(fontsize=9, loc="upper left")
     ax.set_ylim(0, y_max)
@@ -3074,24 +3597,29 @@ def _plot_latency(rows: List[dict], out_path: str) -> None:
     plt.close(fig)
 
 
-def step_23_latency(cfg: dict, device: torch.device) -> None:
-    """End-to-end retrieval latency for the 6 methods on every test query.
+def step_25_latency(cfg: dict, device: torch.device) -> None:
+    """End-to-end retrieval latency for the 6 methods on every test query,
+    plus the additional latency that cross-encoder reranking adds.
 
-    Each method is timed *independently* (re-running BM25 / dense / model
-    inference per call) so the reported number reflects the cost of a
-    standalone deployment of that method.  CUDA work is synchronised before
-    and after each timed block.  A 3-query warmup primes the GPU and any
-    JIT caches.
+    Each method is timed *independently* (re-running BM25 / dense / router
+    inference per call) so the reported numbers reflect the cost of a
+    standalone deployment of that method.  After timing the original
+    retrieval, the top-k list it produced is fed to the CE reranker and the
+    extra latency is recorded separately.  CUDA work is synchronised before
+    and after every timed block.  A short warmup primes GPU + JIT caches.
     """
-    print_step_header(23, "Retrieval latency (ms / query, all 6 methods)")
+    print_step_header(25, "Retrieval latency (ms / query, all 6 methods + CE rerank)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
-    out_csv = os.path.join(results_root, "latency.csv")
-    out_png = os.path.join(results_root, "latency.png")
-    if file_exists(out_csv) and file_exists(out_png):
+    out_csv      = os.path.join(results_root, "latency.csv")
+    out_png      = os.path.join(results_root, "latency.png")
+    out_png_rer  = os.path.join(results_root, "latency_rerank.png")
+    out_png_ovh  = os.path.join(results_root, "latency_overhead.png")
+    if (file_exists(out_csv) and file_exists(out_png)
+            and file_exists(out_png_rer) and file_exists(out_png_ovh)):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer, CrossEncoder
 
     # Pre-load all router models (kept in memory for the full step).
     models_root = get_config_path(cfg, "models_folder", "data/models")
@@ -3099,19 +3627,25 @@ def step_23_latency(cfg: dict, device: torch.device) -> None:
     strong_b = load_pickle(os.path.join(models_root, "strong_model.pkl"))
     moe_b    = load_pickle(os.path.join(models_root, "moe_model.pkl"))
 
-    # Sentence transformer for query encoding (single shared instance).
+    # Sentence transformer + cross-encoder (loaded once, shared across datasets).
     st_model = SentenceTransformer(cfg["embeddings"]["model_name"], device=str(device))
+    rer_cfg  = cfg.get("reranker", {}) or {}
+    ce_name  = str(rer_cfg.get("model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
+    ce_bs    = int(rer_cfg.get("batch_size_cuda", 128) if device.type == "cuda"
+                   else rer_cfg.get("batch_size_cpu", 32))
+    ce_model = CrossEncoder(ce_name, max_length=512, device=str(device))
+    print(f"  CE reranker: {ce_name}  batch_size={ce_bs}")
 
-    bm25_params = get_active_bm25_params(cfg)
+    bm25_params  = get_active_bm25_params(cfg)
     use_stemming = bm25_params["use_stemming"]
     stemmer_lang = cfg["preprocessing"]["stemmer_language"]
-    english_sw = ensure_english_stopwords()
+    english_sw   = ensure_english_stopwords()
     if use_stemming:
         from nltk.stem.snowball import SnowballStemmer
-        stemmer = SnowballStemmer(stemmer_lang)
+        stemmer        = SnowballStemmer(stemmer_lang)
         stopword_stems = frozenset(stemmer.stem(w) for w in english_sw)
     else:
-        stemmer = None
+        stemmer        = None
         stopword_stems = frozenset(w.lower() for w in english_sw)
 
     rcfg = cfg.get("routing_features", {}) or {}
@@ -3132,16 +3666,20 @@ def step_23_latency(cfg: dict, device: torch.device) -> None:
             torch.cuda.synchronize()
 
     rows: List[dict] = []
-    macro_lat: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    macro_lat:    Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+    macro_lat_ce: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
 
     for ds_name in cfg["datasets"]:
         print(f"\n  --- {ds_name} ---")
-        ds_dir = dataset_processed_dir(cfg, ds_name)
-        sparse = bm25_artifact_paths(ds_dir, **bm25_params)
-        bm25 = load_pickle(sparse["bm25_pkl"])
+        ds_dir  = dataset_processed_dir(cfg, ds_name)
+        sparse  = bm25_artifact_paths(ds_dir, **bm25_params)
+        bm25    = load_pickle(sparse["bm25_pkl"])
         doc_ids = load_pickle(sparse["bm25_docids_pkl"])
         word_freq, total_corpus_tokens = load_pickle(sparse["word_freq_pkl"])
-        doc_freq, total_docs           = load_pickle(sparse["doc_freq_pkl"])
+        doc_freq,  total_docs          = load_pickle(sparse["doc_freq_pkl"])
+
+        # Corpus text dict for CE rerank lookups.
+        corpus_text = load_full_corpus(os.path.join(ds_dir, "corpus.jsonl"))
 
         # Move corpus embeddings to GPU once (or stay on CPU if OOM).
         corpus_embs = torch.load(os.path.join(ds_dir, "corpus_embeddings.pt"),
@@ -3155,129 +3693,200 @@ def step_23_latency(cfg: dict, device: torch.device) -> None:
                 cur_device = torch.device("cpu")
                 torch.cuda.empty_cache()
 
-        queries = load_queries(os.path.join(ds_dir, "queries.jsonl"))
+        queries   = load_queries(os.path.join(ds_dir, "queries.jsonl"))
         test_qids = split[ds_name]["test"]
+        if not test_qids:
+            print(f"  [WARN] no test queries for {ds_name}; skipping.")
+            del corpus_embs, corpus_text
+            if cur_device.type == "cuda":
+                torch.cuda.empty_cache()
+            continue
 
-        # Warmup (excluded from measurements).
+        # Warmup (excluded from measurements).  Includes a CE warmup.
         for qid in test_qids[:min(3, len(test_qids))]:
             q_text = queries[qid]
             _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
             _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
                               top_k, c_chunk, cur_device)
+        ce_model.predict([(queries[test_qids[0]], "warmup")],
+                         batch_size=ce_bs,
+                         show_progress_bar=False, convert_to_numpy=True)
         _sync()
 
-        lat: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+        lat:    Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
+        lat_ce: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
 
         for qid in tqdm(test_qids, desc=f"  latency [{ds_name}]", dynamic_ncols=True):
             q_text = queries[qid]
+            # Per-query: capture each method's final ranked list so we can
+            # rerank exactly what each method would have shipped.
+            method_topk: Dict[str, list] = {}
 
             # ---------------- bm25 ----------------
             t0 = time.perf_counter()
-            _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            bm_p, _ = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
             lat["bm25"].append((time.perf_counter() - t0) * 1000.0)
+            method_topk["bm25"] = bm_p
 
             # ---------------- dense ----------------
             _sync(); t0 = time.perf_counter()
-            _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
-                              top_k, c_chunk, cur_device)
+            de_p, _ = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                        top_k, c_chunk, cur_device)
             _sync(); lat["dense"].append((time.perf_counter() - t0) * 1000.0)
+            method_topk["dense"] = de_p
 
             # ---------------- static_rrf ----------------
             _sync(); t0 = time.perf_counter()
-            bm_p, _ = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
-            de_p, _ = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
-                                         top_k, c_chunk, cur_device)
-            wrrf_top_k(0.5, bm_p, de_p, rrf_k, top_k)
+            bm_sr, _    = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_sr, _    = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                            top_k, c_chunk, cur_device)
+            sr_topk = wrrf_top_k(0.5, bm_sr, de_sr, rrf_k, top_k)
             _sync(); lat["static_rrf"].append((time.perf_counter() - t0) * 1000.0)
+            method_topk["static_rrf"] = sr_topk
 
             # ---------------- wrrf_weak ----------------
             _sync(); t0 = time.perf_counter()
-            bm_p, q_tokens = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
-            de_p, _ = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
-                                         top_k, c_chunk, cur_device)
-            feats = _compute_query_features(
-                q_text, q_tokens, bm_p, de_p,
+            bm_w, q_tok_w = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_w, _       = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                              top_k, c_chunk, cur_device)
+            feats_w = _compute_query_features(
+                q_text, q_tok_w, bm_w, de_w,
                 word_freq, total_corpus_tokens, doc_freq, total_docs,
                 stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
             )
-            X = np.array([[feats[n] for n in FEATURE_NAMES]], dtype=np.float32)
-            X = X[:, weak_b["feature_cols"]]
-            X = (X - weak_b["scaler_mu"]) / weak_b["scaler_sigma"]
-            a_w = float(predict_alpha_from_model(weak_b["model"], X, weak_b["model_name"])[0])
-            wrrf_top_k(a_w, bm_p, de_p, rrf_k, top_k)
+            Xw = np.array([[feats_w[n] for n in FEATURE_NAMES]], dtype=np.float32)
+            Xw = Xw[:, weak_b["feature_cols"]]
+            Xw = (Xw - weak_b["scaler_mu"]) / weak_b["scaler_sigma"]
+            a_w = float(predict_alpha_from_model(weak_b["model"], Xw,
+                                                 weak_b["model_name"])[0])
+            ww_topk = wrrf_top_k(a_w, bm_w, de_w, rrf_k, top_k)
             _sync(); lat["wrrf_weak"].append((time.perf_counter() - t0) * 1000.0)
+            method_topk["wrrf_weak"] = ww_topk
 
             # ---------------- wrrf_strong ----------------
             _sync(); t0 = time.perf_counter()
-            bm_p, _ = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
-            de_p, q_vec = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
-                                             top_k, c_chunk, cur_device)
-            X_s = q_vec.detach().cpu().numpy().astype(np.float32)
-            X_s = (X_s - strong_b["scaler_mu"]) / strong_b["scaler_sigma"]
-            a_s = float(predict_alpha_from_model(strong_b["model"], X_s, strong_b["model_name"])[0])
-            wrrf_top_k(a_s, bm_p, de_p, rrf_k, top_k)
+            bm_s, _      = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_s, q_vec_s = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                               top_k, c_chunk, cur_device)
+            Xs = q_vec_s.detach().cpu().numpy().astype(np.float32)
+            Xs = (Xs - strong_b["scaler_mu"]) / strong_b["scaler_sigma"]
+            a_s = float(predict_alpha_from_model(strong_b["model"], Xs,
+                                                 strong_b["model_name"])[0])
+            ws_topk = wrrf_top_k(a_s, bm_s, de_s, rrf_k, top_k)
             _sync(); lat["wrrf_strong"].append((time.perf_counter() - t0) * 1000.0)
+            method_topk["wrrf_strong"] = ws_topk
 
             # ---------------- moe ----------------
             _sync(); t0 = time.perf_counter()
-            bm_p, q_tokens = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
-            de_p, q_vec = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
-                                             top_k, c_chunk, cur_device)
-            feats = _compute_query_features(
-                q_text, q_tokens, bm_p, de_p,
+            bm_m, q_tok_m = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
+            de_m, q_vec_m = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
+                                               top_k, c_chunk, cur_device)
+            feats_m = _compute_query_features(
+                q_text, q_tok_m, bm_m, de_m,
                 word_freq, total_corpus_tokens, doc_freq, total_docs,
                 stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
             )
-            Xw = np.array([[feats[n] for n in FEATURE_NAMES]], dtype=np.float32)
-            Xw = Xw[:, weak_b["feature_cols"]]
-            Xw = (Xw - weak_b["scaler_mu"]) / weak_b["scaler_sigma"]
-            a_w = float(predict_alpha_from_model(weak_b["model"], Xw, weak_b["model_name"])[0])
-            Xs = q_vec.detach().cpu().numpy().astype(np.float32)
-            Xs = (Xs - strong_b["scaler_mu"]) / strong_b["scaler_sigma"]
-            a_s = float(predict_alpha_from_model(strong_b["model"], Xs, strong_b["model_name"])[0])
-            Xm = _moe_features(np.array([a_w], dtype=np.float32),
-                               np.array([a_s], dtype=np.float32),
-                               moe_b["model_name"])
-            a_m = float(predict_alpha_from_model(moe_b["model"], Xm, moe_b["model_name"])[0])
-            wrrf_top_k(a_m, bm_p, de_p, rrf_k, top_k)
+            Xwm = np.array([[feats_m[n] for n in FEATURE_NAMES]], dtype=np.float32)
+            Xwm = Xwm[:, weak_b["feature_cols"]]
+            Xwm = (Xwm - weak_b["scaler_mu"]) / weak_b["scaler_sigma"]
+            a_w_m = float(predict_alpha_from_model(weak_b["model"], Xwm,
+                                                   weak_b["model_name"])[0])
+            Xsm = q_vec_m.detach().cpu().numpy().astype(np.float32)
+            Xsm = (Xsm - strong_b["scaler_mu"]) / strong_b["scaler_sigma"]
+            a_s_m = float(predict_alpha_from_model(strong_b["model"], Xsm,
+                                                   strong_b["model_name"])[0])
+            Xmm = _moe_features(np.array([a_w_m], dtype=np.float32),
+                                np.array([a_s_m], dtype=np.float32),
+                                moe_b["model_name"])
+            a_m = float(predict_alpha_from_model(moe_b["model"], Xmm,
+                                                 moe_b["model_name"])[0])
+            mo_topk = wrrf_top_k(a_m, bm_m, de_m, rrf_k, top_k)
             _sync(); lat["moe"].append((time.perf_counter() - t0) * 1000.0)
+            method_topk["moe"] = mo_topk
 
-        # Free GPU memory before the next dataset.
-        del corpus_embs
+            # ---------------- CE rerank latency per method ----------------
+            for m in METHOD_KEYS_6:
+                docs = [d for d, _ in method_topk[m]]
+                if not docs:
+                    lat_ce[m].append(0.0)
+                    continue
+                pair_texts = [(q_text, corpus_text.get(d, "")) for d in docs]
+                _sync(); t0 = time.perf_counter()
+                ce_model.predict(pair_texts, batch_size=ce_bs,
+                                 show_progress_bar=False, convert_to_numpy=True)
+                _sync()
+                lat_ce[m].append((time.perf_counter() - t0) * 1000.0)
+
+        # Free per-dataset memory before moving on.
+        del corpus_embs, corpus_text
         if cur_device.type == "cuda":
             torch.cuda.empty_cache()
 
         for m in METHOD_KEYS_6:
             macro_lat[m].extend(lat[m])
+            macro_lat_ce[m].extend(lat_ce[m])
 
         row = {"group": ds_name, "n": len(lat[METHOD_KEYS_6[0]])}
-        print(f"    {'method':<22}  {'mean':>8}  {'median':>8}  {'p95':>8}")
+        print(f"    {'method':<22}  {'retr':>9}  {'+CE':>8}  {'total':>9}  "
+              f"{'med':>8}  {'p95':>8}  {'med_rer':>9}  {'p95_rer':>9}")
         for m, lab in zip(METHOD_KEYS_6, METHOD_LABELS_6):
-            arr = np.array(lat[m], dtype=np.float64)
-            row[m]              = float(arr.mean())
-            row[f"{m}_median"]  = float(np.median(arr))
-            row[f"{m}_p95"]     = float(np.percentile(arr, 95))
+            arr     = np.array(lat[m],    dtype=np.float64)
+            arr_ce  = np.array(lat_ce[m], dtype=np.float64)
+            arr_tot = arr + arr_ce
+            row[m]                  = float(arr.mean())
+            row[f"{m}_median"]      = float(np.median(arr))
+            row[f"{m}_p95"]         = float(np.percentile(arr, 95))
+            row[f"{m}_ce_only"]     = float(arr_ce.mean())
+            row[f"{m}_rer"]         = float(arr_tot.mean())
+            row[f"{m}_rer_median"]  = float(np.median(arr_tot))
+            row[f"{m}_rer_p95"]     = float(np.percentile(arr_tot, 95))
             print(f"    {lab:<22}  {row[m]:>7.2f}ms  "
-                  f"{row[f'{m}_median']:>7.2f}ms  {row[f'{m}_p95']:>7.2f}ms")
+                  f"{row[f'{m}_ce_only']:>6.1f}ms  "
+                  f"{row[f'{m}_rer']:>7.2f}ms  "
+                  f"{row[f'{m}_median']:>6.2f}ms  "
+                  f"{row[f'{m}_p95']:>6.2f}ms  "
+                  f"{row[f'{m}_rer_median']:>7.2f}ms  "
+                  f"{row[f'{m}_rer_p95']:>7.2f}ms")
         rows.append(row)
 
     # Macro across all datasets (concatenated per-query latencies).
     macro_row = {"group": "MACRO",
                  "n": len(macro_lat[METHOD_KEYS_6[0]])}
     for m in METHOD_KEYS_6:
-        arr = np.array(macro_lat[m], dtype=np.float64)
-        macro_row[m]             = float(arr.mean())
-        macro_row[f"{m}_median"] = float(np.median(arr))
-        macro_row[f"{m}_p95"]    = float(np.percentile(arr, 95))
+        arr     = np.array(macro_lat[m],    dtype=np.float64)
+        arr_ce  = np.array(macro_lat_ce[m], dtype=np.float64)
+        arr_tot = arr + arr_ce
+        macro_row[m]                 = float(arr.mean())
+        macro_row[f"{m}_median"]     = float(np.median(arr))
+        macro_row[f"{m}_p95"]        = float(np.percentile(arr, 95))
+        macro_row[f"{m}_ce_only"]    = float(arr_ce.mean())
+        macro_row[f"{m}_rer"]        = float(arr_tot.mean())
+        macro_row[f"{m}_rer_median"] = float(np.median(arr_tot))
+        macro_row[f"{m}_rer_p95"]    = float(np.percentile(arr_tot, 95))
     rows.append(macro_row)
 
     fieldnames = ["group", "n"] + [
-        col for m in METHOD_KEYS_6 for col in (m, f"{m}_median", f"{m}_p95")
+        col for m in METHOD_KEYS_6
+        for col in (m, f"{m}_median", f"{m}_p95",
+                    f"{m}_ce_only", f"{m}_rer",
+                    f"{m}_rer_median", f"{m}_rer_p95")
     ]
     save_csv_dicts(rows, fieldnames, out_csv)
-    _plot_latency(rows, out_png)
+    _plot_latency(rows, out_png,
+                  key_for_method=lambda m: m,
+                  ylabel="Mean latency (ms / query)",
+                  title="End-to-end Retrieval Latency per Method "
+                        "(mean over test queries)")
+    _plot_latency(rows, out_png_rer,
+                  key_for_method=lambda m: f"{m}_rer",
+                  ylabel="Mean latency with CE rerank (ms / query)",
+                  title="Retrieval + Cross-Encoder Rerank Latency per Method")
+    _plot_latency_overhead(rows, out_png_ovh)
     print(f"\n  Latency CSV: {out_csv}")
-    print(f"  Latency PNG: {out_png}")
+    print(f"  Latency plots:")
+    print(f"    {out_png}     — retrieval only")
+    print(f"    {out_png_rer} — retrieval + CE rerank")
+    print(f"    {out_png_ovh} — stacked (retrieval / CE overhead)")
 
 
 # ============================================================
@@ -3319,7 +3928,9 @@ def main() -> None:
     step_20_recall_at_100(cfg, device)
     step_21_rerank(cfg, device)
     step_22_significance(cfg, device)
-    step_23_latency(cfg, device)
+    step_23_mrr(cfg, device)
+    step_24_hardware(cfg, device)
+    step_25_latency(cfg, device)
 
     print("\n\nPipeline complete.")
 

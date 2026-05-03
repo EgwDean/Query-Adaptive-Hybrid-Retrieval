@@ -394,6 +394,22 @@ def query_recall_at_k(retrieved_ids: Iterable[str],
     return len(relevant & set(top)) / len(relevant)
 
 
+def query_mrr_at_k(ranked_pairs: Sequence[Tuple[str, float]],
+                   rels: Dict[str, int], k: int) -> Optional[float]:
+    """Reciprocal Rank at k for a single query.
+
+    Returns 1 / rank_of_first_relevant_doc (within top-k), or 0.0 if no
+    relevant doc appears in the top-k.  Returns None when no relevant
+    document exists for the query (matches `query_recall_at_k`)."""
+    relevant = {d for d, g in rels.items() if g > 0}
+    if not relevant:
+        return None
+    for rank, (doc_id, _) in enumerate(ranked_pairs[:k], start=1):
+        if doc_id in relevant:
+            return 1.0 / rank
+    return 0.0
+
+
 # ============================================================
 # 8. wRRF fusion
 # ============================================================
@@ -667,27 +683,89 @@ def paired_t_test(scores_a: Sequence[float], scores_b: Sequence[float]) -> dict:
     """
     Two-sided paired t-test on per-query scores  (a - b).
 
-    Returns a dict with mean difference, t-statistic, p-value and the
-    number of queries used.  An empty / all-equal sample yields p = 1.0.
+    Returns a dict with mean difference, t-statistic, p-value, the number of
+    queries used, and Cohen's d for paired samples (mean_diff / sd_of_diff).
+    An empty / all-equal sample yields p = 1.0 and d = 0.0.
     """
     from scipy.stats import ttest_rel
 
     a = np.asarray(scores_a, dtype=np.float64)
     b = np.asarray(scores_b, dtype=np.float64)
     if len(a) == 0 or len(a) != len(b):
-        return {"n": int(min(len(a), len(b))), "mean_diff": 0.0, "t": 0.0, "p": 1.0}
+        return {"n": int(min(len(a), len(b))), "mean_diff": 0.0,
+                "t": 0.0, "p": 1.0, "d": 0.0}
 
     diff = a - b
     if np.allclose(diff, 0.0):
-        return {"n": int(len(a)), "mean_diff": 0.0, "t": 0.0, "p": 1.0}
+        return {"n": int(len(a)), "mean_diff": 0.0, "t": 0.0, "p": 1.0, "d": 0.0}
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = ttest_rel(a, b)
+
+    # Cohen's d for paired samples.  Guard against near-zero SD (would
+    # otherwise produce a meaningless huge number for degenerate inputs).
+    sd_diff = float(np.std(diff, ddof=1)) if len(diff) >= 2 else 0.0
+    cohens_d = float(np.mean(diff) / sd_diff) if sd_diff > 1e-12 else 0.0
 
     return {
         "n":         int(len(a)),
         "mean_diff": float(np.mean(diff)),
         "t":         float(result.statistic),
         "p":         float(result.pvalue),
+        "d":         cohens_d,
     }
+
+
+def bootstrap_ci_mean(scores: Sequence[float],
+                      n_resamples: int = 1000,
+                      ci: float = 0.95,
+                      seed: int = 42) -> Tuple[float, float, float]:
+    """Bootstrap CI for the mean of *scores*.
+
+    Vectorised resampling for speed.  Returns (mean, lower, upper).  An
+    empty array yields all zeros.  Identical seed → identical CI across
+    runs (reproducibility).
+    """
+    a = np.asarray(scores, dtype=np.float64)
+    if len(a) == 0:
+        return 0.0, 0.0, 0.0
+    if len(a) == 1:
+        v = float(a[0])
+        return v, v, v
+    rng = np.random.RandomState(seed)
+    idx = rng.randint(0, len(a), size=(int(n_resamples), len(a)))
+    boots = a[idx].mean(axis=1)
+    alpha = (1.0 - float(ci)) / 2.0
+    return (float(a.mean()),
+            float(np.percentile(boots, 100.0 * alpha)),
+            float(np.percentile(boots, 100.0 * (1.0 - alpha))))
+
+
+def holm_correction(p_values: Sequence[float],
+                    alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
+    """Holm-Bonferroni step-down family-wise correction.
+
+    Given a vector of raw p-values, returns:
+      - rejected: boolean array — True for hypotheses rejected at level *alpha*.
+      - p_adj:    Holm-adjusted p-values (monotone in sorted order, clipped to 1.0).
+
+    Standard procedure: order p-values ascending, multiply rank-i p-value by
+    (n - i + 1), then enforce monotonicity from smallest to largest.  A
+    hypothesis is rejected iff its adjusted p-value is <= alpha.
+    """
+    p = np.asarray(p_values, dtype=np.float64)
+    n = len(p)
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=np.float64)
+
+    order = np.argsort(p, kind="stable")
+    p_sorted = p[order]
+    multipliers = np.arange(n, 0, -1, dtype=np.float64)        # n, n-1, ..., 1
+    p_adj_sorted = np.maximum.accumulate(p_sorted * multipliers)
+    p_adj_sorted = np.minimum(p_adj_sorted, 1.0)
+
+    p_adj = np.empty(n, dtype=np.float64)
+    p_adj[order] = p_adj_sorted
+    rejected = p_adj <= float(alpha)
+    return rejected, p_adj
