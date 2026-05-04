@@ -318,6 +318,32 @@ def load_full_corpus(corpus_jsonl: str, batch_size: int = 1024) -> Dict[str, str
     return out
 
 
+def load_corpus_subset(corpus_jsonl: str,
+                       needed_doc_ids: Iterable[str]) -> Dict[str, str]:
+    """Single-pass streaming load of only the docs in *needed_doc_ids*.
+
+    Returns {doc_id: 'title text'}.  Stops early once every requested doc has
+    been found.  Memory-friendly alternative to `load_full_corpus` for the
+    cross-encoder reranker, which only needs a small fraction of the corpus.
+    """
+    needed = set(needed_doc_ids)
+    out: Dict[str, str] = {}
+    if not needed:
+        return out
+    with open(corpus_jsonl, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            doc_id = d.get("_id")
+            if doc_id in needed:
+                out[doc_id] = (d.get("title", "") + " " + d.get("text", "")).strip()
+                if len(out) == len(needed):
+                    break
+    return out
+
+
 # ============================================================
 # 6. Tokenisation
 # ============================================================
@@ -607,6 +633,67 @@ def grouped_bar_chart(rows: Sequence[dict],
     else:
         ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
 
+    fig.tight_layout()
+    ensure_dir(os.path.dirname(out_path))
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def grouped_bar_chart_with_ci(rows: Sequence[dict],
+                              methods: Sequence[str],
+                              labels: Sequence[str],
+                              colors: Sequence[str],
+                              ci_lookup: Callable[[str, str], Tuple[float, float, float]],
+                              ylabel: str,
+                              title: str,
+                              out_path: str,
+                              group_key: str = "group",
+                              figsize: Tuple[int, int] = (16, 6),
+                              y_max_cap: float = 1.0) -> None:
+    """Grouped bar chart with bootstrap-CI error bars.
+
+    `ci_lookup(group, method)` must return (mean, ci_low, ci_high).  Bars
+    show the mean and asymmetric error bars span [ci_low, ci_high].
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    groups = [r[group_key] for r in rows]
+    x = np.arange(len(groups))
+    n_m = len(methods)
+    width = 0.85 / max(n_m, 1)
+    offsets = np.linspace(-(n_m - 1) / 2, (n_m - 1) / 2, n_m) * width
+
+    fig, ax = plt.subplots(figsize=figsize)
+    all_highs: List[float] = []
+    for method, label, color, off in zip(methods, labels, colors, offsets):
+        means: List[float] = []
+        err_lo: List[float] = []
+        err_hi: List[float] = []
+        for g in groups:
+            m_, lo, hi = ci_lookup(g, method)
+            means.append(m_)
+            err_lo.append(max(0.0, m_ - lo))
+            err_hi.append(max(0.0, hi - m_))
+            all_highs.append(hi)
+        ax.bar(
+            x + off, means, width, label=label, color=color,
+            alpha=0.85, edgecolor="white",
+            yerr=[err_lo, err_hi], capsize=2,
+            error_kw=dict(ecolor="black", linewidth=0.7, alpha=0.8),
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(title, fontsize=12)
+    ax.legend(fontsize=9, loc="upper right")
+    if all_highs:
+        ax.set_ylim(0, min(y_max_cap, max(all_highs) + 0.05))
+    ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
+    ax.grid(True, axis="y", alpha=0.25)
     fig.tight_layout()
     ensure_dir(os.path.dirname(out_path))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")

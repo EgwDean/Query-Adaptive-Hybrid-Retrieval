@@ -30,7 +30,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -55,14 +55,15 @@ from src.utils import (
     download_beir_dataset,
     ensure_dir,
     ensure_english_stopwords,
-    file_exists,
     get_config_path,
     grouped_bar_chart,
+    grouped_bar_chart_with_ci,
     init_stem_worker,
     is_nonempty_file,
     kfold_indices,
     load_beir_dataset,
     load_config,
+    load_corpus_subset,
     load_csv_dicts,
     load_full_corpus,
     load_json,
@@ -198,7 +199,7 @@ def get_active_bm25_params(cfg: dict) -> dict:
     otherwise from cfg['bm25']."""
     results_root = get_config_path(cfg, "results_folder", "data/results")
     best_json = os.path.join(results_root, "bm25_best_params.json")
-    if file_exists(best_json):
+    if is_nonempty_file(best_json):
         d = load_json(best_json)
         return {"k1": float(d["k1"]), "b": float(d["b"]),
                 "use_stemming": bool(d["use_stemming"])}
@@ -371,10 +372,25 @@ def make_model(model_name: str, params: dict, seed: int):
 
 
 def predict_alpha_from_model(model, X, model_name: str) -> np.ndarray:
-    """Return clipped alpha predictions for any supported model family."""
+    """Return clipped alpha predictions for any supported model family.
+
+    Handles the degenerate case where a classifier saw a single class during
+    fit (proba shape (N, 1)) — in that case we emit that class's label as the
+    constant alpha rather than crashing on `proba[:, 1]`.
+    """
+    n = len(X)
     if model_name in CLASSIFIER_MODELS:
         proba = model.predict_proba(X)
-        return proba[:, 1].astype(np.float32)
+        classes = getattr(model, "classes_", np.array([0, 1]))
+        if proba.shape[1] == 1:
+            return np.full(n, float(classes[0]), dtype=np.float32)
+        # Locate the column for the positive ("alpha=1") class explicitly so
+        # we don't depend on column ordering when classes_ != [0, 1].
+        try:
+            pos_col = int(np.where(classes == 1)[0][0])
+        except IndexError:
+            pos_col = proba.shape[1] - 1
+        return proba[:, pos_col].astype(np.float32)
     preds = model.predict(X).astype(np.float32)
     return np.clip(preds, 0.0, 1.0)
 
@@ -395,6 +411,43 @@ def _scoped_pairwise_method_pairs() -> List[Tuple[str, str]]:
         for rj in ROUTER_METHODS[i + 1:]:
             pairs.append((ri, rj))
     return pairs
+
+
+def _plot_ci_from_csv(ci_csv: str,
+                      datasets: Sequence[str],
+                      methods: Sequence[str],
+                      labels: Sequence[str],
+                      colors: Sequence[str],
+                      ylabel: str,
+                      title: str,
+                      out_png: str,
+                      y_max_cap: float = 1.0) -> bool:
+    """Render a per-(dataset, method) bootstrap-CI bar chart from an existing
+    `*_ci.csv` (group, method, n, mean, ci_low, ci_high).  Returns True on
+    success.  Used by both the in-step plot generation and the standalone
+    "skip-but-still-make-the-plot" recovery path."""
+    if not is_nonempty_file(ci_csv):
+        return False
+    ci_rows = load_csv_dicts(ci_csv)
+    ci_dict: Dict[Tuple[str, str], Tuple[float, float, float]] = {
+        (r["group"], r["method"]): (
+            float(r["mean"]), float(r["ci_low"]), float(r["ci_high"])
+        )
+        for r in ci_rows
+    }
+    groups = list(datasets) + ["MACRO"]
+    rows = [{"group": g} for g in groups]
+
+    def _lookup(g: str, m: str) -> Tuple[float, float, float]:
+        return ci_dict.get((g, m), (0.0, 0.0, 0.0))
+
+    grouped_bar_chart_with_ci(
+        rows, methods, labels, colors,
+        ci_lookup=_lookup,
+        ylabel=ylabel, title=title, out_path=out_png,
+        y_max_cap=y_max_cap,
+    )
+    return True
 
 
 def _bootstrap_ci(scores: Sequence[float], cfg: dict) -> Tuple[float, float, float]:
@@ -572,31 +625,50 @@ def _preprocess_corpus_parallel(corpus_jsonl: str, output_jsonl: str,
         pbar.close()
 
 
-def _build_bm25_and_word_freq(tokenized_corpus_jsonl: str, k1: float, b: float):
-    """Build BM25 index plus the global token frequency index in one pass."""
+def _build_bm25_and_freq_indices(tokenized_corpus_jsonl: str, k1: float, b: float):
+    """Build BM25 index + word frequency + document frequency in a SINGLE pass.
+
+    Reading the tokenised corpus is the dominant I/O cost on large datasets
+    (e.g. trec-covid, 171k docs).  Computing both freq indices alongside the
+    BM25 input avoids a second full scan.  After BM25Okapi has copied the
+    tokens into its own internal arrays, we drop the local list to free the
+    transient ~200-500 MB Python-list memory before pickling.
+    """
     from rank_bm25 import BM25Okapi
 
     doc_ids: List[str] = []
     tokenized_docs: List[List[str]] = []
     global_counts: Dict[str, int] = {}
+    doc_freq: Dict[str, int] = {}
     total_tokens = 0
     n_lines = u.count_lines(tokenized_corpus_jsonl)
     with open(tokenized_corpus_jsonl, "r", encoding="utf-8") as f:
-        for line in tqdm(f, total=n_lines, desc="  Loading tokenized corpus", dynamic_ncols=True):
+        for line in tqdm(f, total=n_lines,
+                         desc="  Loading tokenized corpus (bm25 + freqs)",
+                         dynamic_ncols=True):
             d = json.loads(line)
             doc_ids.append(d["_id"])
             tokens = d["tokens"]
             tokenized_docs.append(tokens)
             for t in tokens:
                 global_counts[t] = global_counts.get(t, 0) + 1
+            for t in set(tokens):
+                doc_freq[t] = doc_freq.get(t, 0) + 1
             total_tokens += len(tokens)
+    total_docs = len(doc_ids)
 
-    print(f"  Building BM25 index over {len(doc_ids):,} documents ...")
+    print(f"  Building BM25 index over {total_docs:,} documents ...")
     bm25 = BM25Okapi(tokenized_docs, k1=k1, b=b)
-    return bm25, doc_ids, global_counts, total_tokens
+    # BM25Okapi keeps its own copy — release the transient Python-list memory
+    # before we pickle anything else.
+    del tokenized_docs
+    return bm25, doc_ids, global_counts, total_tokens, doc_freq, total_docs
 
 
-def _build_doc_freq(tokenized_corpus_jsonl: str):
+def _build_doc_freq_only(tokenized_corpus_jsonl: str):
+    """Compute (doc_freq, total_docs) without building BM25 — used only in
+    the rare case where bm25/word_freq are already cached but doc_freq is not.
+    """
     doc_freq: Dict[str, int] = {}
     total_docs = 0
     n_lines = u.count_lines(tokenized_corpus_jsonl)
@@ -766,11 +838,11 @@ def step_02_preprocess(cfg: dict, device: torch.device) -> None:
         if not need_bm25:
             print("  [4/5] BM25 + frequency indices cached.")
         else:
-            bm25, doc_ids, global_counts, total_tokens = _build_bm25_and_word_freq(
+            (bm25, doc_ids, global_counts, total_tokens,
+             doc_freq, total_docs) = _build_bm25_and_freq_indices(
                 sparse["tokenized_corpus_jsonl"],
                 k1=bm25_params["k1"], b=bm25_params["b"],
             )
-            doc_freq, total_docs = _build_doc_freq(sparse["tokenized_corpus_jsonl"])
             save_pickle(bm25, sparse["bm25_pkl"])
             save_pickle(doc_ids, sparse["bm25_docids_pkl"])
             save_pickle((global_counts, total_tokens), sparse["word_freq_pkl"])
@@ -827,19 +899,29 @@ def _ensure_sparse_for_params(cfg: dict, ds_name: str,
 
     needs_bm25 = not (is_nonempty_file(paths["bm25_pkl"])
                       and is_nonempty_file(paths["bm25_docids_pkl"]))
-    needs_freq = not (is_nonempty_file(paths["word_freq_pkl"])
-                      and is_nonempty_file(paths["doc_freq_pkl"]))
-    if needs_bm25 or needs_freq:
-        bm25, doc_ids, gc, tt = _build_bm25_and_word_freq(
-            paths["tokenized_corpus_jsonl"], k1=k1, b=b,
-        )
-        if needs_bm25:
-            save_pickle(bm25,    paths["bm25_pkl"])
-            save_pickle(doc_ids, paths["bm25_docids_pkl"])
-        if needs_freq:
-            df, td = _build_doc_freq(paths["tokenized_corpus_jsonl"])
-            save_pickle((gc, tt), paths["word_freq_pkl"])
+    needs_word_freq = not is_nonempty_file(paths["word_freq_pkl"])
+    needs_doc_freq  = not is_nonempty_file(paths["doc_freq_pkl"])
+
+    # Common case: nothing cached yet — build everything in one pass.
+    if needs_bm25 or needs_word_freq or needs_doc_freq:
+        if needs_bm25 or (needs_word_freq and needs_doc_freq):
+            (bm25, doc_ids, gc, tt,
+             df, td) = _build_bm25_and_freq_indices(
+                paths["tokenized_corpus_jsonl"], k1=k1, b=b,
+            )
+            if needs_bm25:
+                save_pickle(bm25,    paths["bm25_pkl"])
+                save_pickle(doc_ids, paths["bm25_docids_pkl"])
+            if needs_word_freq:
+                save_pickle((gc, tt), paths["word_freq_pkl"])
+            if needs_doc_freq:
+                save_pickle((df, td), paths["doc_freq_pkl"])
+        elif needs_doc_freq:
+            # Rare: only doc_freq missing — single small pass, no BM25 build.
+            df, td = _build_doc_freq_only(paths["tokenized_corpus_jsonl"])
             save_pickle((df, td), paths["doc_freq_pkl"])
+        # (needs_word_freq alone without bm25 is unreachable — they're saved
+        # together in step 2 — but the combined branch above would handle it.)
     return paths
 
 
@@ -869,7 +951,7 @@ def step_03_optimize_bm25(cfg: dict, device: torch.device) -> None:
     macro_csv = os.path.join(results_root, "bm25_grid_search.csv")
     best_json = os.path.join(results_root, "bm25_best_params.json")
 
-    if file_exists(best_json) and file_exists(macro_csv):
+    if is_nonempty_file(best_json) and is_nonempty_file(macro_csv):
         print(f"  [SKIP] {best_json} already exists.")
         return
 
@@ -948,7 +1030,7 @@ def _select_merged_qids(cfg: dict) -> Dict[str, List[str]]:
     """
     results_root = get_config_path(cfg, "results_folder", "data/results")
     cache_path   = os.path.join(results_root, "merged_qids.json")
-    if file_exists(cache_path):
+    if is_nonempty_file(cache_path):
         cached = load_json(cache_path)
         return {k: list(v) for k, v in cached.items()}
 
@@ -1005,6 +1087,10 @@ def _load_dense_results_with_cache(cfg: dict, ds_name: str, queries_jsonl: str,
     results = run_dense_retrieval(q_vecs, q_ids, corpus_embeddings, corpus_ids, top_k, cfg,
                                   desc=f"Dense retrieval [{ds_name}]")
     save_pickle(results, cache)
+    # Release the GPU/RAM working set before the next dataset's call.
+    del corpus_embeddings, q_vecs, corpus_ids, q_ids
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return results
 
 
@@ -1097,8 +1183,28 @@ def step_04_oracle_alpha(cfg: dict, device: torch.device) -> None:
     print_step_header(4, "Oracle alpha grid search (per query)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "oracle_alphas.csv")
-    if file_exists(out_csv):
+    out_json = os.path.join(results_root, "oracle_ndcg_per_dataset.json")
+    ndcg_k_skip = int(cfg["benchmark"]["ndcg_k"])
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_json):
         print(f"  [SKIP] {out_csv} already exists.")
+        return
+    # Recover path: alpha CSV exists but per-dataset JSON missing — regenerate
+    # only the JSON (cheap) without re-running the brute-force alpha grid.
+    if is_nonempty_file(out_csv) and not is_nonempty_file(out_json):
+        print(f"  [PARTIAL] {out_csv} present, regenerating {out_json} only.")
+        rows_cached = load_csv_dicts(out_csv)
+        avg = {}
+        for ds_name in cfg["datasets"]:
+            qrels_ds = load_qrels(os.path.join(
+                dataset_processed_dir(cfg, ds_name), "qrels.tsv"))
+            sub = [float(r["oracle_ndcg"]) for r in rows_cached
+                   if r["ds_name"] == ds_name
+                   and any(g > 0 for g in qrels_ds.get(r["qid"], {}).values())]
+            avg[ds_name] = float(np.mean(sub)) if sub else 0.0
+        avg["MACRO"] = float(np.mean(list(avg.values()))) if avg else 0.0
+        save_json(avg, out_json)
+        for k, v in avg.items():
+            print(f"    {k:<10}  oracle NDCG@{ndcg_k_skip} = {v:.4f}")
         return
 
     selected = _select_merged_qids(cfg)
@@ -1135,11 +1241,19 @@ def step_04_oracle_alpha(cfg: dict, device: torch.device) -> None:
     print(f"\n  Saved {len(rows)} oracle alphas to {out_csv}")
 
     # Also save the per-dataset average oracle NDCG for reference.
+    # Exclude queries with no relevant docs (oracle_ndcg forced to 0.0 by
+    # `_oracle_alpha_for_query`) so the reported macro isn't deflated by
+    # arithmetically averaging in unevaluable queries.  Matches the filter
+    # used in steps 20 / 22 / 23 / 21.
     avg = {}
     for ds_name in cfg["datasets"]:
-        sub = [r["oracle_ndcg"] for r in rows if r["ds_name"] == ds_name]
+        qrels_ds = load_qrels(os.path.join(
+            dataset_processed_dir(cfg, ds_name), "qrels.tsv"))
+        sub = [r["oracle_ndcg"] for r in rows
+               if r["ds_name"] == ds_name
+               and any(g > 0 for g in qrels_ds.get(r["qid"], {}).values())]
         avg[ds_name] = float(np.mean(sub)) if sub else 0.0
-    avg["MACRO"] = float(np.mean(list(avg.values())))
+    avg["MACRO"] = float(np.mean(list(avg.values()))) if avg else 0.0
     save_json(avg, os.path.join(results_root, "oracle_ndcg_per_dataset.json"))
     for k, v in avg.items():
         print(f"    {k:<10}  oracle NDCG@{ndcg_k} = {v:.4f}")
@@ -1153,7 +1267,7 @@ def _load_split(cfg: dict) -> Dict[str, dict]:
     """Read or compute the stratified train/dev/test split."""
     results_root = get_config_path(cfg, "results_folder", "data/results")
     cache_path   = os.path.join(results_root, "merged_split.json")
-    if file_exists(cache_path):
+    if is_nonempty_file(cache_path):
         return load_json(cache_path)
 
     selected = _select_merged_qids(cfg)
@@ -1310,7 +1424,7 @@ def step_05_weak_dataset(cfg: dict, device: torch.device) -> None:
     print_step_header(5, "Weak-model dataset (16 features + oracle alpha)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "weak_dataset.csv")
-    if file_exists(out_csv):
+    if is_nonempty_file(out_csv):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -1528,7 +1642,7 @@ def step_06_weak_grid_search(cfg: dict, device: torch.device) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv      = os.path.join(results_root, "weak_grid_search_top.csv")
     out_best     = os.path.join(results_root, "weak_best_params.json")
-    if file_exists(out_csv) and file_exists(out_best):
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_best):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -1609,7 +1723,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
     n_jobs    = 1 if torch.cuda.is_available() else -1
 
     # ── Phase 1: leave-one-feature-out + leave-one-group-out ─────────────
-    if not (file_exists(p1_csv) and file_exists(p1_png)):
+    if not (is_nonempty_file(p1_csv) and is_nonempty_file(p1_png)):
         print(f"\n  --- Phase 1: single feature / group ablation ---")
         print(f"  Using best model: {best_model_name}  {best_params}")
         configs_p1 = [("full", "full", "—", list(range(len(FEATURE_NAMES))))]
@@ -1664,7 +1778,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
         print(f"  [SKIP] Phase 1 already done ({p1_csv}).")
 
     # ── Phase 2: all subsets of non-damaging features AND non-damaging groups ──
-    if not (file_exists(p2_csv) and file_exists(p2_png)):
+    if not (is_nonempty_file(p2_csv) and is_nonempty_file(p2_png)):
         print(f"\n  --- Phase 2: combination ablation of non-damaging features + groups ---")
         rows_p1    = load_csv_dicts(p1_csv)
         full_score = float(next(r[f"cv_ndcg@{ndcg_k}"] for r in rows_p1
@@ -1793,7 +1907,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
         print(f"  [SKIP] Phase 2 already done ({p2_csv}).")
 
     # ── Final model: select feature set from phase 2 result ──────────────
-    if file_exists(final_pkl):
+    if is_nonempty_file(final_pkl):
         print(f"  [SKIP] Final model already built ({final_pkl}).")
         return
 
@@ -1998,23 +2112,37 @@ def _per_dataset_test_evaluate(cfg: dict, device: torch.device,
     return rows
 
 
+# Per-process cache for the test-split predictions of each router.  Each is
+# computed once per pipeline invocation and reused across steps 8–25.  Keyed
+# by (results_root, models_root) — robust to repeated calls from sibling
+# steps without parsing weak_dataset.csv (or unpickling the strong dataset)
+# every time.
+_PRED_CACHE: Dict[Tuple[str, str, str], Dict[Tuple[str, str], float]] = {}
+
+
 def _predict_weak(cfg: dict) -> Dict[Tuple[str, str], float]:
-    """Apply the saved weak model to every test-split query."""
-    bundle = load_pickle(os.path.join(
-        get_config_path(cfg, "models_folder", "data/models"), "weak_model.pkl"))
+    """Apply the saved weak model to every test-split query (cached)."""
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    models_root  = get_config_path(cfg, "models_folder", "data/models")
+    key = ("weak", results_root, models_root)
+    if key in _PRED_CACHE:
+        return _PRED_CACHE[key]
+
+    bundle = load_pickle(os.path.join(models_root, "weak_model.pkl"))
     cols   = bundle["feature_cols"]
     mu     = bundle["scaler_mu"]; sigma = bundle["scaler_sigma"]
     mn     = bundle["model_name"]
     mdl    = bundle["model"]
 
-    rows = load_csv_dicts(os.path.join(
-        get_config_path(cfg, "results_folder", "data/results"), "weak_dataset.csv"))
+    rows = load_csv_dicts(os.path.join(results_root, "weak_dataset.csv"))
     test = [r for r in rows if r["split"] == "test"]
     X = np.array([[float(r[k]) for k in FEATURE_NAMES] for r in test], dtype=np.float32)
     Xc = X[:, cols]
     Xz = (Xc - mu) / sigma
     preds = predict_alpha_from_model(mdl, Xz, mn)
-    return {(r["ds_name"], r["qid"]): float(p) for r, p in zip(test, preds)}
+    out = {(r["ds_name"], r["qid"]): float(p) for r, p in zip(test, preds)}
+    _PRED_CACHE[key] = out
+    return out
 
 
 def step_08_weak_retrieval_comparison(cfg: dict, device: torch.device) -> None:
@@ -2022,7 +2150,7 @@ def step_08_weak_retrieval_comparison(cfg: dict, device: torch.device) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "weak_retrieval_comparison.csv")
     out_png = os.path.join(results_root, "weak_retrieval_comparison.png")
-    if file_exists(out_csv) and file_exists(out_png):
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_png):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2055,7 +2183,7 @@ def step_09_plot_weak_alphas(cfg: dict) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     box_png    = os.path.join(results_root, "weak_alphas_boxplot.png")
     sorted_png = os.path.join(results_root, "weak_alphas_sorted.png")
-    if file_exists(box_png) and file_exists(sorted_png):
+    if is_nonempty_file(box_png) and is_nonempty_file(sorted_png):
         print(f"  [SKIP] alpha plots already exist.")
         return
 
@@ -2092,7 +2220,7 @@ def step_10_weak_shap(cfg: dict) -> None:
     print_step_header(10, "Weak SHAP (merged dataset)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_png      = os.path.join(results_root, "weak_shap.png")
-    if file_exists(out_png):
+    if is_nonempty_file(out_png):
         print(f"  [SKIP] {out_png} already exists.")
         return
 
@@ -2148,7 +2276,7 @@ def step_11_strong_dataset(cfg: dict, device: torch.device) -> None:
     print_step_header(11, "Strong-model dataset (BGE-M3 query embeddings)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_pkl = os.path.join(results_root, "strong_dataset.pkl")
-    if file_exists(out_pkl):
+    if is_nonempty_file(out_pkl):
         print(f"  [SKIP] {out_pkl} already exists.")
         return
 
@@ -2244,7 +2372,7 @@ def step_12_strong_grid_search(cfg: dict, device: torch.device) -> None:
     out_csv  = os.path.join(results_root, "strong_grid_search_top.csv")
     out_best = os.path.join(results_root, "strong_best_params.json")
     out_pkl  = os.path.join(models_root,  "strong_model.pkl")
-    if file_exists(out_csv) and file_exists(out_best) and file_exists(out_pkl):
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_best) and is_nonempty_file(out_pkl):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2312,9 +2440,14 @@ def step_12_strong_grid_search(cfg: dict, device: torch.device) -> None:
 
 
 def _predict_strong(cfg: dict) -> Dict[Tuple[str, str], float]:
-    """Apply the saved strong model to every test-split query."""
-    bundle = load_pickle(os.path.join(
-        get_config_path(cfg, "models_folder", "data/models"), "strong_model.pkl"))
+    """Apply the saved strong model to every test-split query (cached)."""
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    models_root  = get_config_path(cfg, "models_folder", "data/models")
+    key = ("strong", results_root, models_root)
+    if key in _PRED_CACHE:
+        return _PRED_CACHE[key]
+
+    bundle = load_pickle(os.path.join(models_root, "strong_model.pkl"))
     mu, sigma = bundle["scaler_mu"], bundle["scaler_sigma"]
     mn   = bundle["model_name"]
     mdl  = bundle["model"]
@@ -2322,7 +2455,9 @@ def _predict_strong(cfg: dict) -> Dict[Tuple[str, str], float]:
     ds = _load_strong_dataset(cfg)
     Xz = (ds["X_te"] - mu) / sigma
     preds = predict_alpha_from_model(mdl, Xz, mn)
-    return {(d, q): float(p) for d, q, p in zip(ds["ds_te"], ds["qids_te"], preds)}
+    out = {(d, q): float(p) for d, q, p in zip(ds["ds_te"], ds["qids_te"], preds)}
+    _PRED_CACHE[key] = out
+    return out
 
 
 # ------------------------------------------------------------
@@ -2334,7 +2469,7 @@ def step_13_strong_retrieval_comparison(cfg: dict, device: torch.device) -> None
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "strong_retrieval_comparison.csv")
     out_png = os.path.join(results_root, "strong_retrieval_comparison.png")
-    if file_exists(out_csv) and file_exists(out_png):
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_png):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2369,7 +2504,7 @@ def step_14_plot_strong_alphas(cfg: dict) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     box_png    = os.path.join(results_root, "strong_alphas_boxplot.png")
     sorted_png = os.path.join(results_root, "strong_alphas_sorted.png")
-    if file_exists(box_png) and file_exists(sorted_png):
+    if is_nonempty_file(box_png) and is_nonempty_file(sorted_png):
         print(f"  [SKIP] alpha plots already exist.")
         return
 
@@ -2451,7 +2586,7 @@ def step_15_moe_dataset(cfg: dict, device: torch.device) -> None:
     print_step_header(15, "MoE meta-learner dataset (OOF base predictions)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "moe_dataset.csv")
-    if file_exists(out_csv):
+    if is_nonempty_file(out_csv):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2580,7 +2715,7 @@ def step_16_moe_grid_search(cfg: dict, device: torch.device) -> None:
     out_csv  = os.path.join(results_root, "moe_grid_search_top.csv")
     out_best = os.path.join(results_root, "moe_best_params.json")
     out_pkl  = os.path.join(models_root,  "moe_model.pkl")
-    if file_exists(out_csv) and file_exists(out_best) and file_exists(out_pkl):
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_best) and is_nonempty_file(out_pkl):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2644,13 +2779,21 @@ def step_16_moe_grid_search(cfg: dict, device: torch.device) -> None:
 
 
 def _predict_moe(cfg: dict) -> Dict[Tuple[str, str], float]:
-    bundle = load_pickle(os.path.join(
-        get_config_path(cfg, "models_folder", "data/models"), "moe_model.pkl"))
+    """Apply the saved MoE model to every test-split query (cached)."""
+    results_root = get_config_path(cfg, "results_folder", "data/results")
+    models_root  = get_config_path(cfg, "models_folder", "data/models")
+    key = ("moe", results_root, models_root)
+    if key in _PRED_CACHE:
+        return _PRED_CACHE[key]
+
+    bundle = load_pickle(os.path.join(models_root, "moe_model.pkl"))
     mn  = bundle["model_name"]; mdl = bundle["model"]
     moe = _load_moe_dataset(cfg)
     X_te = _moe_features(moe["aw_te"], moe["as_te"], mn)
     preds = predict_alpha_from_model(mdl, X_te, mn)
-    return {(d, q): float(p) for d, q, p in zip(moe["ds_te"], moe["qid_te"], preds)}
+    out = {(d, q): float(p) for d, q, p in zip(moe["ds_te"], moe["qid_te"], preds)}
+    _PRED_CACHE[key] = out
+    return out
 
 
 # ------------------------------------------------------------
@@ -2661,7 +2804,7 @@ def step_17_moe_decision_heatmap(cfg: dict) -> None:
     print_step_header(17, "MoE decision heatmap")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_png = os.path.join(results_root, "moe_decision_heatmap.png")
-    if file_exists(out_png):
+    if is_nonempty_file(out_png):
         print(f"  [SKIP] {out_png} already exists.")
         return
 
@@ -2723,7 +2866,7 @@ def step_18_moe_retrieval_comparison(cfg: dict, device: torch.device) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "moe_retrieval_comparison.csv")
     out_png = os.path.join(results_root, "moe_retrieval_comparison.png")
-    if file_exists(out_csv) and file_exists(out_png):
+    if is_nonempty_file(out_csv) and is_nonempty_file(out_png):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2755,7 +2898,7 @@ def step_19_plot_moe_alphas(cfg: dict) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     box_png    = os.path.join(results_root, "moe_alphas_boxplot.png")
     sorted_png = os.path.join(results_root, "moe_alphas_sorted.png")
-    if file_exists(box_png) and file_exists(sorted_png):
+    if is_nonempty_file(box_png) and is_nonempty_file(sorted_png):
         print(f"  [SKIP] alpha plots already exist.")
         return
 
@@ -2792,8 +2935,19 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
     out_png    = os.path.join(results_root, "recall_at_100.png")
     ttest_csv  = os.path.join(results_root, "recall_ttest.csv")
     ci_csv     = os.path.join(results_root, "recall_ci.csv")
-    if (file_exists(out_csv) and file_exists(out_png)
-            and file_exists(ttest_csv) and file_exists(ci_csv)):
+    ci_png     = os.path.join(results_root, "recall_ci.png")
+    top_k_for_title = int(cfg["benchmark"]["top_k"])
+    if (is_nonempty_file(out_csv) and is_nonempty_file(out_png)
+            and is_nonempty_file(ttest_csv) and is_nonempty_file(ci_csv)):
+        if not is_nonempty_file(ci_png):
+            _plot_ci_from_csv(
+                ci_csv, cfg["datasets"],
+                METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+                ylabel=f"Recall@{top_k_for_title}",
+                title=f"Recall@{top_k_for_title} with 95% bootstrap CI",
+                out_png=ci_png,
+            )
+            print(f"  Generated CI plot from cached CSV: {ci_png}")
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2886,6 +3040,14 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
     save_csv_dicts(ci_rows,
                    ["group", "method", "n", "mean", "ci_low", "ci_high"], ci_csv)
     print(f"  Recall@{top_k} bootstrap CIs saved to {ci_csv}")
+    _plot_ci_from_csv(
+        ci_csv, cfg["datasets"],
+        METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+        ylabel=f"Recall@{top_k}",
+        title=f"Recall@{top_k} with 95% bootstrap CI",
+        out_png=ci_png,
+    )
+    print(f"  Recall@{top_k} CI plot saved to {ci_png}")
 
     # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
     ttest_rows = _scoped_pairwise_tests(all_recalls, sig_alpha)
@@ -2951,9 +3113,9 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
     out_mrr_png = os.path.join(results_root, "rerank_mrr.png")
     out_mrr_gn  = os.path.join(results_root, "rerank_mrr_gain.png")
     ttest_csv   = os.path.join(results_root, "rerank_ttest.csv")
-    if (file_exists(out_csv) and file_exists(out_png) and file_exists(out_gain)
-            and file_exists(out_mrr_csv) and file_exists(out_mrr_png)
-            and file_exists(out_mrr_gn) and file_exists(ttest_csv)):
+    if (is_nonempty_file(out_csv) and is_nonempty_file(out_png) and is_nonempty_file(out_gain)
+            and is_nonempty_file(out_mrr_csv) and is_nonempty_file(out_mrr_png)
+            and is_nonempty_file(out_mrr_gn) and is_nonempty_file(ttest_csv)):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -2989,7 +3151,6 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
         print(f"\n  --- {ds_name} ---")
         bm25_res, dense_res, qrels = _load_active_retrieval(cfg, ds_name, device)
         ds_dir  = dataset_processed_dir(cfg, ds_name)
-        corpus  = load_full_corpus(os.path.join(ds_dir, "corpus.jsonl"))
         queries = load_queries(os.path.join(ds_dir, "queries.jsonl"))
         test_qids = split[ds_name]["test"]
 
@@ -3011,10 +3172,18 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
                 for doc_id in cands[m]:
                     required_pairs.add((qid, doc_id))
 
+        # Stream-load only the doc texts we'll actually rerank — for
+        # trec-covid this slashes the working set from ~700 MB to ~10-50 MB.
+        needed_doc_ids = {d for _, d in required_pairs}
+        corpus = load_corpus_subset(
+            os.path.join(ds_dir, "corpus.jsonl"), needed_doc_ids,
+        )
+
         cache_path = os.path.join(results_root, f"rerank_scores_{ce_short}_{ds_name}.pkl")
         score_map = _ensure_ce_scores(
             cache_path, ce_model, bs, queries, corpus, required_pairs,
         )
+        del corpus
 
         # Per-method per-query NDCG and MRR (original wRRF rank vs reranked).
         orig_n: Dict[str, list] = {m: [] for m in METHOD_KEYS_6}
@@ -3142,32 +3311,47 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
 def _ensure_ce_scores(cache_path: str, ce_model, batch_size: int,
                       queries: Dict[str, str], corpus: Dict[str, str],
                       required_pairs: set) -> Dict[Tuple[str, str], float]:
-    """Cached cross-encoder scoring for a set of (qid, doc_id) pairs."""
-    if file_exists(cache_path):
+    """Cached cross-encoder scoring for a set of (qid, doc_id) pairs.
+
+    Behaviour:
+      - Full cache hit  → return cached as-is.
+      - Partial hit     → score ONLY the missing pairs and merge with the
+                          cached scores (so we never re-pay for pairs we
+                          already have).
+      - Corrupt / missing → score all required pairs from scratch.
+    """
+    cached: Dict[Tuple[str, str], float] = {}
+    if is_nonempty_file(cache_path):
         try:
             cached = load_pickle(cache_path)
-            if all(p in cached for p in required_pairs):
-                print(f"  CE cache hit ({len(required_pairs):,} pairs).")
-                return cached
-            print(f"  CE cache partial — rebuilding.")
+            if not isinstance(cached, dict):
+                cached = {}
         except Exception as exc:
-            print(f"  [WARN] CE cache corrupt: {exc}; rebuilding.")
+            print(f"  [WARN] CE cache corrupt: {exc}; rebuilding from scratch.")
+            cached = {}
 
-    pair_list   = sorted(required_pairs)   # deterministic order
-    pair_texts: List[Tuple[str, str]] = []
-    for qid, doc_id in pair_list:
-        q_text = queries.get(qid, "")
-        d_text = corpus.get(doc_id, "")
-        pair_texts.append((q_text, d_text))
+    missing = [p for p in required_pairs if p not in cached]
+    if not missing:
+        print(f"  CE cache hit ({len(required_pairs):,} pairs).")
+        return cached
 
-    print(f"  Scoring {len(pair_texts):,} unique (q, d) pairs ...")
+    print(f"  CE cache: {len(cached):,} reusable, "
+          f"{len(missing):,} new — scoring missing only.")
+    pair_list  = sorted(missing)            # deterministic order
+    pair_texts: List[Tuple[str, str]] = [
+        (queries.get(qid, ""), corpus.get(doc_id, ""))
+        for qid, doc_id in pair_list
+    ]
     scores = ce_model.predict(
         pair_texts, batch_size=batch_size,
         show_progress_bar=True, convert_to_numpy=True,
     )
-    out = {pair: float(scores[i]) for i, pair in enumerate(pair_list)}
+    # Merge into the existing cache (preserving prior scores).
+    out = dict(cached)
+    for i, pair in enumerate(pair_list):
+        out[pair] = float(scores[i])
     save_pickle(out, cache_path)
-    print(f"  CE scores cached: {cache_path}")
+    print(f"  CE scores cached: {cache_path}  ({len(out):,} pairs total)")
     return out
 
 
@@ -3183,7 +3367,17 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "significance_tests.csv")
     ci_csv  = os.path.join(results_root, "ndcg_ci.csv")
-    if file_exists(out_csv) and file_exists(ci_csv):
+    ci_png  = os.path.join(results_root, "ndcg_ci.png")
+    if is_nonempty_file(out_csv) and is_nonempty_file(ci_csv):
+        if not is_nonempty_file(ci_png):
+            _plot_ci_from_csv(
+                ci_csv, cfg["datasets"],
+                METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+                ylabel=f"NDCG@{ndcg_k}",
+                title=f"NDCG@{ndcg_k} with 95% bootstrap CI",
+                out_png=ci_png,
+            )
+            print(f"  Generated CI plot from cached CSV: {ci_png}")
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -3237,6 +3431,14 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
     save_csv_dicts(ci_rows,
                    ["group", "method", "n", "mean", "ci_low", "ci_high"], ci_csv)
     print(f"  NDCG@{ndcg_k} bootstrap CIs saved to {ci_csv}")
+    _plot_ci_from_csv(
+        ci_csv, cfg["datasets"],
+        METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+        ylabel=f"NDCG@{ndcg_k}",
+        title=f"NDCG@{ndcg_k} with 95% bootstrap CI",
+        out_png=ci_png,
+    )
+    print(f"  NDCG@{ndcg_k} CI plot saved to {ci_png}")
 
     # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
     rows = _scoped_pairwise_tests(per_method_scores, sig_alpha)
@@ -3262,8 +3464,18 @@ def step_23_mrr(cfg: dict, device: torch.device) -> None:
     out_png   = os.path.join(results_root, "mrr_at_100.png")
     ttest_csv = os.path.join(results_root, "mrr_ttest.csv")
     ci_csv    = os.path.join(results_root, "mrr_ci.csv")
-    if (file_exists(out_csv) and file_exists(out_png)
-            and file_exists(ttest_csv) and file_exists(ci_csv)):
+    ci_png    = os.path.join(results_root, "mrr_ci.png")
+    if (is_nonempty_file(out_csv) and is_nonempty_file(out_png)
+            and is_nonempty_file(ttest_csv) and is_nonempty_file(ci_csv)):
+        if not is_nonempty_file(ci_png):
+            _plot_ci_from_csv(
+                ci_csv, cfg["datasets"],
+                METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+                ylabel=f"MRR@{ndcg_k}",
+                title=f"MRR@{ndcg_k} with 95% bootstrap CI",
+                out_png=ci_png,
+            )
+            print(f"  Generated CI plot from cached CSV: {ci_png}")
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -3336,6 +3548,14 @@ def step_23_mrr(cfg: dict, device: torch.device) -> None:
     save_csv_dicts(ci_rows,
                    ["group", "method", "n", "mean", "ci_low", "ci_high"], ci_csv)
     print(f"  MRR@{ndcg_k} bootstrap CIs saved to {ci_csv}")
+    _plot_ci_from_csv(
+        ci_csv, cfg["datasets"],
+        METHOD_KEYS_6, METHOD_LABELS_6, METHOD_COLORS_6,
+        ylabel=f"MRR@{ndcg_k}",
+        title=f"MRR@{ndcg_k} with 95% bootstrap CI",
+        out_png=ci_png,
+    )
+    print(f"  MRR@{ndcg_k} CI plot saved to {ci_png}")
 
     # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
     ttest_rows = _scoped_pairwise_tests(all_mrr, sig_alpha)
@@ -3360,7 +3580,7 @@ def step_24_hardware(cfg: dict, device: torch.device) -> None:
     print_step_header(24, "Hardware / environment metadata")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_json = os.path.join(results_root, "hardware.json")
-    if file_exists(out_json):
+    if is_nonempty_file(out_json):
         print(f"  [SKIP] {out_json} already exists.")
         return
 
@@ -3614,8 +3834,8 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
     out_png      = os.path.join(results_root, "latency.png")
     out_png_rer  = os.path.join(results_root, "latency_rerank.png")
     out_png_ovh  = os.path.join(results_root, "latency_overhead.png")
-    if (file_exists(out_csv) and file_exists(out_png)
-            and file_exists(out_png_rer) and file_exists(out_png_ovh)):
+    if (is_nonempty_file(out_csv) and is_nonempty_file(out_png)
+            and is_nonempty_file(out_png_rer) and is_nonempty_file(out_png_ovh)):
         print(f"  [SKIP] {out_csv} already exists.")
         return
 
@@ -3666,8 +3886,6 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
             torch.cuda.synchronize()
 
     rows: List[dict] = []
-    macro_lat:    Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
-    macro_lat_ce: Dict[str, List[float]] = {m: [] for m in METHOD_KEYS_6}
 
     for ds_name in cfg["datasets"]:
         print(f"\n  --- {ds_name} ---")
@@ -3822,10 +4040,6 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
         if cur_device.type == "cuda":
             torch.cuda.empty_cache()
 
-        for m in METHOD_KEYS_6:
-            macro_lat[m].extend(lat[m])
-            macro_lat_ce[m].extend(lat_ce[m])
-
         row = {"group": ds_name, "n": len(lat[METHOD_KEYS_6[0]])}
         print(f"    {'method':<22}  {'retr':>9}  {'+CE':>8}  {'total':>9}  "
               f"{'med':>8}  {'p95':>8}  {'med_rer':>9}  {'p95_rer':>9}")
@@ -3849,20 +4063,21 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
                   f"{row[f'{m}_rer_p95']:>7.2f}ms")
         rows.append(row)
 
-    # Macro across all datasets (concatenated per-query latencies).
+    # Macro = mean of per-dataset summary statistics (matches the
+    # dataset-weighted aggregation used by every other macro in the pipeline:
+    # NDCG, MRR, recall).  Median / p95 macros are means of per-dataset
+    # medians / p95s — not statistically identical to a global percentile but
+    # consistent with how this codebase reports per-dataset → MACRO.
     macro_row = {"group": "MACRO",
-                 "n": len(macro_lat[METHOD_KEYS_6[0]])}
+                 "n": int(np.sum([r["n"] for r in rows])) if rows else 0}
     for m in METHOD_KEYS_6:
-        arr     = np.array(macro_lat[m],    dtype=np.float64)
-        arr_ce  = np.array(macro_lat_ce[m], dtype=np.float64)
-        arr_tot = arr + arr_ce
-        macro_row[m]                 = float(arr.mean())
-        macro_row[f"{m}_median"]     = float(np.median(arr))
-        macro_row[f"{m}_p95"]        = float(np.percentile(arr, 95))
-        macro_row[f"{m}_ce_only"]    = float(arr_ce.mean())
-        macro_row[f"{m}_rer"]        = float(arr_tot.mean())
-        macro_row[f"{m}_rer_median"] = float(np.median(arr_tot))
-        macro_row[f"{m}_rer_p95"]    = float(np.percentile(arr_tot, 95))
+        macro_row[m]                 = float(np.mean([r[m] for r in rows])) if rows else 0.0
+        macro_row[f"{m}_median"]     = float(np.mean([r[f"{m}_median"]     for r in rows])) if rows else 0.0
+        macro_row[f"{m}_p95"]        = float(np.mean([r[f"{m}_p95"]        for r in rows])) if rows else 0.0
+        macro_row[f"{m}_ce_only"]    = float(np.mean([r[f"{m}_ce_only"]    for r in rows])) if rows else 0.0
+        macro_row[f"{m}_rer"]        = float(np.mean([r[f"{m}_rer"]        for r in rows])) if rows else 0.0
+        macro_row[f"{m}_rer_median"] = float(np.mean([r[f"{m}_rer_median"] for r in rows])) if rows else 0.0
+        macro_row[f"{m}_rer_p95"]    = float(np.mean([r[f"{m}_rer_p95"]    for r in rows])) if rows else 0.0
     rows.append(macro_row)
 
     fieldnames = ["group", "n"] + [
