@@ -6,151 +6,172 @@ Diploma Thesis — Konstantinos Anastasopoulos, CEID
 
 ## Problem
 
-Standard retrieval systems apply a fixed strategy to every query. For some queries
-BM25 (sparse, lexical matching) is the better retriever; for others a dense
-embedding model is. A query-adaptive system learns to weight the two methods
-per query, improving retrieval quality across diverse query types.
+Standard retrieval systems apply a fixed strategy to every query.  For some
+queries BM25 (sparse, lexical matching) is the better retriever; for others
+a dense embedding model is.  A query-adaptive system learns to predict, for
+each individual query, how much to trust BM25 vs. dense retrieval.
+
+Different queries have fundamentally different needs:
+- A clinical keyword query like *"COVID-19 ACE2 receptor binding"* needs
+  exact term matching — BM25.
+- A paraphrase-heavy question like *"what makes chocolate pleasurable"*
+  needs semantic understanding — dense retrieval.
+- Most queries fall somewhere in between.
+
+Fixed-weight fusion (Static RRF, α = 0.5) ignores this variability.  This
+project learns α per query from observable query signals.
 
 ---
 
 ## Algorithm
 
-For each query $q$:
+For each query q the system:
 
-1. **Sparse retrieval** — BM25 produces a ranked list of documents.
-2. **Dense retrieval** — a bi-encoder (BAAI/bge-m3) produces a ranked list via cosine similarity.
-3. **Router** — an XGBoost model predicts a weight $\hat{\alpha}(q) \in [0, 1]$ from
-   15 query features. Values near 1 favour sparse; values near 0 favour dense.
-4. **Weighted RRF fusion** — the two ranked lists are combined:
+1. **Sparse retrieval** — BM25 (Okapi BM25, tuned k1/b/stemming) produces a
+   ranked list of up to 100 documents.
+2. **Dense retrieval** — `BAAI/bge-m3` (1024-dim) encodes the query and
+   retrieves the top-100 by cosine similarity.
+3. **Router** — predicts α(q) ∈ [0, 1].  Three router variants are trained:
+   - **Weak router:** 16 hand-crafted features (query length, IDF statistics,
+     retriever confidence margins, retriever agreement, score entropy) →
+     XGBoost regressor.
+   - **Strong router:** 1024-dimensional BGE-M3 query embedding → distance-
+     weighted KNN regressor.
+   - **MoE meta-learner:** takes the weak and strong predictions as input →
+     SVR regressor.
+4. **Weighted RRF fusion** — the two ranked lists are merged:
 
-$$\text{score}(q, d) = \hat{\alpha}(q) \cdot \frac{1}{k + r_\text{sparse}(d)} + (1 - \hat{\alpha}(q)) \cdot \frac{1}{k + r_\text{dense}(d)}$$
+```
+score(d) = α · 1/(60 + rank_bm25(d))  +  (1−α) · 1/(60 + rank_dense(d))
+```
 
-with $k = 60$ (RRF damping constant). Setting $\hat{\alpha} = 0.5$ recovers
-static RRF, which serves as the primary fusion baseline.
+α = 1 → pure BM25; α = 0 → pure Dense; α = 0.5 → Static RRF (baseline).
 
-The router is trained with **soft labels** derived from the relative NDCG@10 of
-BM25 vs dense on each query (see `docs/routing_features.md`).
+The ground-truth α per query is found by brute-force search over
+α ∈ {0.00, 0.01, …, 1.00} maximising NDCG@100 against gold relevance
+judgements (oracle alpha).
 
 ---
 
 ## Key results
 
-Macro NDCG@10 across 5 BEIR datasets on 15% held-out test sets:
+Macro NDCG@100, MRR@100, Recall@100 across **6 BEIR datasets**, **233
+held-out test queries**:
 
-| Method | Macro NDCG@10 |
-|--------|---------------|
-| BM25-only | 0.2867 |
-| Dense-only | 0.4135 |
-| Static RRF (α = 0.5) | 0.3768 |
-| **wRRF — XGBoost router** | **0.4008** |
+| Method | NDCG@100 | MRR@100 | Recall@100 |
+|--------|----------|---------|------------|
+| BM25 | 0.324 | 0.438 | 0.440 |
+| Dense (BGE-M3) | 0.420 | 0.500 | 0.553 |
+| Static RRF (α = 0.5) | 0.405 | 0.504 | 0.550 |
+| wRRF Weak (XGBoost) | 0.424 | 0.525 | **0.562** |
+| wRRF Strong (KNN) | 0.423 | 0.523 | 0.554 |
+| **wRRF MoE (SVR)** | **0.425** | **0.530** | 0.557 |
+| Oracle ceiling | 0.483 | — | — |
 
-The router adds **+0.024** over static RRF and closes **80%** of the gap
-between static RRF and dense-only. See `docs/retrieval_explainability_results.md`
-for the full per-dataset breakdown and SHAP explainability analysis.
+All three adaptive methods **significantly outperform BM25** (p < 1e-8,
+Holm-Bonferroni corrected, Cohen's d ≈ 0.4) and **significantly outperform
+Static RRF** on NDCG (Holm-corrected p < 0.05 for Weak and Strong).
+
+The cheap 16-feature weak router performs **statistically indistinguishably**
+from the expensive embedding-based strong router (p = 0.85, Δ = 0.001 NDCG)
+and from the MoE ensemble — at a fraction of the inference cost.
+
+See [`docs/results.md`](docs/results.md) for the full per-dataset breakdown,
+significance tables, reranking analysis, and latency benchmarks.
 
 ---
 
 ## Datasets
 
-Five BEIR datasets: `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`.
+Six BEIR datasets: `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`,
+`trec-covid`.  300 queries per dataset are sampled (1 500 total), split
+70 % train / 15 % dev / 15 % test per dataset.
 
 ---
 
 ## Setup
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux / macOS
+# Clone the repository
+git clone <repo-url>
+cd Query-Adaptive-Hybrid-Retrieval
 
+# Create a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+.venv\Scripts\activate           # Windows PowerShell
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Download NLTK stop words used by the tokeniser
+python -c "import nltk; nltk.download('stopwords')"
 ```
+
+A GPU with ≥ 8 GB VRAM is recommended.  The pipeline falls back to CPU if
+no GPU is available (embedding and reranking steps will be significantly
+slower).
 
 ---
 
-## Pipeline — run order
-
-Each step produces cached artifacts consumed by the next.
+## Running the pipeline
 
 ```bash
-# 1. Download BEIR datasets
-python src/download.py
-
-# 2. Build preprocessing caches (BM25 index, dense embeddings, frequency indexes)
-python src/preprocess.py
-
-# 3. Optimise BM25 parameters (k1, b, stemming) via grid search
-python src/optimize_bm25.py
-
-# 4. Model family and global hyperparameter selection (grid search across 9 models)
-python src/weak_signal_model_grid_search.py
-
-# 5. Feature ablation study (leave-one-out and leave-one-group-out)
-python src/ablation_study.py
-
-# 6. Full vs reduced model comparison (16 features vs 14 features)
-python src/full_vs_smaller_model_ablation_study.py
-
-# 7. Per-dataset XGBoost hyperparameter grid search (expanded grid, 85/15 split)
-python src/weak_signal_params_grid_search.py
-
-# 8. Final evaluation: compare all four retrieval methods + SHAP explainability
-python src/retrieval_explainability.py
+python -m src.pipeline
 ```
+
+The pipeline runs all 25 steps in sequence, caching every intermediate result
+to disk.  It prints a per-step summary to stdout.  All outputs are written to
+`data/results/` and `data/models/`.
+
+**Resuming after interruption:** re-run the same command.  Every step checks
+whether its outputs already exist before running and skips if so.
+
+**Running a specific step range:**
+```bash
+python -m src.pipeline --start 6 --end 8
+```
+
+**Forcing recomputation:** delete the step's output files and re-run.
 
 ---
 
 ## Source files
 
-### Pipeline scripts (`src/`)
-
 | File | Purpose |
 |------|---------|
-| `src/download.py` | Downloads the five BEIR datasets from the Hugging Face hub into `data/datasets/`. |
-| `src/preprocess.py` | Builds all preprocessing artifacts: BM25 tokenised corpus and query tokens, dense corpus embeddings and query vectors, word/doc frequency indexes. Skips steps whose outputs already exist and are non-empty. |
-| `src/optimize_bm25.py` | Grid-searches BM25 parameters (k1, b, use_stemming) and writes the best combination to `data/results/bm25_optimization_macro.csv` and `bm25_optimization_best.json`. The best parameters should be copied to `config.yaml` before proceeding. |
-| `src/weak_signal_model_grid_search.py` | Grid-searches 9 model families with ~2 600 total hyperparameter combinations under 10-fold Monte Carlo CV. Saves the top-100 results to `data/results/model_grid_search_top100.csv`. Also contains all shared utilities: feature computation, soft-label derivation, NDCG@k, dataset loading, caching. |
-| `src/ablation_study.py` | Feature ablation with the global-best XGBoost configuration. Evaluates 22 configurations (full model + 16 leave-one-feature-out + 5 leave-one-group-out) and produces `data/results/ablation_study.csv` and `ablation_study.png`. |
-| `src/full_vs_smaller_model_ablation_study.py` | Direct comparison between the full 16-feature model and the 14-feature model with `query_length` and `average_idf` removed. Produces `data/results/full_vs_smaller_ablation.csv` and `full_vs_smaller_ablation.png`. |
-| `src/weak_signal_params_grid_search.py` | Per-dataset XGBoost hyperparameter grid search (~6 480 combinations, expanded grid including gamma). Uses a fixed 85/15 traindev/test split per dataset. Writes `data/results/per_dataset_best_params.csv`. |
-| `src/retrieval_explainability.py` | Final evaluation on per-dataset held-out test sets. Compares BM25-only, Dense-only, Static RRF, and wRRF (XGBoost). Generates SHAP beeswarm plots per dataset. Writes `data/results/retrieval_comparison.csv`, `retrieval_comparison.png`, and `shap_<dataset>.png` for each dataset. |
-| `src/utils.py` | Shared utilities: config loading, path resolution, BM25 signature, model short name, pickle helpers, directory helpers. |
-
-### Maintenance
-
-| File | Purpose |
-|------|---------|
-| `cleanup_hpc.py` | Removes stale data artifacts from previous pipeline runs that do not match the current configuration. Run `python cleanup_hpc.py` for a dry-run preview, or `python cleanup_hpc.py --confirm` to delete. Never touches raw BEIR downloads or dense embeddings. |
+| `src/pipeline.py` | Main entry point — 25-step end-to-end pipeline |
+| `src/utils.py` | Shared helpers: embedder, BM25 builder, frequency indices, plots, normalisation |
+| `config.yaml` | All hyperparameters (edit here, not in code) |
 
 ---
 
 ## Configuration (`config.yaml`)
 
-All pipeline parameters live in a single YAML file. Key sections:
+Key sections:
 
 | Section | Controls |
 |---------|----------|
-| `datasets` | List of BEIR dataset names to process |
-| `embeddings.model_name` | SentenceTransformer model for dense retrieval |
-| `bm25` | k1, b, use_stemming, stemmer_lang |
-| `benchmark` | top_k, ndcg_k, rrf.k |
-| `routing_features` | Feature computation parameters (overlap_k, feature_stat_k, etc.) |
-| `xgboost_best` | Global best XGBoost hyperparameters (from model selection) |
-| `xgboost_params_grid` | Grid definition for per-dataset search |
-| `xgboost_per_dataset` | Best hyperparameters per dataset (from per-dataset search) |
-| `ablation_study` | n_folds, train_fraction, n_jobs for ablation |
+| `datasets` | List of BEIR dataset names |
+| `embeddings.model_name` | SentenceTransformer model (`BAAI/bge-m3`) |
+| `bm25_grid_search` | k1, b, use_stemming search space |
+| `benchmark` | top_k, ndcg_k, rrf.k, bootstrap settings |
+| `sampling` | n_queries_per_dataset, test_fraction, dev_fraction, random_seed, cv_n_folds |
+| `routing_features` | Feature computation parameters |
+| `weak_model_grid_search` | Model families and hyperparameter grids for weak router |
+| `strong_model_grid_search` | Model families and hyperparameter grids for strong router |
+| `moe_grid_search` | Model families and hyperparameter grids for MoE |
+| `reranker` | Cross-encoder model name |
+| `significance_test` | Alpha threshold for t-tests |
 
 ---
 
-## Documentation (`docs/`)
+## Documentation
 
 | File | Contents |
 |------|---------|
-| `docs/routing_features.md` | All 15 routing feature definitions with formulas and group assignments. Includes the soft-label derivation formula. |
-| `docs/model_selection_results.md` | Model grid search results. Top-10 configurations, per-dataset scores for rank-1, and interpretation of which hyperparameters matter. |
-| `docs/ablation_study_results.md` | Full leave-one-feature-out and leave-one-group-out tables. Rationale for removing `query_length`. Full vs smaller model comparison. |
-| `docs/per_dataset_params_results.md` | Per-dataset grid search results: best hyperparameters, CV and test NDCG@10 per dataset, and interpretation of why parameters differ across datasets. |
-| `docs/retrieval_explainability_results.md` | Final benchmark results across all four retrieval methods. Per-dataset analysis. SHAP plot interpretation per dataset and cross-dataset feature importance patterns. |
+| [`docs/pipeline_steps.md`](docs/pipeline_steps.md) | Detailed description of all 25 pipeline steps: feature definitions, normalisation protocol, model training, split details, output file layout |
+| [`docs/results.md`](docs/results.md) | Complete experimental analysis: NDCG/MRR/Recall tables, significance tests, feature ablation, reranking analysis, latency benchmarks |
 
 ---
 
@@ -158,29 +179,33 @@ All pipeline parameters live in a single YAML file. Key sections:
 
 ```
 data/
-  datasets/           # Raw BEIR downloads (never deleted by cleanup_hpc.py)
-  processed_data/
-    <model_short_name>/
-      <dataset>/
-        corpus.jsonl            # Exported corpus
-        queries.jsonl           # Exported queries
-        qrels.tsv               # Relevance judgements
-        corpus_embeddings.pt    # Dense corpus embeddings (expensive)
-        corpus_ids.pkl
-        query_vectors.pt        # Dense query embeddings
-        query_ids.pkl
-        tokenized_corpus_stem_*.jsonl
-        tokenized_queries_stem_*.jsonl
-        bm25_k1_*_b_*_stem_*.pkl
-        bm25_k1_*_b_*_stem_*_topk_*_results.pkl
-        features_labels_<hash>.pkl
-  results/
-    bm25_optimization_macro.csv
-    bm25_optimization_best.json
-    model_grid_search_top100.csv
-    ablation_study.csv / .png
-    full_vs_smaller_ablation.csv / .png
-    per_dataset_best_params.csv
-    retrieval_comparison.csv / .png
-    shap_<dataset>.png
+├── datasets/                      # Raw BEIR downloads (~1.5 GB)
+├── processed/<embedding_model>/   # Per-dataset preprocessed artefacts
+│   └── <dataset>/
+│       ├── corpus_embeddings.pt   # Dense corpus embeddings (GPU-computed)
+│       ├── query_vectors.pt
+│       ├── bm25_k1_*_b_*_stem_*.pkl
+│       └── ...
+├── results/                       # All CSV / JSON / PNG outputs
+│   ├── bm25_best_params.json
+│   ├── oracle_ndcg_per_dataset.json
+│   ├── moe_retrieval_comparison.csv
+│   ├── significance_tests.csv
+│   ├── latency.csv
+│   └── ...
+└── models/
+    ├── weak_model.pkl
+    ├── strong_model.pkl
+    └── moe_model.pkl
 ```
+
+---
+
+## Reproducibility
+
+All random seeds derive from `sampling.random_seed = 42`.  The 1 500-query
+selection and 70/15/15 split are cached to `data/results/merged_qids.json`
+and `data/results/merged_split.json` and never recomputed once written.
+
+Hardware used for published results: AMD Ryzen 9 5950X, NVIDIA RTX 4090
+(24 GB), 62.7 GB RAM, Ubuntu 24.04, CUDA 13.0, PyTorch 2.11.

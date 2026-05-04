@@ -1,474 +1,832 @@
-# Pipeline — Step-by-Step Reference
+# Pipeline — Complete Step-by-Step Reference
 
-This document describes every step performed by `src/pipeline.py`. The pipeline
+This document describes every step performed by `src/pipeline.py`.  The pipeline
 is a single end-to-end script that produces every artefact (data, models,
-metrics, plots) required by the thesis on top of *oracle* alpha labels found
-by per-query grid search rather than the closed-form NDCG-difference soft
-labels used in the legacy version.
+metrics, plots) required by the thesis on top of **oracle** α labels found
+by per-query brute-force search.
 
 The pipeline is **idempotent**: every step caches its outputs to disk and
-skips itself on a subsequent run if they already exist, so the script can be
-killed and restarted at any point.
+skips itself on a subsequent run if the outputs already exist, so the script
+can be killed and restarted at any point without losing progress.  The skip
+gate uses `is_nonempty_file()` (not just `os.path.exists()`) so zero-byte
+crash files are never treated as valid cache.
+
+---
+
+## Dataset and split overview
 
 The merged dataset used throughout the pipeline is the concatenation of the
-five BEIR datasets `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`,
-truncated to **300 queries per dataset** (1500 total), then split per-dataset
-into **train (70 %) / dev (15 %) / test (15 %)**. The 15 % test portion is
-**held out and never seen by any model** until the per-dataset evaluations
-(steps 8 / 13 / 18 / 20 / 21 / 22).  The remaining 85 % (train + dev) is
-used by every grid search via 10-fold cross-validation.
+six BEIR datasets **scifact**, **nfcorpus**, **arguana**, **fiqa**,
+**scidocs**, and **trec-covid**, truncated to **300 queries per dataset**
+(1 500 total).  The 300 queries are drawn by stratified random sampling
+(seed = `sampling.random_seed`, default 42) so that each unique relevance
+label is proportionally represented.
 
-All grids honour the global cap `max_models_per_grid = 1500`; combos beyond
-the cap are deterministically truncated.
+Each dataset's 300 queries are then split **per-dataset** into:
+
+| Split | Fraction | Queries/dataset | Total |
+|-------|----------|-----------------|-------|
+| Train | 70 % | 210 | 1 260 |
+| Dev   | 15 % | 45  | 270   |
+| Test  | 15 % | 45  | 270   |
+
+Train + dev (85 %, 1 275 queries) is used by all grid searches via
+10-fold cross-validation.  The test split (15 %, 225 queries — 233 after
+merging because trec-covid contributes only 8 due to fewer total queries in
+that BEIR subset) is **held out and never seen by any model** until the
+per-dataset evaluation steps.  The split assignments are cached to
+`data/results/merged_split.json` and are never recomputed once written, so
+every re-run of the pipeline evaluates on the same test queries.
+
+All grid searches honour the global cap `max_models_per_grid = 1500`;
+combinations beyond the cap are deterministically truncated (deterministic
+because Python dicts preserve insertion order and grid lists are defined in
+the config).
 
 ---
 
 ## STEP 1 — Download datasets
 
 Downloads each BEIR dataset listed under `datasets:` in `config.yaml` to
-`data/datasets/<dataset>/`. If a dataset is already present, it is skipped.
-All five datasets together total ~1.5 GB on disk after extraction. The
-function uses BEIR's official `util.download_and_unzip` so file integrity is
-guaranteed. No further preprocessing happens at this stage.
+`data/datasets/<dataset>/`.  If a dataset is already present (checked by
+directory existence), the download is skipped.  The six datasets together
+total roughly 1.5 GB on disk after extraction.  The function uses BEIR's
+official `util.download_and_unzip` so file integrity is guaranteed.  No
+preprocessing happens at this stage.
 
-**Output:** `data/datasets/<dataset>/`
+**Output:** `data/datasets/<dataset>/` (one directory per dataset)
+
+---
 
 ## STEP 2 — Preprocessing
 
-For every dataset, the script writes the canonical export files
-(`corpus.jsonl`, `queries.jsonl`, `qrels.tsv`), then builds the artefacts
+For every dataset the script writes the canonical export files
+(`corpus.jsonl`, `queries.jsonl`, `qrels.tsv`) and then builds all artefacts
 that downstream stages need:
 
-* **Tokenised corpus** — lowercase + whitespace split + Snowball stem
-  (`stemmer_language: english`). Built in parallel by a `ProcessPoolExecutor`
-  whose workers each construct one stemmer instance and reuse it across all
-  batches assigned to them. The output is appended in the original order to
-  `tokenized_corpus_stem_<0|1>.jsonl`.
-* **Tokenised queries** — same stemming pipeline, written to
-  `tokenized_queries_stem_<0|1>.jsonl` and a `query_tokens_<flag>.pkl`
-  dictionary.
-* **BM25 index** — `BM25Okapi(tokens, k1, b)` plus its document-id list,
-  pickled separately.
-* **Word & document frequency indices** — used by the cross-entropy and IDF
-  features in Step 5.
-* **Corpus and query embeddings** — produced by `BAAI/bge-m3` on the GPU
-  when available, with an automatic OOM-resilient batch-shrinking helper that
-  halves the sub-batch size on `torch.cuda.OutOfMemoryError` and falls back
-  to CPU if the GPU emits an unrecoverable error. The embeddings tensor and
-  the corresponding ID lists are saved separately so they can be loaded
-  without a model dependency.
+### 2a. Tokenised corpus and queries
 
-**Output:** under `data/processed/<model>/<dataset>/` —
-`corpus.jsonl`, `queries.jsonl`, `qrels.tsv`,
-tokenized files, BM25 + frequency indices,
-`corpus_embeddings.pt`, `corpus_ids.pkl`,
-`query_vectors.pt`, `query_ids.pkl`.
+Tokenisation is lowercase + whitespace split.  Optionally a
+**Snowball English stemmer** is applied (`use_stemming` flag, optimised in
+Step 3).  The pipeline builds *two* variants in parallel — stemmed
+(`stem_1`) and unstemmed (`stem_0`) — so Step 3's grid search can switch
+between them without re-tokenising.
+
+Corpus tokenisation is parallelised with `ProcessPoolExecutor`.  Each
+worker receives a batch of raw documents and a fresh stemmer instance (one
+per process to avoid sharing state across threads).  The tokenised output is
+appended in the original document order to
+`tokenized_corpus_stem_<0|1>.jsonl`.
+
+Query tokens are written to `tokenized_queries_stem_<0|1>.jsonl` and to a
+`query_tokens_stem_<flag>.pkl` dictionary keyed by query ID.
+
+### 2b. BM25 index
+
+`BM25Okapi(tokenized_corpus, k1, b)` is constructed for every
+`(k1, b, use_stemming)` triple encountered by the grid search.  The BM25
+object and its corresponding ordered list of document IDs are pickled
+separately so they can be loaded without re-building.
+
+### 2c. Frequency indices (word freq and doc freq)
+
+A single pass over the tokenised corpus produces both:
+
+* `word_freq_index` — mapping `term → total count across corpus`
+* `doc_freq_index` — mapping `term → number of documents containing term`
+
+These are used by the cross-entropy and average/max-IDF features in Step 5.
+Building them in a single pass (merged into `_build_bm25_and_freq_indices`)
+avoids scanning the corpus twice.
+
+After `BM25Okapi()` is constructed from `tokenized_docs`, the list is
+deleted (`del tokenized_docs`) immediately to free memory before
+BM25's internal structures have finished being built.
+
+### 2d. Dense embeddings (BGE-M3)
+
+Corpus and query embeddings are produced by `BAAI/bge-m3` (1024-dimensional
+dense head) on the GPU when available, falling back to CPU otherwise.  An
+OOM-resilient helper (`_embed_with_oom_retry`) automatically halves the
+sub-batch size on `torch.cuda.OutOfMemoryError` and retries; if the GPU
+raises an unrecoverable error the helper falls back to CPU for the remainder
+of the batch.  After encoding is complete, `torch.cuda.empty_cache()` is
+called to release unused VRAM.
+
+The corpus embeddings tensor and its corresponding ordered document-ID list
+are saved separately (`corpus_embeddings.pt` and `corpus_ids.pkl`) so they
+can be loaded without a model dependency.  The same pattern is used for
+query embeddings.
+
+**Output:** under `data/processed/<embedding_model>/<dataset>/`:
+```
+corpus.jsonl, queries.jsonl, qrels.tsv
+tokenized_corpus_stem_<0|1>.jsonl
+tokenized_queries_stem_<0|1>.jsonl
+query_tokens_stem_<flag>.pkl
+word_freq_index_stem_<flag>.pkl
+doc_freq_index_stem_<flag>.pkl
+bm25_k1_<…>_b_<…>_stem_<…>.pkl
+bm25_k1_<…>_b_<…>_stem_<…>_doc_ids.pkl
+bm25_k1_<…>_b_<…>_stem_<…>_topk_<k>_results.pkl
+dense_results_topk_<k>.pkl
+corpus_embeddings.pt, corpus_ids.pkl
+query_vectors.pt, query_ids.pkl
+```
+
+---
 
 ## STEP 3 — Optimise BM25 (k1, b, use_stemming)
 
 Runs a grid search over the BM25 hyperparameter space defined under
-`bm25_grid_search` in the config. The grid for the new pipeline is
-`5 × 5 × 2 = 50` combinations: `k1 ∈ {0.8, 1.2, 1.5, 1.6, 2.0}`,
-`b ∈ {0.0, 0.25, 0.5, 0.75, 1.0}`, `use_stemming ∈ {true, false}`.
+`bm25_grid_search` in `config.yaml`:
+
+```yaml
+bm25_grid_search:
+  k1:  [0.8, 1.2, 1.5, 1.6, 2.0]
+  b:   [0.0, 0.25, 0.5, 0.75, 1.0]
+  use_stemming: [true, false]
+```
+
+This yields 5 × 5 × 2 = **50 combinations**.
 
 For every combination the pipeline ensures the corresponding tokenised
-corpus, frequency indices and BM25 index exist (building them on demand and
-caching them keyed by the parameter signature so that subsequent runs of any
-script that uses the same `(k1, b, stem)` triple are free), then performs
-BM25 retrieval restricted to the **300 queries per dataset** that will form
-the merged dataset later. NDCG@10 is computed per query and averaged per
-dataset; the final score for a combination is the macro-average across the
-five datasets.
+corpus, frequency indices, and BM25 index exist (building them on demand and
+caching them keyed by the parameter triple so subsequent steps with the same
+params are free), then performs BM25 retrieval for the 300 sampled queries
+per dataset.  NDCG@100 is computed per query and averaged per dataset; the
+score for a combination is the **macro-average across all six datasets**.
 
-The full grid is written sorted descending by macro NDCG@10 to
-`bm25_grid_search.csv`, and the single best configuration is persisted as
-`bm25_best_params.json`. From this point on the helper
-`get_active_bm25_params(cfg)` returns the best parameters and **every
-subsequent step uses them**.
+The full grid is written sorted descending by macro NDCG@100 to
+`bm25_grid_search.csv`.  The single best configuration is persisted to
+`bm25_best_params.json`.  From this point on every subsequent step calls
+`get_active_bm25_params(cfg)` which reads this file and returns the winning
+triple.
+
+**Best parameters found:**
+```json
+{ "k1": 1.2, "b": 0.75, "use_stemming": true, "macro_ndcg@100": 0.3265 }
+```
 
 **Output:** `data/results/bm25_grid_search.csv`,
-`data/results/bm25_best_params.json`, plus per-config BM25 indices and
-retrieval caches under each dataset's `data/processed/<model>/<dataset>/`.
+`data/results/bm25_best_params.json`
+
+---
 
 ## STEP 4 — Oracle alpha grid search (per query)
 
-For each of the 1500 selected queries the pipeline finds the best
-fusion-weight `α* = argmax_{α} NDCG@10(wRRF(α | q))` by brute force over the
-101 values `α ∈ {0.00, 0.01, …, 1.00}`.
+For each of the 1 500 selected queries the pipeline finds the optimal
+fusion weight:
 
-The candidate pool for a query is the union of BM25 top-100 and Dense
-top-100 (using the active BM25 parameters from Step 3 and the BGE-M3 dense
-retriever). Within the loop the rank arrays
-`R_bm[d] = 1/(rrf_k + rank_bm25(d))` and `R_de[d] = 1/(rrf_k + rank_dense(d))`
-are precomputed once per query. Each alpha then evaluates a *vectorised*
-fused score `α · R_bm + (1−α) · R_de`, sorts the result, takes the top
-`top_k = 100`, and computes NDCG@10. The IDCG used as the denominator is the
-ideal DCG over the *full qrels* (matching `query_ndcg_at_k`), so the
-reported `oracle_ndcg` is comparable across queries; the chosen oracle alpha
-is mathematically invariant to this choice.
+```
+α* = argmax_{α ∈ {0.00, 0.01, …, 1.00}} NDCG@100( wRRF(α | q) )
+```
 
-Ties at the maximum NDCG are broken in favour of the **lowest** alpha (the
-first alpha to achieve the max in the ascending iteration), which is
-deterministic. Queries with no relevant document are emitted with α = 0.5
-and `oracle_ndcg = 0` so they remain in the dataset and contribute uniform
-noise rather than disappearing.
+where the weighted Reciprocal Rank Fusion score for a document d is:
 
-**Output:** `data/results/oracle_alphas.csv` with columns
-`(ds_name, qid, oracle_alpha, oracle_ndcg)`, plus
-`data/results/oracle_ndcg_per_dataset.json` — the per-dataset and macro
-oracle NDCG@10 for sanity checking.
+```
+score(d) = α · 1/(k + rank_bm25(d))  +  (1−α) · 1/(k + rank_dense(d))
+           with k = rrf.k = 60
+```
 
-## STEP 5 — Weak-model dataset
+**Algorithm.**  The candidate pool is the union of BM25 top-100 and Dense
+top-100 (using the best BM25 parameters from Step 3 and the BGE-M3 dense
+retriever).  Within the loop the rank arrays
 
-Builds the 16-feature hand-crafted dataset that the weak router will be
-trained on. The features replicate exactly those of the legacy pipeline,
-organised in five groups:
+```
+R_bm[d] = 1 / (60 + rank_bm25(d))
+R_de[d] = 1 / (60 + rank_dense(d))
+```
 
-* **A. Query Surface** — `query_length`, `stopword_ratio`,
-  `has_question_word`.
-* **B. Vocabulary Match** — `average_idf`, `max_idf`, `rare_term_ratio`,
-  `cross_entropy` (with Laplace smoothing, see
-  `routing_features.ce_smoothing_alpha`).
-* **C. Retriever Confidence** — top score and top-1 vs top-2 confidence
-  margin for both retrievers, after min-max normalisation of each ranked
-  list.
-* **D. Retriever Agreement** — `overlap_at_k`, `first_shared_doc_rank`,
-  `spearman_topk` over the top-`feature_stat_k` of each retriever.
-* **E. Distribution Shape** — Shannon entropy of the normalised top-k score
-  distributions for BM25 and Dense.
+are precomputed once per query.  Each of the 101 alpha values then evaluates
+a *vectorised* fused score `α·R_bm + (1−α)·R_de`, sorts it, takes the top
+100, and computes NDCG@100 against the full qrels.
 
-The label per query is the **oracle alpha** read from
-`oracle_alphas.csv`. The split column reflects the cached
-`merged_split.json` and is used by every later step that needs to filter
-rows by split.
+**Tie-breaking.**  When multiple alpha values achieve the same maximum NDCG,
+the lowest alpha (first in the ascending iteration) is chosen.  This is
+deterministic.
 
-**Output:** `data/results/weak_dataset.csv` (1500 rows × 19 columns) and the
-companion files `data/results/merged_qids.json` and
-`data/results/merged_split.json` produced lazily on first use.
+**No-relevance queries.**  Queries with no relevant document in the qrels
+are emitted with α = 0.5 and `oracle_ndcg = 0`.  They remain in the dataset
+and contribute uniform noise rather than disappearing.  They are excluded
+from the per-dataset oracle NDCG average reported in
+`oracle_ndcg_per_dataset.json` (i.e. the average is over queries with at
+least one relevant document).
+
+**Oracle NDCG@100 per dataset:**
+| Dataset | Oracle NDCG@100 |
+|---------|----------------|
+| scifact | 0.7697 |
+| nfcorpus | 0.3340 |
+| arguana | 0.4782 |
+| fiqa | 0.5486 |
+| scidocs | 0.3045 |
+| trec-covid | 0.4610 |
+| **MACRO** | **0.4827** |
+
+This is the theoretical ceiling for any alpha-fusion method on this dataset.
+
+**Output:** `data/results/oracle_alphas.csv` (`ds_name, qid, oracle_alpha,
+oracle_ndcg`), `data/results/oracle_ndcg_per_dataset.json`
+
+---
+
+## STEP 5 — Weak-model feature dataset
+
+Builds the 16-dimensional hand-crafted feature matrix that the weak router
+will be trained on.  Every row corresponds to one of the 1 500 queries.
+Features are organised in five groups:
+
+### Group A — Query Surface (3 features)
+| Feature | Description |
+|---------|-------------|
+| `query_length` | Number of tokens in the query |
+| `stopword_ratio` | Fraction of query tokens that are NLTK English stop words |
+| `has_question_word` | Binary: 1 if query starts with who/what/when/where/why/how |
+
+### Group B — Vocabulary Match (4 features)
+| Feature | Description |
+|---------|-------------|
+| `average_idf` | Mean IDF of query tokens against the corpus (`log(N/df + 1)`) |
+| `max_idf` | Maximum IDF among all query tokens |
+| `rare_term_ratio` | Fraction of query tokens with df < `rare_term_threshold` |
+| `cross_entropy` | Cross-entropy of the query language model against the corpus unigram distribution; Laplace-smoothed with `ce_smoothing_alpha` |
+
+### Group C — Retriever Confidence (4 features)
+| Feature | Description |
+|---------|-------------|
+| `top_sparse_score` | Top-1 BM25 score after min-max normalisation of the ranked list |
+| `sparse_confidence` | Top-1 minus top-2 BM25 score margin (normalised) |
+| `top_dense_score` | Top-1 dense cosine similarity |
+| `dense_confidence` | Top-1 minus top-2 cosine similarity margin |
+
+### Group D — Retriever Agreement (3 features)
+| Feature | Description |
+|---------|-------------|
+| `overlap_at_k` | Jaccard overlap of BM25 top-k and dense top-k (`feature_stat_k`) |
+| `first_shared_doc_rank` | Harmonic mean rank of the first document in the intersection |
+| `spearman_topk` | Spearman rank correlation of BM25 and dense scores over the top-k union |
+
+### Group E — Distribution Shape (2 features)
+| Feature | Description |
+|---------|-------------|
+| `sparse_entropy_topk` | Shannon entropy of normalised BM25 top-k score distribution |
+| `dense_entropy_topk` | Shannon entropy of normalised dense top-k score distribution |
+
+The label for every row is the **oracle alpha** read from
+`oracle_alphas.csv`.  The split column (`train`/`dev`/`test`) is taken from
+`merged_split.json` and is included in the CSV so any later step can filter
+by split without re-reading the split file.
+
+**Output:** `data/results/weak_dataset.csv` (1 500 rows × 19 columns:
+`ds_name, qid, split, oracle_alpha, oracle_ndcg` + 16 features)
+
+---
 
 ## STEP 6 — Weak-model grid search
 
-For every combination of (model, hyperparameters) generated from
-`weak_model_grid_search.models`, the pipeline:
+For every `(model_family, hyperparameter_combination)` in
+`weak_model_grid_search.models` the pipeline runs a **10-fold stratified
+cross-validation** on the train + dev rows (1 260 + 270 = 1 275 queries,
+before optional reduction due to missing qrels).
 
-1. z-scores the weak-feature matrix using statistics fitted **on the training
-   fold only** (so the test fold remains unseen);
-2. fits the model on the training fold (`y_oracle` directly for regressors;
-   binarised at 0.5 for the classifier branch — `logistic_regression`,
-   `gaussian_nb`, `lda`);
-3. predicts a per-query alpha on the validation fold (clipped to `[0, 1]`
-   for regressors, `predict_proba[:, 1]` for classifiers);
-4. evaluates wRRF NDCG@10 on each validation query (using the actual BM25
-   and Dense retrieval results, not a proxy loss), averages over the queries
-   in the fold, and finally averages across the 10 folds.
+### Normalisation (critical for correctness)
 
-Combinations that fail to fit (degenerate folds, single-class classifier
-inputs, etc.) silently fall back to a uniform `α = 0.5` prediction so the
-grid search continues. The top 100 combinations are written to
-`weak_grid_search_top.csv` and the single best one to
-`weak_best_params.json`. With CUDA available, `n_jobs = 1` is used for the
-outer joblib loop because XGBoost on CUDA is not safe to share across
-threads; otherwise the loop uses every core.
+Inside each fold:
+1. The scaler is **fit on the training fold only** (210 × 6 / 10 ≈ 1 147
+   queries per training fold in the inner loop).
+2. The same scaler is applied to transform the validation fold.
+3. **No statistics from the validation fold ever influence the scaler.**
 
-**Output:** `data/results/weak_grid_search_top.csv`,
-`data/results/weak_best_params.json`.
+This ensures zero data leakage between splits.  The scaler used is
+`sklearn.preprocessing.StandardScaler` (z-score: subtract mean, divide by
+std).  When the final model is trained on the full 85 % after grid search,
+a fresh `StandardScaler` is fit on all 1 275 train+dev rows and saved
+alongside the model so it can be applied at inference time.
+
+### Prediction protocol
+
+* **Regressors** (XGBoost, Ridge, SVR, …): predict a continuous alpha in
+  `[0, 1]`, clipped to that range after prediction.
+* **Classifiers** (LogisticRegression, GaussianNB, LDA): output
+  `predict_proba[:, pos_class_idx]`, where `pos_class_idx` is looked up via
+  `model.classes_` to handle the degenerate case where the positive class
+  (α = 1) never appears in a fold.
+
+### Scoring
+
+Validation alpha predictions are fed into the wRRF formula against the
+actual BM25 and dense retrieval results (not a proxy loss).  NDCG@100 is
+computed per validation query and averaged per fold, then macro-averaged
+across the 10 folds.  This means the grid optimises the exact retrieval
+metric that matters.
+
+Models that fail to fit (degenerate folds, single-class classifier inputs)
+silently fall back to a uniform α = 0.5 prediction for that fold, so the
+grid search continues without interruption.
+
+**Best model:** XGBoost with `cv_ndcg@100 = 0.4362`
+```json
+{
+  "model": "xgboost",
+  "params": { "colsample_bytree": 0.8, "gamma": 0.0,
+              "learning_rate": 0.05, "max_depth": 4,
+              "min_child_weight": 1, "n_estimators": 300, "subsample": 0.8 }
+}
+```
+
+The final weak model is retrained on all 1 275 train+dev queries using the
+best params and a fresh scaler, then saved to `data/models/weak_model.pkl`
+(containing: `model`, `scaler`, `feature_cols`, `feature_names`).
+
+**Output:** `data/results/weak_grid_search_top.csv` (top 100 combinations),
+`data/results/weak_best_params.json`, `data/models/weak_model.pkl`
+
+---
 
 ## STEP 7 — Weak-model feature ablation
 
 Holds the best `(model, params)` from Step 6 fixed and re-evaluates the
 same 10-fold CV protocol with three families of feature subsets:
 
-* **Full** — all 16 features (baseline).
-* **Leave-one-feature-out** — 16 configurations, one per feature.
-* **Leave-one-group-out** — 5 configurations, one per `FEATURE_GROUPS`
-  bucket above.
+* **Full** — all 16 features (baseline, cv_ndcg@100 = 0.4362).
+* **Leave-one-feature-out** — 16 configurations, one per individual feature.
+* **Leave-one-group-out** — 5 configurations, one per feature group A–E.
 
-Every configuration's `cv_ndcg@10` is written to `weak_ablation.csv` along
-with the JSON-encoded list of feature column indices that produced it.
-A two-panel horizontal-bar plot saves to `weak_ablation.png` (top panel:
-leave-one-feature-out; bottom panel: leave-one-group-out), with each bar
-annotated by its delta against the full-model score and a green dashed
-reference line at the full-model NDCG@10.
+The normalisation protocol is unchanged: the scaler is fit on the training
+fold only in every inner loop.
 
-The configuration with the highest CV NDCG@10 — which in some experiments is
-the full set and in others a reduced one — is selected as the **final weak
-feature set**. The best model is retrained on the full 85 % train + dev
-portion of the merged dataset using only those columns, and persisted to
-`data/models/weak_model.pkl` with its scaler statistics, model object, the
-selected `feature_cols` and `feature_names`. Every later step that needs a
-weak alpha applies this saved bundle directly.
+Results are sorted by `cv_ndcg@100` descending.  A two-panel horizontal-bar
+plot is saved to `weak_ablation.png` (top panel: individual features; bottom
+panel: groups), with each bar annotated by its delta against the full-model
+score and a green dashed reference line at the full-model score.
+
+The feature configuration with the **highest CV NDCG@100** — which may be a
+subset rather than the full set — is selected as the final weak feature set.
+The best model is retrained on the full 85 % train+dev portion using only
+those columns and its scaler, and the bundle is saved to
+`data/models/weak_model.pkl` (overwriting the Step 6 version with the
+ablation-selected feature set).
+
+**Key ablation finding:**  Removing `top_sparse_score` (Group C) slightly
+*improved* CV NDCG (0.4367 > 0.4362), suggesting it introduces mild noise.
+All group-level ablations decreased performance vs. the full model, with
+Group A (Query Surface) being the most harmful to remove (−0.003).
 
 **Output:** `data/results/weak_ablation.csv`,
+`data/results/weak_ablation_combo.csv`,
 `data/results/weak_ablation.png`,
-`data/models/weak_model.pkl`.
+`data/models/weak_model.pkl`
+
+---
 
 ## STEP 8 — Weak retrieval comparison (test set)
 
-Evaluates four methods on the 15 % held-out test set:
+Evaluates four retrieval methods on the **held-out 15 % test set** (never
+seen during training or grid search):
 
-* **BM25** — pure sparse retrieval (top-100).
-* **Dense** — pure dense retrieval (top-100).
-* **Static RRF (α = 0.5)** — Reciprocal Rank Fusion with constant α.
-* **wRRF (weak)** — α predicted per query by the saved weak model.
+| Method | Description |
+|--------|-------------|
+| BM25 | Pure sparse retrieval, top-100, best BM25 params |
+| Dense | Pure dense retrieval (BGE-M3), top-100 |
+| Static RRF (α = 0.5) | wRRF with fixed α = 0.5 (equal weight) |
+| wRRF (weak) | α predicted per query by the saved weak model (with its scaler applied) |
 
-NDCG@10 is computed per dataset and macro-averaged across the five
-datasets. The 4-bar grouped chart is saved to
-`weak_retrieval_comparison.png` and the underlying numbers to the matching
-CSV.
+NDCG@100 is computed per query, averaged per dataset, and macro-averaged
+across the six datasets.  A grouped bar chart with one bar per method per
+dataset (+ MACRO) is saved to `weak_retrieval_comparison.png`.
 
 **Output:** `data/results/weak_retrieval_comparison.csv`,
-`data/results/weak_retrieval_comparison.png`.
+`data/results/weak_retrieval_comparison.png`
 
-## STEP 9 — Plot weak alphas
+---
 
-Two diagnostic plots over the test set:
+## STEP 9 — Plot weak router alpha distributions
 
-* **Box plot** — distribution of the weak-router predicted α per dataset
-  plus a **MACRO** column (concatenation of all datasets). Mean is drawn as
-  a dashed red line, median as a dark-blue line.
-* **Sorted overlay** — the oracle α values are sorted ascending and plotted
-  as blue dots; the weak-router's predicted α for the same queries is drawn
-  on top as red dots (in the same order). The closer the red trace
-  approaches the blue diagonal, the better the routing.
+Two diagnostic plots over the **test set** queries:
+
+* **Box plot** (`weak_alphas_boxplot.png`): distribution of weak-router
+  predicted α per dataset plus a MACRO column.  Mean is a dashed red line,
+  median is a dark-blue line.  Reveals per-dataset routing bias
+  (e.g. arguana strongly prefers dense, trec-covid strongly prefers BM25).
+
+* **Sorted overlay** (`weak_alphas_sorted.png`): oracle α values sorted
+  ascending (blue dots) with the weak router's predicted α for the same
+  queries overlaid (red dots, in the same sort order).  The closer the red
+  trace approaches the blue diagonal, the better the routing calibration.
 
 **Output:** `data/results/weak_alphas_boxplot.png`,
-`data/results/weak_alphas_sorted.png`.
+`data/results/weak_alphas_sorted.png`
 
-## STEP 10 — Weak SHAP
+---
 
-Computes a single SHAP summary plot for the merged dataset.  For tree-based
-models (`xgboost`, `lightgbm`, `random_forest`, `extra_trees`) the fast
-`shap.TreeExplainer` is used; for any other model family the script falls
-back to `shap.KernelExplainer` with a 100-row background sample and 200
-samples per explanation. The plot displays all features sorted by mean
-absolute SHAP value, dots coloured by feature value (blue = low,
-red = high). The model name is included in the figure title for
-provenance.
+## STEP 10 — SHAP explainability (weak model)
 
-**Output:** `data/results/weak_shap.png`.
+Computes a SHAP summary plot for the merged dataset (all 1 500 queries).
+For tree-based models (XGBoost, LightGBM, RandomForest, ExtraTrees) the
+fast `shap.TreeExplainer` is used; for any other model family the script
+falls back to `shap.KernelExplainer` with a 100-row background sample and
+200 samples per explanation.
 
-## STEP 11 — Strong-model dataset
+The plot shows all 16 features sorted by mean absolute SHAP value, with
+individual points coloured by feature value (blue = low, red = high).
+The model name is included in the figure title for provenance.
 
-Constructs the strong-router dataset whose features are the **1024-dim
-BGE-M3 query embeddings** for the same 1500 queries used by the weak
-dataset, with the same train / dev / test split assignments. The
-embeddings are loaded from each dataset's cached `query_vectors.pt`,
-re-aligned to the canonical qid order, vertically stacked, and saved as a
-single pickle with `rows` (split metadata) and `X` (a `(1500, 1024)`
-float32 matrix). Saved as a single binary file (rather than a CSV) because
-1.5 M floats round-trip much faster through pickle.
+**Output:** `data/results/weak_shap.png`
 
-**Output:** `data/results/strong_dataset.pkl`.
+---
+
+## STEP 11 — Strong-model feature dataset
+
+Constructs the strong-router dataset whose features are the **1 024-dimensional
+BGE-M3 query embeddings** for the same 1 500 queries, with the same split
+assignments.  The embeddings are loaded from each dataset's cached
+`query_vectors.pt`, re-aligned to the canonical qid order in
+`merged_qids.json`, vertically stacked, and saved as a single pickle
+containing `rows` (split metadata matching the weak dataset) and `X`
+(a `(1500, 1024)` float32 matrix).
+
+Pickle is used rather than CSV because 1.5 M floats round-trip much faster
+without text serialisation overhead and without precision loss.
+
+**Output:** `data/results/strong_dataset.pkl`
+
+---
 
 ## STEP 12 — Strong-model grid search
 
-Identical protocol to Step 6 but on the 1024-dim embedding features. The
-grid (`strong_model_grid_search.models`) keeps the model families that
-performed well in the legacy strong-signal selection — Ridge, ElasticNet,
-KNN, SVR, MLP, XGBoost, RandomForest, ExtraTrees. With CUDA available the
-outer loop is again sequential because XGBoost on CUDA cannot be shared
-across joblib threads.
+Identical protocol to Step 6 (10-fold CV, fit scaler on training fold only,
+predict alpha, score via actual wRRF NDCG@100) but on the 1 024-dimensional
+embedding features.  The model families are: Ridge, ElasticNet, KNN, SVR,
+MLP, XGBoost, RandomForest, ExtraTrees.
 
-After the grid finishes the best combination is retrained on the full
-85 % train + dev and saved together with its scaler statistics to
-`data/models/strong_model.pkl`. The top-100 grid rows go to
-`strong_grid_search_top.csv` and the winner to `strong_best_params.json`.
+**Normalisation** is identical: `StandardScaler` fit on training fold only,
+applied to validation fold.  Because the embedding dimensions can have
+very different variances, this normalisation step is critical for
+distance-based (KNN) and kernel-based (SVR) models.
+
+**Best model:** KNN with `cv_ndcg@100 = 0.4343`
+```json
+{ "model": "knn", "params": { "n_neighbors": 5, "weights": "distance" } }
+```
+
+The final strong model is retrained on all 1 275 train+dev queries and saved
+to `data/models/strong_model.pkl`.
 
 **Output:** `data/results/strong_grid_search_top.csv`,
 `data/results/strong_best_params.json`,
-`data/models/strong_model.pkl`.
+`data/models/strong_model.pkl`
+
+---
 
 ## STEP 13 — Strong retrieval comparison (test set)
 
-Same as Step 8 but with **five** methods: BM25, Dense, Static RRF (α = 0.5),
-wRRF (weak) and wRRF (strong). The weak alphas are produced by the saved
-weak bundle and the strong ones by the saved strong bundle. Reporting both
-in the same chart makes the two routers directly comparable on identical
-test queries.
+Same as Step 8 but evaluating **five methods**: BM25, Dense, Static RRF,
+wRRF (weak), wRRF (strong).  Having both routers in the same chart enables
+direct comparison on identical test queries.  The strong router's predicted
+alphas are produced by loading the saved strong bundle and applying the saved
+scaler to the test embeddings.
 
 **Output:** `data/results/strong_retrieval_comparison.csv`,
-`data/results/strong_retrieval_comparison.png`.
+`data/results/strong_retrieval_comparison.png`
 
-## STEP 14 — Plot strong alphas
+---
+
+## STEP 14 — Plot strong router alpha distributions
 
 Same two plots as Step 9 but using the strong router's predicted alphas.
 
 **Output:** `data/results/strong_alphas_boxplot.png`,
-`data/results/strong_alphas_sorted.png`.
+`data/results/strong_alphas_sorted.png`
+
+---
 
 ## STEP 15 — MoE meta-learner dataset
 
-Builds the meta-dataset on which the MoE router is trained. The crucial
-detail is **zero leakage** on the train + dev portion: every traindev row's
-`alpha_weak` and `alpha_strong` is produced by a base model that has *not*
-seen that query during training. Concretely:
+Builds the two-dimensional meta-feature matrix on which the MoE router is
+trained.  The critical design goal is **zero leakage** between the base
+models (weak, strong) and the MoE on the train+dev portion.
 
-* The pipeline runs **standard 10-fold CV** on the train + dev rows
-  (matching the seed and fold definition used by the grid searches), using
-  the best `(model, params)` and feature-subset bundle saved by the weak
-  and strong stages. Each query's prediction comes from the fold in which
-  it was the validation row, never the training row.
-* For the **test** rows, the final base models trained on the full
-  85 % train + dev (i.e. the bundles in `data/models/`) are queried
-  directly, so no traindev query ever contaminates a test prediction.
+### OOF (out-of-fold) predictions for train+dev
 
-The meta-dataset has the columns `ds_name, qid, split, alpha_weak,
-alpha_strong, alpha_gt`, where `alpha_gt` is the oracle alpha. It is
-written as a CSV (small enough not to need pickling) so it can be
-inspected manually.
+For every train+dev query a prediction is generated by a base model that
+has **not** seen that query during its training:
 
-The pipeline asserts that the weak and strong datasets are **aligned
-position-by-position** on both the train+dev qids and the test qids before
-packaging the rows; if they ever diverge (e.g. because someone re-ran one
-side with a different seed) the script aborts with a clear error.
+1. The pipeline runs 10-fold CV on the 1 275 train+dev rows using the
+   **same fold definition** (same seed, same `StratifiedKFold` object) as
+   Steps 6 and 12.
+2. For each fold, the weak and strong models are re-trained from scratch on
+   the training portion of that fold (with fresh scalers) using the best
+   `(model, params, feature_cols)` bundles from Steps 7 and 12.
+3. The held-out fold's alpha prediction comes from these freshly trained
+   base models, so no train+dev query ever contaminates its own OOF
+   prediction.
 
-**Output:** `data/results/moe_dataset.csv`.
+### Test predictions
+
+For the 225–233 test queries the already-trained bundles from
+`data/models/weak_model.pkl` and `data/models/strong_model.pkl` are used
+directly (they were trained on all 1 275 train+dev queries, so they have
+never seen any test query).
+
+### Alignment assertion
+
+Before packaging the meta-rows, the pipeline asserts that the weak and
+strong OOF qid lists are **identical in position order** for both train+dev
+and test portions.  If they diverge (e.g. because one side was re-generated
+with a different seed), the script aborts with a clear error message.
+
+### Meta-dataset columns
+
+`ds_name, qid, split, alpha_weak, alpha_strong, alpha_gt`
+
+where `alpha_gt` is the oracle alpha from `oracle_alphas.csv`.
+
+**Output:** `data/results/moe_dataset.csv`
+
+---
 
 ## STEP 16 — MoE meta-learner grid search
 
 The MoE grid (`moe_grid_search.models`) covers ten relatively shallow model
 families — Ridge, Lasso, ElasticNet, SVR, KNN, RandomForest, ExtraTrees,
-MLP, XGBoost, LightGBM — because the input is only 2-dimensional. For tree
-models the meta-feature vector is `[α_weak, α_strong]`; for linear,
-distance, kernel and neural models we additionally include
-`|α_weak − α_strong|` so they can express interaction terms without
-sacrificing identifiability.
+MLP, XGBoost, LightGBM — because the input is only 2-dimensional (or
+3-dimensional for models that benefit from interaction terms).
 
-The grid uses the same 10-fold protocol as Steps 6 / 12. NDCG@10 is
-evaluated on the validation queries using their actual BM25 + Dense
-retrieval results — not a proxy loss on the alphas — so the grid optimises
-the metric we ultimately care about. The best combination is retrained on
-the full traindev meta-dataset and saved to `data/models/moe_model.pkl`.
+### Feature construction
+
+* For tree-based models: `[α_weak, α_strong]` (2 features).
+* For linear, distance, kernel, and neural models: additionally include
+  `|α_weak − α_strong|` (3 features), giving them the ability to express
+  interaction terms without sacrificing identifiability.
+
+### Normalisation
+
+Same `StandardScaler` protocol: fit on train fold, apply to val fold.
+Because the input range is bounded within `[0, 1]`, normalisation has less
+impact here than in the strong model, but it remains correct.
+
+### Scoring
+
+NDCG@100 is evaluated on the validation queries using the actual BM25 +
+dense retrieval results — the MoE's predicted alpha is plugged into the wRRF
+formula against real candidate lists.
+
+**Best model:** SVR with `cv_ndcg@100 = 0.4355`
+```json
+{ "model": "svr", "params": { "C": 1.0, "epsilon": 0.05 } }
+```
+
+The final MoE model is retrained on the full traindev meta-dataset and saved
+to `data/models/moe_model.pkl`.
 
 **Output:** `data/results/moe_grid_search_top.csv`,
 `data/results/moe_best_params.json`,
-`data/models/moe_model.pkl`.
+`data/models/moe_model.pkl`
+
+---
 
 ## STEP 17 — MoE decision heatmap
 
 Renders the prediction surface of the saved MoE model over the unit square
-`(α_strong, α_weak) ∈ [0, 1]^2`. The grid is sampled at 100 × 100 = 10 000
-points; predictions are reshaped into a 2-D grid and drawn as a 30-level
-filled contour plot with the `RdYlBu_r` palette (blue = MoE prefers Dense,
-red = MoE prefers BM25).
+`(α_strong, α_weak) ∈ [0, 1]²`.  The grid is sampled at 100 × 100 =
+10 000 points; predictions are reshaped into a 2-D array and drawn as a
+30-level filled contour plot with the `RdYlBu_r` palette (blue = MoE prefers
+Dense (α→0), red = MoE prefers BM25 (α→1)).
 
-Real queries are scatter-overlaid in their dataset's palette colour; small
-markers are train + dev queries (drawn translucently), large markers with
-black edges are the held-out test queries. The plot reproduces the
-"decision boundary" plot from the legacy MoE pipeline.
+Real queries are scatter-overlaid colour-coded by dataset.  Small
+translucent markers are train+dev queries; large markers with black edges
+are the held-out test queries.
 
-**Output:** `data/results/moe_decision_heatmap.png`.
+**Output:** `data/results/moe_decision_heatmap.png`
 
-## STEP 18 — MoE retrieval comparison (six methods)
+---
 
-The full comparison: BM25, Dense, Static RRF, wRRF (weak), wRRF (strong),
-wRRF (MoE). The MoE alphas come from the saved MoE bundle applied to the
-test rows of the meta-dataset.
+## STEP 18 — Full retrieval comparison: six methods (test set)
+
+The complete head-to-head evaluation of all six methods on the held-out test
+set:
+
+| Method | Description |
+|--------|-------------|
+| BM25 | Sparse-only, best k1/b/stemming |
+| Dense | Dense-only (BGE-M3) |
+| Static RRF | wRRF with α = 0.5 (no adaptation) |
+| wRRF (weak) | 16-feature XGBoost router |
+| wRRF (strong) | 1024-dim BGE-M3 embedding KNN router |
+| wRRF (MoE) | SVR meta-learner combining weak + strong |
+
+NDCG@100 per dataset and macro is written to CSV and plotted.
 
 **Output:** `data/results/moe_retrieval_comparison.csv`,
-`data/results/moe_retrieval_comparison.png`.
+`data/results/moe_retrieval_comparison.png`
 
-## STEP 19 — Plot MoE alphas
+---
 
-Same two plots as Steps 9 and 14, this time for the MoE router.
+## STEP 19 — Plot MoE router alpha distributions
+
+Same two diagnostic plots as Steps 9 and 14, this time for the MoE router's
+predicted alphas on the test set.
 
 **Output:** `data/results/moe_alphas_boxplot.png`,
-`data/results/moe_alphas_sorted.png`.
+`data/results/moe_alphas_sorted.png`
+
+---
 
 ## STEP 20 — Recall@100
 
 Recall@100 is computed for **seven** sets of candidates on the test set:
 
-* The six top-100 lists produced by BM25, Dense, Static RRF, wRRF (weak),
-  wRRF (strong) and wRRF (MoE).
-* The **union** of BM25's and Dense's full top-100 lists, *unranked* — this
-  is the theoretical Recall@100 ceiling for any re-ranker that draws
-  candidates from both first-stage retrievers, included as a reference
-  bar.
+| Candidate set | Description |
+|--------------|-------------|
+| BM25 top-100 | Sparse retrieval only |
+| Dense top-100 | Dense retrieval only |
+| Static RRF top-100 | wRRF with α = 0.5 |
+| wRRF (weak) top-100 | Weak-router fusion |
+| wRRF (strong) top-100 | Strong-router fusion |
+| wRRF (MoE) top-100 | MoE-router fusion |
+| BM25 ∪ Dense (union) | All 200 unique docs from both top-100 lists — **ceiling** |
 
-Queries with no relevant document are excluded from the per-method
-averages so that they are not double-counted as zero. The seven-bar
-grouped chart and the matching CSV are saved.
+The union set is the theoretical recall ceiling for any re-ranker drawing
+candidates from both first-stage retrievers.  It is included as a reference
+bar and is unranked (Recall@100 is rank-invariant).
+
+Queries with no relevant document are excluded from the per-method averages
+to avoid deflating recall with structurally zero-recall queries.
+
+A grouped bar chart with 95 % bootstrap CI error bars is saved alongside
+the CSV.  The CIs use `n_resamples = 1000` with `seed = 42`.  The plot is
+regenerated from the cached CSV if the main outputs exist but the PNG is
+missing (standalone recovery).
 
 **Output:** `data/results/recall_at_100.csv`,
-`data/results/recall_at_100.png`.
+`data/results/recall_at_100.png`,
+`data/results/recall_ci.csv`
+
+---
 
 ## STEP 21 — Cross-encoder reranking
 
-Loads the cross-encoder defined under `reranker.model_name`
-(`cross-encoder/ms-marco-MiniLM-L-6-v2` by default) and reranks the top-100
-candidate set produced by each of the six retrieval methods.
+Loads the cross-encoder `cross-encoder/ms-marco-MiniLM-L-6-v2` and reranks
+the top-100 candidate set produced by each of the six retrieval methods.
 
-**Efficiency.** Across the six methods the candidate sets overlap heavily
-(they all draw from BM25 ∪ Dense). To avoid ever scoring the same
-`(query, document)` pair twice, the pipeline enumerates the *union* of
-required pairs across all six methods for one dataset, scores them in a
-single batched `predict` call (batch size 128 on CUDA, 32 on CPU), and
-caches the results to `rerank_scores_<ce_short>_<dataset>.pkl`. Subsequent
-runs check that the cache contains every required pair before reusing it,
-and rebuild it if any pair is missing.
+### Efficiency: shared scoring
 
-For each method, NDCG@10 is computed *before* and *after* reranking. The
-"before" ordering is the original retrieval order; the "after" ordering
-sorts the same candidate set by the cross-encoder score (descending). Two
+Across the six methods the candidate sets overlap heavily (all draw from
+BM25 ∪ Dense).  To avoid scoring the same `(query, document)` pair twice:
+1. The union of all required `(qid, doc_id)` pairs across all six methods
+   for one dataset is enumerated.
+2. The `needed_doc_ids` set is extracted and only those documents are loaded
+   from disk via `load_corpus_subset()` (streaming JSONL scan, stops early
+   when all target documents are found).
+3. All pairs are scored in a single batched `predict` call (batch size 128
+   on CUDA, 32 on CPU).
+4. Scores are cached to `rerank_scores_<ce_short>_<dataset>.pkl`.
+
+On subsequent runs the cache is loaded and checked for completeness.  If
+any required pair is missing (e.g. because new queries were added), only the
+missing pairs are scored and merged into the cache — previously scored pairs
+are never discarded.
+
+### Metrics
+
+For each method, NDCG@100 is computed *before* (original retrieval ranking)
+and *after* (re-sorted by cross-encoder score descending) reranking.  Two
 charts are produced:
 
-* `rerank_ndcg.png` — re-ranked NDCG@10 per method per dataset (six bars
-  per group).
-* `rerank_gain.png` — `Δ NDCG@10 = re-ranked − original` per method per
-  dataset (positive = gain, negative = loss; a horizontal dashed zero
-  line is drawn for reference).
+* `rerank_ndcg.png` — re-ranked NDCG@100 per method per dataset (six bars
+  per group), with 95 % bootstrap CI error bars.
+* `rerank_gain.png` — `ΔNDCG@100 = re-ranked − original` per method per
+  dataset; a horizontal dashed zero line marks the break-even point.
 
 **Output:** `data/results/rerank_ndcg.csv`,
 `data/results/rerank_ndcg.png`,
 `data/results/rerank_gain.png`,
-plus the per-dataset `rerank_scores_<…>_<dataset>.pkl` caches.
-
-## STEP 22 — Paired t-tests
-
-For every unordered pair of methods (15 pairs) the pipeline computes
-`scipy.stats.ttest_rel` over the per-query NDCG@10 difference on the merged
-test set (~225 queries). The output table records the sample size, mean
-difference, t-statistic, two-sided p-value and a binary
-`significant`/`not significant` flag at the threshold
-`significance_test.alpha` (default 0.05).
-
-This step turns "method A beats method B by Δ NDCG@10 = 0.003" into a
-defensible "method A beats method B with mean Δ = 0.003, p = …" statement.
-
-**Output:** `data/results/significance_tests.csv`.
+`data/results/rerank_mrr.csv`,
+`data/results/<rerank_cache>_<dataset>.pkl`
 
 ---
 
-## Data and model layout produced by the pipeline
+## STEP 22 — Paired significance tests (NDCG@100)
+
+For every unordered pair of methods among (BM25, Dense, Static RRF,
+wRRF weak, wRRF strong, wRRF MoE) — **15 pairs total** — the pipeline:
+
+1. Collects per-query NDCG@100 scores for the two methods on the merged
+   test set (n = 233 queries).
+2. Runs `scipy.stats.ttest_rel` (paired two-sided t-test).
+3. Reports: `n`, `mean_diff`, `t`, `p_value`, `cohens_d`, raw significance
+   at α = 0.05, and Holm-Bonferroni corrected significance.
+
+**Holm-Bonferroni correction** is applied across all 15 comparisons to
+control the family-wise error rate.  Each row therefore has both a
+`significant` column (raw α = 0.05) and a `significant_holm` column
+(corrected).
+
+Cohen's d effect size is computed as `mean_diff / pooled_std`.
+
+A grouped bar chart with 95 % bootstrap CI error bars is also generated
+from the NDCG scores.
+
+**Output:** `data/results/significance_tests.csv`,
+`data/results/ndcg_ci.csv`,
+`data/results/ndcg_ci.png`
+
+---
+
+## STEP 23 — MRR@100 and Recall significance tests
+
+Analogous to Step 22 but for MRR@100 and Recall@100.  The same 15 pairs are
+tested for each metric.  Outputs are the per-query MRR and recall score
+tables plus their t-test summaries.
+
+**Output:** `data/results/mrr_at_100.csv`,
+`data/results/mrr_ci.csv`,
+`data/results/mrr_ttest.csv`,
+`data/results/mrr_ci.png`,
+`data/results/recall_ttest.csv`,
+`data/results/recall_ci.csv`,
+`data/results/recall_ci.png`
+
+---
+
+## STEP 24 — Oracle NDCG summary
+
+Verifies and exports the oracle NDCG per dataset (already computed in
+Step 4) to a readable JSON for reference.  The macro is computed only over
+queries that have at least one relevant document (same filter as Step 4).
+
+**Output:** `data/results/oracle_ndcg_per_dataset.json`
+
+---
+
+## STEP 25 — Latency benchmarking
+
+Benchmarks end-to-end query latency for every method on every dataset.
+
+### What is measured
+
+For each `(method, dataset)` combination the pipeline times n repetitions
+(default: equal to the test set size) of the full query path:
+
+* **BM25:** tokenise query → BM25 score → argsort top-100.
+* **Dense:** embed query (GPU inference) → cosine similarity → argsort
+  top-100.  Query embedding time is included.
+* **Static / wRRF / MoE:** dense time + BM25 time + wRRF merge step +
+  (router inference for adaptive methods).
+* **With reranking (+`_rer` columns):** the above plus cross-encoder
+  `predict()` on the top-100 candidates.
+* **CE-only (`_ce_only` columns):** cross-encoder scoring time in isolation,
+  excluding first-stage retrieval.
+
+All timings use `time.perf_counter()` (high-resolution wall-clock time).
+The GPU is warmed up before measurement begins.
+
+### Reported statistics
+
+For each `(method, dataset)` cell the table records:
+- `mean` latency per query (ms)
+- `median` latency per query (ms)
+- `p95` (95th percentile) latency per query (ms)
+
+The macro row is the **dataset-weighted mean** of per-dataset summary
+statistics (consistent with how NDCG/MRR/Recall macros are computed).
+
+**Output:** `data/results/latency.csv`,
+`data/results/latency.png`
+
+---
+
+## Data and model layout
 
 ```
 data/
-├── datasets/                      # BEIR raw datasets + zips
+├── datasets/                      # BEIR raw datasets
 │   ├── arguana/
 │   ├── fiqa/
 │   ├── nfcorpus/
 │   ├── scidocs/
-│   └── scifact/
-├── processed/<embedding model>/   # per-dataset preprocessed artefacts
+│   ├── scifact/
+│   └── trec-covid/
+├── processed/<embedding_model>/   # per-dataset preprocessed artefacts
 │   └── <dataset>/
 │       ├── corpus.jsonl
 │       ├── queries.jsonl
 │       ├── qrels.tsv
-│       ├── tokenized_corpus_stem_<flag>.jsonl
-│       ├── tokenized_queries_stem_<flag>.jsonl
+│       ├── tokenized_corpus_stem_<0|1>.jsonl
+│       ├── tokenized_queries_stem_<0|1>.jsonl
 │       ├── query_tokens_stem_<flag>.pkl
 │       ├── word_freq_index_stem_<flag>.pkl
 │       ├── doc_freq_index_stem_<flag>.pkl
-│       ├── bm25_k1_<…>_b_<…>_stem_<…>.pkl
-│       ├── bm25_k1_<…>_b_<…>_stem_<…>_doc_ids.pkl
-│       ├── bm25_k1_<…>_b_<…>_stem_<…>_topk_<k>_results.pkl
+│       ├── bm25_k1_<k1>_b_<b>_stem_<flag>.pkl
+│       ├── bm25_k1_<k1>_b_<b>_stem_<flag>_doc_ids.pkl
+│       ├── bm25_k1_<k1>_b_<b>_stem_<flag>_topk_<k>_results.pkl
 │       ├── dense_results_topk_<k>.pkl
 │       ├── corpus_embeddings.pt
 │       ├── corpus_ids.pkl
 │       ├── query_vectors.pt
 │       └── query_ids.pkl
-├── results/                       # csv / json / png outputs
+├── results/                       # CSV / JSON / PNG outputs
 │   ├── merged_qids.json
 │   ├── merged_split.json
 │   ├── bm25_grid_search.csv
@@ -479,6 +837,7 @@ data/
 │   ├── weak_grid_search_top.csv
 │   ├── weak_best_params.json
 │   ├── weak_ablation.csv
+│   ├── weak_ablation_combo.csv
 │   ├── weak_ablation.png
 │   ├── weak_retrieval_comparison.csv / .png
 │   ├── weak_alphas_boxplot.png
@@ -498,38 +857,42 @@ data/
 │   ├── moe_alphas_boxplot.png
 │   ├── moe_alphas_sorted.png
 │   ├── recall_at_100.csv / .png
+│   ├── recall_ci.csv / .png
+│   ├── recall_ttest.csv
 │   ├── rerank_ndcg.csv / .png
+│   ├── rerank_mrr.csv
 │   ├── rerank_gain.png
-│   ├── rerank_scores_<…>_<dataset>.pkl
-│   └── significance_tests.csv
+│   ├── rerank_scores_<ce>_<dataset>.pkl
+│   ├── significance_tests.csv
+│   ├── ndcg_ci.csv / .png
+│   ├── mrr_at_100.csv
+│   ├── mrr_ci.csv / .png
+│   ├── mrr_ttest.csv
+│   ├── latency.csv / .png
+│   └── hardware.json
 └── models/
     ├── weak_model.pkl
     ├── strong_model.pkl
     └── moe_model.pkl
 ```
 
-## Reproducibility checklist
+---
+
+## Reproducibility
 
 * All random seeds derive from `sampling.random_seed` (default 42) plus a
   deterministic, dataset-specific MD5 offset, so per-dataset shuffles do not
-  collide and the pipeline is reproducible across machines.
-* The 1500-query selection is cached at
-  `data/results/merged_qids.json` and the 70 / 15 / 15 split at
-  `data/results/merged_split.json`; both are recomputed only if missing.
-* All grid searches use the **same 10 CV folds** (same seed) so the OOF
-  predictions in Step 15 are guaranteed to use queries that no base model
-  ever saw during training in the same fold — this is the leakage barrier
-  between Steps 6 / 12 and Steps 15 / 16.
+  collide and the pipeline is fully reproducible across machines.
+* The 1 500-query selection is cached at `data/results/merged_qids.json` and
+  the 70/15/15 split at `data/results/merged_split.json`; both are
+  recomputed only if missing.
+* All grid searches use the **same 10 CV folds** (same seed + same
+  `StratifiedKFold` object) so the OOF predictions in Step 15 are guaranteed
+  to use queries that no base model has ever seen during training in the same
+  fold.
 * Every cache file is keyed by the parameters that affect its content
-  (BM25 by `k1, b, use_stemming, top_k`; embeddings by the embedding-model
-  short name) so changing `config.yaml` automatically invalidates the
-  affected caches.
-
-## Cleanup
-
-`src/cleanup.py` exists solely to wipe stale outputs from `data/results/`
-and `data/models/`, plus a curated set of stale caches under
-`data/processed/`. It runs once on the HPC node before the first end-to-end
-pipeline run and is then deleted (per the TODO instructions). Pass
-`--dry-run` to print everything that would be removed without actually
-deleting it.
+  (BM25 by `k1, b, use_stemming, top_k`; dense by the embedding model short
+  name) so changing `config.yaml` automatically invalidates the relevant
+  caches.
+* Hardware used for the published results: AMD Ryzen 9 5950X, NVIDIA RTX 4090
+  (24 GB VRAM), 62.7 GB RAM, Ubuntu 24.04, CUDA 13.0, PyTorch 2.11.
