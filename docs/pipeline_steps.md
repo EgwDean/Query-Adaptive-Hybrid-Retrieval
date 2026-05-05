@@ -17,26 +17,30 @@ crash files are never treated as valid cache.
 
 The merged dataset used throughout the pipeline is the concatenation of the
 six BEIR datasets **scifact**, **nfcorpus**, **arguana**, **fiqa**,
-**scidocs**, and **trec-covid**, truncated to **300 queries per dataset**
-(1 500 total).  The 300 queries are drawn by stratified random sampling
+**scidocs**, and **trec-covid**, capped at **300 queries per dataset** where
+available.  The 300 queries are drawn by stratified random sampling
 (seed = `sampling.random_seed`, default 42) so that each unique relevance
 label is proportionally represented.
 
-Each dataset's 300 queries are then split **per-dataset** into:
+> **Note on trec-covid:** The BEIR trec-covid split contains only ~50
+> queries — fewer than the 300-query cap.  All available queries are used,
+> so this dataset contributes ~50 queries rather than 300.  The total across
+> all six datasets is therefore approximately **1 550** (5 × 300 + ~50).
 
-| Split | Fraction | Queries/dataset | Total |
-|-------|----------|-----------------|-------|
-| Train | 70 % | 210 | 1 260 |
-| Dev   | 15 % | 45  | 270   |
-| Test  | 15 % | 45  | 270   |
+Each dataset's queries are split **per-dataset** into:
 
-Train + dev (85 %, 1 275 queries) is used by all grid searches via
-10-fold cross-validation.  The test split (15 %, 225 queries — 233 after
-merging because trec-covid contributes only 8 due to fewer total queries in
-that BEIR subset) is **held out and never seen by any model** until the
-per-dataset evaluation steps.  The split assignments are cached to
-`data/results/merged_split.json` and are never recomputed once written, so
-every re-run of the pipeline evaluates on the same test queries.
+| Split | Fraction | Queries/dataset (typical) | Approx. total |
+|-------|----------|---------------------------|---------------|
+| Train | 70 % | 210 (≈35 for trec-covid) | ~1 085 |
+| Dev   | 15 % | 45  (≈7 for trec-covid)  | ~232  |
+| Test  | 15 % | 45  (8 for trec-covid)   | **233** |
+
+Train + dev (85 %, ~1 317 queries) is used by all grid searches via
+10-fold cross-validation.  The test split (15 %, **233 queries**) is
+**held out and never seen by any model** until the per-dataset evaluation
+steps.  The split assignments are cached to `data/results/merged_split.json`
+and are never recomputed once written, so every re-run of the pipeline
+evaluates on the same test queries.
 
 All grid searches honour the global cap `max_models_per_grid = 1500`;
 combinations beyond the cap are deterministically truncated (deterministic
@@ -175,7 +179,7 @@ triple.
 
 ## STEP 4 — Oracle alpha grid search (per query)
 
-For each of the 1 500 selected queries the pipeline finds the optimal
+For each of the ~1 550 selected queries the pipeline finds the optimal
 fusion weight:
 
 ```
@@ -234,7 +238,7 @@ oracle_ndcg`), `data/results/oracle_ndcg_per_dataset.json`
 ## STEP 5 — Weak-model feature dataset
 
 Builds the 16-dimensional hand-crafted feature matrix that the weak router
-will be trained on.  Every row corresponds to one of the 1 500 queries.
+will be trained on.  Every row corresponds to one of the ~1 550 queries.
 Features are organised in five groups:
 
 ### Group A — Query Surface (3 features)
@@ -278,7 +282,7 @@ The label for every row is the **oracle alpha** read from
 `merged_split.json` and is included in the CSV so any later step can filter
 by split without re-reading the split file.
 
-**Output:** `data/results/weak_dataset.csv` (1 500 rows × 19 columns:
+**Output:** `data/results/weak_dataset.csv` (~1 550 rows × 19 columns:
 `ds_name, qid, split, oracle_alpha, oracle_ndcg` + 16 features)
 
 ---
@@ -287,13 +291,13 @@ by split without re-reading the split file.
 
 For every `(model_family, hyperparameter_combination)` in
 `weak_model_grid_search.models` the pipeline runs a **10-fold stratified
-cross-validation** on the train + dev rows (1 260 + 270 = 1 275 queries,
-before optional reduction due to missing qrels).
+cross-validation** on the train + dev rows (~1 317 queries across all six
+datasets, before optional reduction due to missing qrels).
 
 ### Normalisation (critical for correctness)
 
 Inside each fold:
-1. The scaler is **fit on the training fold only** (210 × 6 / 10 ≈ 1 147
+1. The scaler is **fit on the training fold only** (~1 317 × 9/10 ≈ 1 185
    queries per training fold in the inner loop).
 2. The same scaler is applied to transform the validation fold.
 3. **No statistics from the validation fold ever influence the scaler.**
@@ -301,7 +305,7 @@ Inside each fold:
 This ensures zero data leakage between splits.  The scaler used is
 `sklearn.preprocessing.StandardScaler` (z-score: subtract mean, divide by
 std).  When the final model is trained on the full 85 % after grid search,
-a fresh `StandardScaler` is fit on all 1 275 train+dev rows and saved
+a fresh `StandardScaler` is fit on all ~1 317 train+dev rows and saved
 alongside the model so it can be applied at inference time.
 
 ### Prediction protocol
@@ -335,7 +339,7 @@ grid search continues without interruption.
 }
 ```
 
-The final weak model is retrained on all 1 275 train+dev queries using the
+The final weak model is retrained on all ~1 317 train+dev queries using the
 best params and a fresh scaler, then saved to `data/models/weak_model.pkl`
 (containing: `model`, `scaler`, `feature_cols`, `feature_names`).
 
@@ -422,7 +426,7 @@ Two diagnostic plots over the **test set** queries:
 
 ## STEP 10 — SHAP explainability (weak model)
 
-Computes a SHAP summary plot for the merged dataset (all 1 500 queries).
+Computes a SHAP summary plot for the merged dataset (all ~1 550 queries).
 For tree-based models (XGBoost, LightGBM, RandomForest, ExtraTrees) the
 fast `shap.TreeExplainer` is used; for any other model family the script
 falls back to `shap.KernelExplainer` with a 100-row background sample and
@@ -439,12 +443,12 @@ The model name is included in the figure title for provenance.
 ## STEP 11 — Strong-model feature dataset
 
 Constructs the strong-router dataset whose features are the **1 024-dimensional
-BGE-M3 query embeddings** for the same 1 500 queries, with the same split
+BGE-M3 query embeddings** for the same ~1 550 queries, with the same split
 assignments.  The embeddings are loaded from each dataset's cached
 `query_vectors.pt`, re-aligned to the canonical qid order in
 `merged_qids.json`, vertically stacked, and saved as a single pickle
 containing `rows` (split metadata matching the weak dataset) and `X`
-(a `(1500, 1024)` float32 matrix).
+(a `(~1550, 1024)` float32 matrix).
 
 Pickle is used rather than CSV because 1.5 M floats round-trip much faster
 without text serialisation overhead and without precision loss.
@@ -470,7 +474,7 @@ distance-based (KNN) and kernel-based (SVR) models.
 { "model": "knn", "params": { "n_neighbors": 5, "weights": "distance" } }
 ```
 
-The final strong model is retrained on all 1 275 train+dev queries and saved
+The final strong model is retrained on all ~1 317 train+dev queries and saved
 to `data/models/strong_model.pkl`.
 
 **Output:** `data/results/strong_grid_search_top.csv`,
@@ -512,7 +516,7 @@ models (weak, strong) and the MoE on the train+dev portion.
 For every train+dev query a prediction is generated by a base model that
 has **not** seen that query during its training:
 
-1. The pipeline runs 10-fold CV on the 1 275 train+dev rows using the
+1. The pipeline runs 10-fold CV on the ~1 317 train+dev rows using the
    **same fold definition** (same seed, same `StratifiedKFold` object) as
    Steps 6 and 12.
 2. For each fold, the weak and strong models are re-trained from scratch on
@@ -526,7 +530,7 @@ has **not** seen that query during its training:
 
 For the 225–233 test queries the already-trained bundles from
 `data/models/weak_model.pkl` and `data/models/strong_model.pkl` are used
-directly (they were trained on all 1 275 train+dev queries, so they have
+directly (they were trained on all ~1 317 train+dev queries, so they have
 never seen any test query).
 
 ### Alignment assertion
@@ -883,9 +887,9 @@ data/
 * All random seeds derive from `sampling.random_seed` (default 42) plus a
   deterministic, dataset-specific MD5 offset, so per-dataset shuffles do not
   collide and the pipeline is fully reproducible across machines.
-* The 1 500-query selection is cached at `data/results/merged_qids.json` and
-  the 70/15/15 split at `data/results/merged_split.json`; both are
-  recomputed only if missing.
+* The query selection is cached at `data/results/merged_qids.json` and the
+  70/15/15 split at `data/results/merged_split.json`; both are recomputed
+  only if missing.
 * All grid searches use the **same 10 CV folds** (same seed + same
   `StratifiedKFold` object) so the OOF predictions in Step 15 are guaranteed
   to use queries that no base model has ever seen during training in the same
