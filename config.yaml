@@ -6,8 +6,6 @@
 # obtained by per-query grid search (instead of soft NDCG-based
 # estimates as in the legacy version).
 #
-# Run order:
-#     python src/cleanup.py        # one-time cleanup of stale artefacts
 #     python src/pipeline.py       # end-to-end training + evaluation
 #
 # Every section of pipeline.py caches its outputs to disk; rerunning
@@ -33,7 +31,6 @@ datasets:
   - arguana
   - fiqa
   - scidocs
-  - trec-covid
 
 # ------------------------------------------------------------
 # Paths (relative to the project root)
@@ -129,13 +126,6 @@ routing_features:
   epsilon:            1.0e-8
   ce_smoothing_alpha: 1.0
 
-# ------------------------------------------------------------
-# Cap on the size of every grid search.  Set generously to
-# satisfy the "<= 1500 trained models per grid" requirement.
-# Combos beyond this cap are not evaluated (deterministically
-# truncated by canonical iteration order).
-# ------------------------------------------------------------
-max_models_per_grid: 1500
 
 # ------------------------------------------------------------
 # Step 6 — Weak-model grid search

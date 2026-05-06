@@ -16,36 +16,28 @@ crash files are never treated as valid cache.
 ## Dataset and split overview
 
 The merged dataset used throughout the pipeline is the concatenation of the
-six BEIR datasets **scifact**, **nfcorpus**, **arguana**, **fiqa**,
-**scidocs**, and **trec-covid**, capped at **300 queries per dataset** where
-available.  The 300 queries are drawn by stratified random sampling
+five BEIR datasets **scifact**, **nfcorpus**, **arguana**, **fiqa**, and
+**scidocs**, each truncated to exactly **300 queries** (1 500 total).  The
+300 queries are drawn by stratified random sampling
 (seed = `sampling.random_seed`, default 42) so that each unique relevance
-label is proportionally represented.
+label is proportionally represented.  All five datasets have at least 300
+available queries, so the cap is always reached and every dataset contributes
+equally to training and evaluation.
 
-> **Note on trec-covid:** The BEIR trec-covid split contains only ~50
-> queries — fewer than the 300-query cap.  All available queries are used,
-> so this dataset contributes ~50 queries rather than 300.  The total across
-> all six datasets is therefore approximately **1 550** (5 × 300 + ~50).
+Each dataset's 300 queries are split **per-dataset** into:
 
-Each dataset's queries are split **per-dataset** into:
+| Split | Fraction | Queries/dataset | Total |
+|-------|----------|-----------------|-------|
+| Train | 70 %     | 210             | 1 050 |
+| Dev   | 15 %     | 45              | 225   |
+| Test  | 15 %     | 45              | **225** |
 
-| Split | Fraction | Queries/dataset (typical) | Approx. total |
-|-------|----------|---------------------------|---------------|
-| Train | 70 % | 210 (≈35 for trec-covid) | ~1 085 |
-| Dev   | 15 % | 45  (≈7 for trec-covid)  | ~232  |
-| Test  | 15 % | 45  (8 for trec-covid)   | **233** |
-
-Train + dev (85 %, ~1 317 queries) is used by all grid searches via
-10-fold cross-validation.  The test split (15 %, **233 queries**) is
+Train + dev (85 %, **1 275 queries**) is used by all grid searches via
+10-fold cross-validation.  The test split (15 %, **225 queries**) is
 **held out and never seen by any model** until the per-dataset evaluation
 steps.  The split assignments are cached to `data/results/merged_split.json`
 and are never recomputed once written, so every re-run of the pipeline
 evaluates on the same test queries.
-
-All grid searches honour the global cap `max_models_per_grid = 1500`;
-combinations beyond the cap are deterministically truncated (deterministic
-because Python dicts preserve insertion order and grid lists are defined in
-the config).
 
 ---
 
@@ -53,7 +45,7 @@ the config).
 
 Downloads each BEIR dataset listed under `datasets:` in `config.yaml` to
 `data/datasets/<dataset>/`.  If a dataset is already present (checked by
-directory existence), the download is skipped.  The six datasets together
+directory existence), the download is skipped.  The five datasets together
 total roughly 1.5 GB on disk after extraction.  The function uses BEIR's
 official `util.download_and_unzip` so file integrity is guaranteed.  No
 preprocessing happens at this stage.
@@ -159,18 +151,13 @@ corpus, frequency indices, and BM25 index exist (building them on demand and
 caching them keyed by the parameter triple so subsequent steps with the same
 params are free), then performs BM25 retrieval for the 300 sampled queries
 per dataset.  NDCG@100 is computed per query and averaged per dataset; the
-score for a combination is the **macro-average across all six datasets**.
+score for a combination is the **macro-average across all five datasets**.
 
 The full grid is written sorted descending by macro NDCG@100 to
 `bm25_grid_search.csv`.  The single best configuration is persisted to
 `bm25_best_params.json`.  From this point on every subsequent step calls
 `get_active_bm25_params(cfg)` which reads this file and returns the winning
 triple.
-
-**Best parameters found:**
-```json
-{ "k1": 1.2, "b": 0.75, "use_stemming": true, "macro_ndcg@100": 0.3265 }
-```
 
 **Output:** `data/results/bm25_grid_search.csv`,
 `data/results/bm25_best_params.json`
@@ -179,7 +166,7 @@ triple.
 
 ## STEP 4 — Oracle alpha grid search (per query)
 
-For each of the ~1 550 selected queries the pipeline finds the optimal
+For each of the 1 500 selected queries the pipeline finds the optimal
 fusion weight:
 
 ```
@@ -217,18 +204,9 @@ from the per-dataset oracle NDCG average reported in
 `oracle_ndcg_per_dataset.json` (i.e. the average is over queries with at
 least one relevant document).
 
-**Oracle NDCG@100 per dataset:**
-| Dataset | Oracle NDCG@100 |
-|---------|----------------|
-| scifact | 0.7697 |
-| nfcorpus | 0.3340 |
-| arguana | 0.4782 |
-| fiqa | 0.5486 |
-| scidocs | 0.3045 |
-| trec-covid | 0.4610 |
-| **MACRO** | **0.4827** |
-
-This is the theoretical ceiling for any alpha-fusion method on this dataset.
+The per-dataset and macro oracle NDCG@100 are written to
+`oracle_ndcg_per_dataset.json` as a sanity check — this is the theoretical
+ceiling for any alpha-fusion method on this dataset.
 
 **Output:** `data/results/oracle_alphas.csv` (`ds_name, qid, oracle_alpha,
 oracle_ndcg`), `data/results/oracle_ndcg_per_dataset.json`
@@ -238,7 +216,7 @@ oracle_ndcg`), `data/results/oracle_ndcg_per_dataset.json`
 ## STEP 5 — Weak-model feature dataset
 
 Builds the 16-dimensional hand-crafted feature matrix that the weak router
-will be trained on.  Every row corresponds to one of the ~1 550 queries.
+will be trained on.  Every row corresponds to one of the 1 500 queries.
 Features are organised in five groups:
 
 ### Group A — Query Surface (3 features)
@@ -282,7 +260,7 @@ The label for every row is the **oracle alpha** read from
 `merged_split.json` and is included in the CSV so any later step can filter
 by split without re-reading the split file.
 
-**Output:** `data/results/weak_dataset.csv` (~1 550 rows × 19 columns:
+**Output:** `data/results/weak_dataset.csv` (1 500 rows × 19 columns:
 `ds_name, qid, split, oracle_alpha, oracle_ndcg` + 16 features)
 
 ---
@@ -291,13 +269,13 @@ by split without re-reading the split file.
 
 For every `(model_family, hyperparameter_combination)` in
 `weak_model_grid_search.models` the pipeline runs a **10-fold stratified
-cross-validation** on the train + dev rows (~1 317 queries across all six
+cross-validation** on the train + dev rows (1 275 queries across all five
 datasets, before optional reduction due to missing qrels).
 
 ### Normalisation (critical for correctness)
 
 Inside each fold:
-1. The scaler is **fit on the training fold only** (~1 317 × 9/10 ≈ 1 185
+1. The scaler is **fit on the training fold only** (1 275 × 9/10 ≈ 1 148
    queries per training fold in the inner loop).
 2. The same scaler is applied to transform the validation fold.
 3. **No statistics from the validation fold ever influence the scaler.**
@@ -305,7 +283,7 @@ Inside each fold:
 This ensures zero data leakage between splits.  The scaler used is
 `sklearn.preprocessing.StandardScaler` (z-score: subtract mean, divide by
 std).  When the final model is trained on the full 85 % after grid search,
-a fresh `StandardScaler` is fit on all ~1 317 train+dev rows and saved
+a fresh `StandardScaler` is fit on all 1 275 train+dev rows and saved
 alongside the model so it can be applied at inference time.
 
 ### Prediction protocol
@@ -329,19 +307,11 @@ Models that fail to fit (degenerate folds, single-class classifier inputs)
 silently fall back to a uniform α = 0.5 prediction for that fold, so the
 grid search continues without interruption.
 
-**Best model:** XGBoost with `cv_ndcg@100 = 0.4362`
-```json
-{
-  "model": "xgboost",
-  "params": { "colsample_bytree": 0.8, "gamma": 0.0,
-              "learning_rate": 0.05, "max_depth": 4,
-              "min_child_weight": 1, "n_estimators": 300, "subsample": 0.8 }
-}
-```
-
-The final weak model is retrained on all ~1 317 train+dev queries using the
-best params and a fresh scaler, then saved to `data/models/weak_model.pkl`
-(containing: `model`, `scaler`, `feature_cols`, `feature_names`).
+The model and hyperparameter combination with the highest mean CV NDCG@100
+is written to `weak_best_params.json`.  The winning model is then retrained
+on all 1 275 train+dev queries using a fresh scaler fit on the full
+train+dev set, and saved to `data/models/weak_model.pkl` (containing:
+`model`, `scaler`, `feature_cols`, `feature_names`).
 
 **Output:** `data/results/weak_grid_search_top.csv` (top 100 combinations),
 `data/results/weak_best_params.json`, `data/models/weak_model.pkl`
@@ -350,36 +320,62 @@ best params and a fresh scaler, then saved to `data/models/weak_model.pkl`
 
 ## STEP 7 — Weak-model feature ablation
 
-Holds the best `(model, params)` from Step 6 fixed and re-evaluates the
-same 10-fold CV protocol with three families of feature subsets:
+Holds the best `(model, params)` from Step 6 fixed and runs a two-phase
+ablation study to determine whether any subset of features produces a
+statistically significantly better router than using all 16.
 
-* **Full** — all 16 features (baseline, cv_ndcg@100 = 0.4362).
-* **Leave-one-feature-out** — 16 configurations, one per individual feature.
-* **Leave-one-group-out** — 5 configurations, one per feature group A–E.
+### Phase 1 — Leave-one-out evaluation
 
-The normalisation protocol is unchanged: the scaler is fit on the training
-fold only in every inner loop.
+The same 10-fold CV protocol (scaler fit on training fold only) is applied
+to the following configurations:
 
-Results are sorted by `cv_ndcg@100` descending.  A two-panel horizontal-bar
-plot is saved to `weak_ablation.png` (top panel: individual features; bottom
-panel: groups), with each bar annotated by its delta against the full-model
-score and a green dashed reference line at the full-model score.
+* **Full** — all 16 features (the baseline).
+* **Leave-one-feature-out** — 16 configurations, one per individual feature
+  removed.
+* **Leave-one-group-out** — 5 configurations, one per feature group A–E
+  removed.
 
-The feature configuration with the **highest CV NDCG@100** — which may be a
-subset rather than the full set — is selected as the final weak feature set.
-The best model is retrained on the full 85 % train+dev portion using only
-those columns and its scaler, and the bundle is saved to
-`data/models/weak_model.pkl` (overwriting the Step 6 version with the
-ablation-selected feature set).
+Per-query validation scores (NDCG@100) are collected for every configuration
+and for the full model across all folds.  Results are written to
+`weak_ablation.csv` and visualised as a two-panel bar chart (`weak_ablation.png`,
+top panel: individual features, bottom panel: groups), with each bar
+annotated by its delta against the full-model score.
 
-**Key ablation finding:**  Removing `top_sparse_score` (Group C) slightly
-*improved* CV NDCG (0.4367 > 0.4362), suggesting it introduces mild noise.
-All group-level ablations decreased performance vs. the full model, with
-Group A (Query Surface) being the most harmful to remove (−0.003).
+From Phase 1, any feature or group whose removal yields a delta ≥ 0 (i.e.
+it does not hurt performance) is identified as **non-damaging**.
+
+### Phase 2 — Combination ablation with statistical testing
+
+All subsets of the non-damaging features and groups identified in Phase 1
+are enumerated and evaluated with the same 10-fold CV protocol.  For each
+combination, a **paired t-test** is run between the per-query validation
+scores of that combination and the per-query scores of the full model.
+**Holm-Bonferroni correction** is applied across the entire family of
+combination tests to control the family-wise error rate.
+
+A combination is marked `sig_better = True` if and only if:
+1. Its Holm-corrected p-value is below the significance threshold, **and**
+2. Its mean NDCG@100 is strictly greater than the full model's mean.
+
+Results (including raw p-values, Holm-corrected p-values, Cohen's d, and
+the `sig_better` flag) are written to `weak_ablation_combo.csv` and plotted
+in `weak_ablation_combo.png` (green bars = significantly better, grey = not
+significant).
+
+### Final model selection
+
+If one or more combinations are `sig_better`, the one with the highest mean
+CV NDCG@100 is selected as the final feature set.  If no combination is
+significantly better, the full 16-feature set is retained.
+
+The winning configuration is retrained on the full train+dev set with a
+fresh scaler and saved to `data/models/weak_model.pkl`, overwriting the
+Step 6 bundle with the ablation-confirmed feature set.
 
 **Output:** `data/results/weak_ablation.csv`,
 `data/results/weak_ablation_combo.csv`,
 `data/results/weak_ablation.png`,
+`data/results/weak_ablation_combo.png`,
 `data/models/weak_model.pkl`
 
 ---
@@ -397,7 +393,7 @@ seen during training or grid search):
 | wRRF (weak) | α predicted per query by the saved weak model (with its scaler applied) |
 
 NDCG@100 is computed per query, averaged per dataset, and macro-averaged
-across the six datasets.  A grouped bar chart with one bar per method per
+across the five datasets.  A grouped bar chart with one bar per method per
 dataset (+ MACRO) is saved to `weak_retrieval_comparison.png`.
 
 **Output:** `data/results/weak_retrieval_comparison.csv`,
@@ -411,8 +407,7 @@ Two diagnostic plots over the **test set** queries:
 
 * **Box plot** (`weak_alphas_boxplot.png`): distribution of weak-router
   predicted α per dataset plus a MACRO column.  Mean is a dashed red line,
-  median is a dark-blue line.  Reveals per-dataset routing bias
-  (e.g. arguana strongly prefers dense, trec-covid strongly prefers BM25).
+  median is a dark-blue line.  Reveals per-dataset routing bias.
 
 * **Sorted overlay** (`weak_alphas_sorted.png`): oracle α values sorted
   ascending (blue dots) with the weak router's predicted α for the same
@@ -426,7 +421,7 @@ Two diagnostic plots over the **test set** queries:
 
 ## STEP 10 — SHAP explainability (weak model)
 
-Computes a SHAP summary plot for the merged dataset (all ~1 550 queries).
+Computes a SHAP summary plot for the merged dataset (all 1 500 queries).
 For tree-based models (XGBoost, LightGBM, RandomForest, ExtraTrees) the
 fast `shap.TreeExplainer` is used; for any other model family the script
 falls back to `shap.KernelExplainer` with a 100-row background sample and
@@ -443,12 +438,12 @@ The model name is included in the figure title for provenance.
 ## STEP 11 — Strong-model feature dataset
 
 Constructs the strong-router dataset whose features are the **1 024-dimensional
-BGE-M3 query embeddings** for the same ~1 550 queries, with the same split
+BGE-M3 query embeddings** for the same 1 500 queries, with the same split
 assignments.  The embeddings are loaded from each dataset's cached
 `query_vectors.pt`, re-aligned to the canonical qid order in
 `merged_qids.json`, vertically stacked, and saved as a single pickle
 containing `rows` (split metadata matching the weak dataset) and `X`
-(a `(~1550, 1024)` float32 matrix).
+(a `(1500, 1024)` float32 matrix).
 
 Pickle is used rather than CSV because 1.5 M floats round-trip much faster
 without text serialisation overhead and without precision loss.
@@ -469,13 +464,8 @@ applied to validation fold.  Because the embedding dimensions can have
 very different variances, this normalisation step is critical for
 distance-based (KNN) and kernel-based (SVR) models.
 
-**Best model:** KNN with `cv_ndcg@100 = 0.4343`
-```json
-{ "model": "knn", "params": { "n_neighbors": 5, "weights": "distance" } }
-```
-
-The final strong model is retrained on all ~1 317 train+dev queries and saved
-to `data/models/strong_model.pkl`.
+The winning model is retrained on all train+dev queries with a fresh scaler
+and saved to `data/models/strong_model.pkl`.
 
 **Output:** `data/results/strong_grid_search_top.csv`,
 `data/results/strong_best_params.json`,
@@ -516,7 +506,7 @@ models (weak, strong) and the MoE on the train+dev portion.
 For every train+dev query a prediction is generated by a base model that
 has **not** seen that query during its training:
 
-1. The pipeline runs 10-fold CV on the ~1 317 train+dev rows using the
+1. The pipeline runs 10-fold CV on the 1 275 train+dev rows using the
    **same fold definition** (same seed, same `StratifiedKFold` object) as
    Steps 6 and 12.
 2. For each fold, the weak and strong models are re-trained from scratch on
@@ -528,9 +518,9 @@ has **not** seen that query during its training:
 
 ### Test predictions
 
-For the 225–233 test queries the already-trained bundles from
+For the test queries the already-trained bundles from
 `data/models/weak_model.pkl` and `data/models/strong_model.pkl` are used
-directly (they were trained on all ~1 317 train+dev queries, so they have
+directly (they were trained on all 1 275 train+dev queries, so they have
 never seen any test query).
 
 ### Alignment assertion
@@ -576,12 +566,7 @@ NDCG@100 is evaluated on the validation queries using the actual BM25 +
 dense retrieval results — the MoE's predicted alpha is plugged into the wRRF
 formula against real candidate lists.
 
-**Best model:** SVR with `cv_ndcg@100 = 0.4355`
-```json
-{ "model": "svr", "params": { "C": 1.0, "epsilon": 0.05 } }
-```
-
-The final MoE model is retrained on the full traindev meta-dataset and saved
+The winning model is retrained on the full train+dev meta-dataset and saved
 to `data/models/moe_model.pkl`.
 
 **Output:** `data/results/moe_grid_search_top.csv`,
@@ -717,7 +702,7 @@ For every unordered pair of methods among (BM25, Dense, Static RRF,
 wRRF weak, wRRF strong, wRRF MoE) — **15 pairs total** — the pipeline:
 
 1. Collects per-query NDCG@100 scores for the two methods on the merged
-   test set (n = 233 queries).
+   test set (n = 225 queries).
 2. Runs `scipy.stats.ttest_rel` (paired two-sided t-test).
 3. Reports: `n`, `mean_diff`, `t`, `p_value`, `cohens_d`, raw significance
    at α = 0.05, and Holm-Bonferroni corrected significance.
@@ -810,8 +795,7 @@ data/
 │   ├── fiqa/
 │   ├── nfcorpus/
 │   ├── scidocs/
-│   ├── scifact/
-│   └── trec-covid/
+│   └── scifact/
 ├── processed/<embedding_model>/   # per-dataset preprocessed artefacts
 │   └── <dataset>/
 │       ├── corpus.jsonl

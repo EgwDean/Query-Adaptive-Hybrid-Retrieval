@@ -20,6 +20,10 @@ All reproducibility-critical choices (random seeds, query split
 fractions, grid sizes, model lists, etc.) live in ``config.yaml``.
 """
 
+# ============================================================
+# Section A — Project Setup
+# ============================================================
+
 from __future__ import annotations
 
 import itertools
@@ -30,7 +34,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -140,10 +144,9 @@ QUESTION_WORDS = frozenset(
     ["who", "what", "when", "where", "why", "how", "which", "whose", "whom"]
 )
 
-# Models that produce probabilities for binary labels (logistic_regression /
-# gaussian_nb / lda).  All other model factories return regressors that we
-# clip to [0, 1].
-CLASSIFIER_MODELS = {"logistic_regression", "gaussian_nb", "lda"}
+# Models that produce probabilities for binary labels (logistic_regression).
+# All other model factories return regressors that we clip to [0, 1].
+CLASSIFIER_MODELS = {"logistic_regression"}
 
 # Method labels for retrieval comparisons.
 # Routers are the three thesis contributions; baselines are the off-the-shelf
@@ -166,12 +169,11 @@ METHOD_COLORS_6 = [
 # Lookups fall back to a default gray so any dataset listed in config.yaml
 # can be plotted without requiring a hardcoded entry here.
 DS_PALETTE = {
-    "scifact":    "#4878D0",
-    "nfcorpus":   "#EE854A",
-    "arguana":    "#6ACC65",
-    "fiqa":       "#D65F5F",
-    "scidocs":    "#B47CC7",
-    "trec-covid": "#17BECF",
+    "scifact":  "#4878D0",
+    "nfcorpus": "#EE854A",
+    "arguana":  "#6ACC65",
+    "fiqa":     "#D65F5F",
+    "scidocs":  "#B47CC7",
 }
 DS_DEFAULT_COLOR = "#888888"
 
@@ -269,7 +271,6 @@ def make_model(model_name: str, params: dict, seed: int):
             C=float(p["C"]),
             gamma=p.get("gamma", "scale"),
             epsilon=float(p["epsilon"]),
-            cache_size=500,
         )
 
     if model_name == "random_forest":
@@ -307,30 +308,6 @@ def make_model(model_name: str, params: dict, seed: int):
             early_stopping=True,
             validation_fraction=0.15,
             n_iter_no_change=20,
-            random_state=seed,
-        )
-
-    if model_name == "gaussian_nb":
-        from sklearn.naive_bayes import GaussianNB
-        return GaussianNB(var_smoothing=float(p.get("var_smoothing", 1e-9)))
-
-    if model_name == "lda":
-        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-        kw = {"solver": p.get("solver", "svd")}
-        if kw["solver"] != "svd" and p.get("shrinkage") is not None:
-            kw["shrinkage"] = p["shrinkage"]
-        return LinearDiscriminantAnalysis(**kw)
-
-    if model_name == "adaboost":
-        from sklearn.ensemble import AdaBoostRegressor
-        from sklearn.tree import DecisionTreeRegressor
-        base = DecisionTreeRegressor(
-            max_depth=int(p.get("base_max_depth", 1)), random_state=seed,
-        )
-        return AdaBoostRegressor(
-            estimator=base,
-            n_estimators=int(p["n_estimators"]),
-            learning_rate=float(p["learning_rate"]),
             random_state=seed,
         )
 
@@ -535,13 +512,6 @@ def expand_grid(grid_cfg: dict) -> List[Tuple[str, dict]]:
     return combos
 
 
-def truncate_combos(combos: List[Tuple[str, dict]], cap: int) -> List[Tuple[str, dict]]:
-    """Truncate the combo list to `cap` if it exceeds it."""
-    if cap and len(combos) > cap:
-        print(f"[INFO] grid has {len(combos)} combos; truncating to cap={cap}.")
-        return combos[:cap]
-    return combos
-
 
 # ============================================================
 # Section B — Step implementations
@@ -629,7 +599,7 @@ def _build_bm25_and_freq_indices(tokenized_corpus_jsonl: str, k1: float, b: floa
     """Build BM25 index + word frequency + document frequency in a SINGLE pass.
 
     Reading the tokenised corpus is the dominant I/O cost on large datasets
-    (e.g. trec-covid, 171k docs).  Computing both freq indices alongside the
+    (e.g. fiqa, ~58k docs).  Computing both freq indices alongside the
     BM25 input avoids a second full scan.  After BM25Okapi has copied the
     tokens into its own internal arrays, we drop the local list to free the
     transient ~200-500 MB Python-list memory before pickling.
@@ -719,8 +689,10 @@ def _encode_with_oom_retry(model, texts, device, batch_size):
             results.append(embs.cpu())
             start = end
         except torch.cuda.OutOfMemoryError:
-            try: torch.cuda.empty_cache()
-            except Exception: pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception as cache_exc:
+                print(f"\n  [WARN] empty_cache failed: {cache_exc}")
             bs = max(1, bs // 2)
             print(f"\n  [OOM] sub-batch -> {bs}")
             if bs == 1 and end - start == 1:
@@ -982,7 +954,6 @@ def step_03_optimize_bm25(cfg: dict, device: torch.device) -> None:
             qrels = load_qrels(os.path.join(ds_dir, "qrels.tsv"))
 
             # Restrict retrieval to the 300 selected queries (much faster).
-            sel_set = set(selected_qids[ds_name])
             queries_sel = {q: queries_all[q] for q in selected_qids[ds_name]
                            if q in queries_all}
 
@@ -1057,10 +1028,15 @@ def _select_merged_qids(cfg: dict) -> Dict[str, List[str]]:
 
 def _load_dense_results_with_cache(cfg: dict, ds_name: str, queries_jsonl: str,
                                    device: torch.device) -> Dict[str, List[Tuple[str, float]]]:
-    """Run dense retrieval over ALL queries of a dataset, cached on disk."""
+    """Run dense retrieval over the selected queries of a dataset, cached on disk.
+
+    Only the qids in `_select_merged_qids` are scored — every downstream step
+    indexes results by qid via `.get(qid, [])`, so unselected queries would be
+    wasted compute (arguana, fiqa).
+    """
     ds_dir   = dataset_processed_dir(cfg, ds_name)
     top_k    = int(cfg["benchmark"]["top_k"])
-    cache    = os.path.join(ds_dir, f"dense_results_topk_{top_k}.pkl")
+    cache    = os.path.join(ds_dir, f"dense_results_topk_{top_k}_selected.pkl")
 
     if is_nonempty_file(cache):
         try:
@@ -1082,13 +1058,21 @@ def _load_dense_results_with_cache(cfg: dict, ds_name: str, queries_jsonl: str,
             print("  [WARN] CUDA OOM; falling back to CPU for dense retrieval.")
             torch.cuda.empty_cache()
     corpus_ids = load_pickle(corpus_ids_pkl)
-    q_vecs = torch.load(query_vecs_pt, weights_only=True)
-    q_ids  = load_pickle(query_ids_pkl)
+    q_vecs_full = torch.load(query_vecs_pt, weights_only=True)
+    q_ids_full  = load_pickle(query_ids_pkl)
+
+    # Subset to selected qids — preserves order from `_select_merged_qids`.
+    selected_qids = set(_select_merged_qids(cfg)[ds_name])
+    qid_to_idx = {q: i for i, q in enumerate(q_ids_full)}
+    keep_idx   = [qid_to_idx[q] for q in q_ids_full if q in selected_qids]
+    q_ids = [q_ids_full[i] for i in keep_idx]
+    q_vecs = q_vecs_full[keep_idx]
+
     results = run_dense_retrieval(q_vecs, q_ids, corpus_embeddings, corpus_ids, top_k, cfg,
                                   desc=f"Dense retrieval [{ds_name}]")
     save_pickle(results, cache)
     # Release the GPU/RAM working set before the next dataset's call.
-    del corpus_embeddings, q_vecs, corpus_ids, q_ids
+    del corpus_embeddings, q_vecs, q_vecs_full, corpus_ids, q_ids, q_ids_full
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return results
@@ -1459,7 +1443,7 @@ def step_05_weak_dataset(cfg: dict, device: torch.device) -> None:
         doc_freq,  total_docs          = load_pickle(sparse["doc_freq_pkl"])
         query_tokens = load_pickle(sparse["query_tokens_pkl"])
 
-        bm25_results, dense_results, _ = _load_active_retrieval(cfg, ds_name, device)
+        bm25_results, dense_results, qrels = _load_active_retrieval(cfg, ds_name, device)
 
         train_set = set(split[ds_name]["train"])
         dev_set   = set(split[ds_name]["dev"])
@@ -1472,7 +1456,14 @@ def step_05_weak_dataset(cfg: dict, device: torch.device) -> None:
                 word_freq, total_corpus_tokens, doc_freq, total_docs,
                 stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
             )
-            if   qid in train_set: split_label = "train"
+            # Queries with no relevant docs have a synthetic 0.5 oracle alpha
+            # (unevaluable). Drop them from the dataset so they don't pollute
+            # train/dev/test with noisy labels.
+            qrel = qrels.get(qid, {})
+            has_rel = bool(qrel) and any(g > 0 for g in qrel.values())
+            if not has_rel:
+                split_label = "drop"
+            elif qid in train_set: split_label = "train"
             elif qid in dev_set:   split_label = "dev"
             elif qid in test_set:  split_label = "test"
             else:                  split_label = "drop"
@@ -1552,7 +1543,7 @@ def _retrieval_data_per_dataset(cfg: dict, device: torch.device,
 # ------------------------------------------------------------
 # Common: evaluate one (model_name, params, feature_cols) combo
 # with 10-fold CV on the train+dev portion of the merged dataset.
-# Returns mean NDCG@10 on dev queries (averaged across folds).
+# Returns mean NDCG@ndcg_k on validation queries (averaged across folds).
 # ------------------------------------------------------------
 
 def _cv_score_one_combo(model_name: str, params: dict,
@@ -1578,7 +1569,7 @@ def _cv_score_one_combo(model_name: str, params: dict,
             mdl.fit(X_tr_z, y_fit)
             preds = predict_alpha_from_model(mdl, X_va_z, model_name)
         except Exception as exc:
-            warnings.warn(f"_cv_score_one_combo {model_name} {params}: {exc}")
+            print(f"  [ERROR] _cv_score_one_combo {model_name} {params}: {exc}")
             preds = np.full(len(va_idx), 0.5, dtype=np.float32)
 
         ndcgs = []
@@ -1620,7 +1611,7 @@ def _cv_perquery_scores(model_name: str, params: dict,
             mdl.fit(X_tr_z, y_fit)
             preds = predict_alpha_from_model(mdl, X_va_z, model_name)
         except Exception as exc:
-            warnings.warn(f"_cv_perquery_scores {model_name} {params}: {exc}")
+            print(f"  [ERROR] _cv_perquery_scores {model_name} {params}: {exc}")
             preds = np.full(len(va_idx), 0.5, dtype=np.float32)
         for i, alpha in zip(va_idx, preds):
             qid = qids_td[i]; ds = ds_td[i]
@@ -1650,11 +1641,9 @@ def step_06_weak_grid_search(cfg: dict, device: torch.device) -> None:
     rrf_k  = int(cfg["benchmark"]["rrf"]["k"])
     ndcg_k = int(cfg["benchmark"]["ndcg_k"])
     n_folds = int(cfg["sampling"]["cv_n_folds"])
-    cap    = int(cfg.get("max_models_per_grid", 1500))
     grid_cfg = cfg.get("weak_model_grid_search", {}).get("models", {}) or {}
 
     combos = expand_grid(grid_cfg)
-    combos = truncate_combos(combos, cap)
     print(f"  Total combos: {len(combos)}")
 
     ds = _load_weak_dataset(cfg)
@@ -2292,6 +2281,7 @@ def step_11_strong_dataset(cfg: dict, device: torch.device) -> None:
         q_vecs = torch.load(os.path.join(ds_dir, "query_vectors.pt"), weights_only=True).cpu().numpy()
         q_ids  = load_pickle(os.path.join(ds_dir, "query_ids.pkl"))
         qid_to_idx = {q: i for i, q in enumerate(q_ids)}
+        qrels = load_qrels(os.path.join(ds_dir, "qrels.tsv"))
 
         train_set = set(split[ds_name]["train"])
         dev_set   = set(split[ds_name]["dev"])
@@ -2302,7 +2292,12 @@ def step_11_strong_dataset(cfg: dict, device: torch.device) -> None:
             if idx is None:
                 raise RuntimeError(f"qid {qid} missing from {ds_name} query_vectors")
             X_parts.append(q_vecs[idx:idx + 1].astype(np.float32))
-            if   qid in train_set: split_label = "train"
+            # Match step 5: drop queries with no relevant docs (synthetic 0.5 label).
+            qrel = qrels.get(qid, {})
+            has_rel = bool(qrel) and any(g > 0 for g in qrel.values())
+            if not has_rel:
+                split_label = "drop"
+            elif qid in train_set: split_label = "train"
             elif qid in dev_set:   split_label = "dev"
             elif qid in test_set:  split_label = "test"
             else:                  split_label = "drop"
@@ -2380,11 +2375,9 @@ def step_12_strong_grid_search(cfg: dict, device: torch.device) -> None:
     rrf_k  = int(cfg["benchmark"]["rrf"]["k"])
     ndcg_k = int(cfg["benchmark"]["ndcg_k"])
     n_folds = int(cfg["sampling"]["cv_n_folds"])
-    cap    = int(cfg.get("max_models_per_grid", 1500))
     grid_cfg = cfg.get("strong_model_grid_search", {}).get("models", {}) or {}
 
     combos = expand_grid(grid_cfg)
-    combos = truncate_combos(combos, cap)
     print(f"  Total combos: {len(combos)}")
 
     ds = _load_strong_dataset(cfg)
@@ -2562,7 +2555,8 @@ def _oof_predictions_for(model_bundle_kind: str, cfg: dict, device: torch.device
     model_name = best["model"]; params = best["params"]
     folds = kfold_indices(len(ds["y_td"]), n_folds, seed)
 
-    aw_oof = np.full(len(ds["y_td"]), 0.5, dtype=np.float32)
+    # Folds partition every index, so every entry is overwritten below.
+    aw_oof = np.empty(len(ds["y_td"]), dtype=np.float32)
     for fi, (tr_idx, va_idx) in enumerate(folds):
         X_tr, y_tr = Xc[tr_idx], ds["y_td"][tr_idx]
         X_va       = Xc[va_idx]
@@ -2575,7 +2569,7 @@ def _oof_predictions_for(model_bundle_kind: str, cfg: dict, device: torch.device
             mdl.fit(X_tr_z, y_fit)
             preds = predict_alpha_from_model(mdl, X_va_z, model_name)
         except Exception as exc:
-            warnings.warn(f"OOF [{model_bundle_kind}] fold {fi}: {exc}")
+            print(f"  [ERROR] OOF [{model_bundle_kind}] fold {fi}: {exc}")
             preds = np.full(len(va_idx), 0.5, dtype=np.float32)
         aw_oof[va_idx] = preds
         print(f"    {model_bundle_kind} OOF fold {fi+1}/{n_folds}  (val={len(va_idx)})")
@@ -2693,7 +2687,7 @@ def _cv_score_moe_combo(model_name: str, params: dict,
             mdl.fit(X_tr, y_fit)
             preds = predict_alpha_from_model(mdl, X_va, model_name)
         except Exception as exc:
-            warnings.warn(f"_cv_score_moe_combo {model_name} {params}: {exc}")
+            print(f"  [ERROR] _cv_score_moe_combo {model_name} {params}: {exc}")
             preds = np.full(len(va_idx), 0.5, dtype=np.float32)
         ndcgs = []
         for i, alpha in zip(va_idx, preds):
@@ -2723,7 +2717,6 @@ def step_16_moe_grid_search(cfg: dict, device: torch.device) -> None:
     rrf_k  = int(cfg["benchmark"]["rrf"]["k"])
     ndcg_k = int(cfg["benchmark"]["ndcg_k"])
     n_folds = int(cfg["sampling"]["cv_n_folds"])
-    cap    = int(cfg.get("max_models_per_grid", 1500))
     grid_cfg = cfg.get("moe_grid_search", {}).get("models", {}) or {}
 
     moe = _load_moe_dataset(cfg)
@@ -2731,7 +2724,6 @@ def step_16_moe_grid_search(cfg: dict, device: torch.device) -> None:
     folds = kfold_indices(len(moe["gt_td"]), n_folds, seed)
 
     combos = expand_grid(grid_cfg)
-    combos = truncate_combos(combos, cap)
     print(f"  Total combos: {len(combos)}")
 
     n_jobs = 1 if torch.cuda.is_available() else -1
@@ -3172,8 +3164,8 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
                 for doc_id in cands[m]:
                     required_pairs.add((qid, doc_id))
 
-        # Stream-load only the doc texts we'll actually rerank — for
-        # trec-covid this slashes the working set from ~700 MB to ~10-50 MB.
+        # Stream-load only the doc texts we'll actually rerank — on the
+        # larger corpora this slashes the working set substantially.
         needed_doc_ids = {d for _, d in required_pairs}
         corpus = load_corpus_subset(
             os.path.join(ds_dir, "corpus.jsonl"), needed_doc_ids,
