@@ -270,7 +270,8 @@ by split without re-reading the split file.
 For every `(model_family, hyperparameter_combination)` in
 `weak_model_grid_search.models` the pipeline runs a **10-fold stratified
 cross-validation** on the train + dev rows (1 275 queries across all five
-datasets, before optional reduction due to missing qrels).
+datasets; queries with no relevant document in the qrels are dropped from
+training because their label is a synthetic α = 0.5 placeholder).
 
 ### Normalisation (critical for correctness)
 
@@ -288,9 +289,9 @@ alongside the model so it can be applied at inference time.
 
 ### Prediction protocol
 
-* **Regressors** (XGBoost, Ridge, SVR, …): predict a continuous alpha in
-  `[0, 1]`, clipped to that range after prediction.
-* **Classifiers** (LogisticRegression, GaussianNB, LDA): output
+* **Regressors** (XGBoost, LightGBM, Ridge, SVR, …): predict a continuous
+  alpha in `[0, 1]`, clipped to that range after prediction.
+* **Classifiers** (Logistic Regression): output
   `predict_proba[:, pos_class_idx]`, where `pos_class_idx` is looked up via
   `model.classes_` to handle the degenerate case where the positive class
   (α = 1) never appears in a fold.
@@ -601,9 +602,9 @@ set:
 | BM25 | Sparse-only, best k1/b/stemming |
 | Dense | Dense-only (BGE-M3) |
 | Static RRF | wRRF with α = 0.5 (no adaptation) |
-| wRRF (weak) | 16-feature XGBoost router |
-| wRRF (strong) | 1024-dim BGE-M3 embedding KNN router |
-| wRRF (MoE) | SVR meta-learner combining weak + strong |
+| wRRF (weak) | Router trained on 16 hand-crafted features (best model selected by CV) |
+| wRRF (strong) | Router trained on 1024-dim BGE-M3 query embeddings (best model selected by CV) |
+| wRRF (MoE) | Meta-learner combining weak + strong router predictions (best model selected by CV) |
 
 NDCG@100 per dataset and macro is written to CSV and plotted.
 

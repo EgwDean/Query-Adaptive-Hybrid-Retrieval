@@ -1,0 +1,52 @@
+{
+  "python_version": "3.12.3",
+  "platform": "Linux-6.8.0-107-generic-x86_64-with-glibc2.39",
+  "uname": "Linux rtx4090 6.8.0-107-generic #107-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar 13 19:51:50 UTC 2026 x86_64 x86_64",
+  "hostname": "rtx4090",
+  "cpu_count": 32,
+  "processor": "x86_64",
+  "linux_distro": "Ubuntu 24.04.4 LTS",
+  "linux_distro_id": "ubuntu",
+  "cpu_model": "AMD Ryzen 9 5950X 16-Core Processor",
+  "mem_total_gb": 62.7,
+  "torch_version": "2.11.0+cu130",
+  "numpy_version": "2.4.4",
+  "scipy_version": "1.17.1",
+  "sklearn_version": "1.8.0",
+  "sentence_transformers_version": "5.3.0",
+  "cuda_available": true,
+  "device_used": "cuda",
+  "cuda_version": "13.0",
+  "cudnn_version": 91900,
+  "gpu_count": 1,
+  "gpu_devices": [
+    {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 4090",
+      "total_memory_gb": 23.52,
+      "multi_processor_count": 128,
+      "compute_capability": "8.9"
+    }
+  ],
+  "datasets": [
+    "scifact",
+    "nfcorpus",
+    "arguana",
+    "fiqa",
+    "scidocs"
+  ],
+  "benchmark": {
+    "top_k": 100,
+    "ndcg_k": 100,
+    "rrf": {
+      "k": 60
+    },
+    "bootstrap": {
+      "n_resamples": 1000,
+      "ci": 0.95,
+      "seed": 42
+    }
+  },
+  "embeddings_model": "BAAI/bge-m3",
+  "reranker_model": "cross-encoder/ms-marco-MiniLM-L-6-v2"
+}

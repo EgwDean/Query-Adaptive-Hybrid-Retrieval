@@ -1,23 +1,12 @@
-# Python bytecode
 __pycache__/
 *.pyc
-
-# Virtual environment
 .venv/
-
-# Downloaded datasets and generated results
-data/
-
-# OS / editor junk
+data/processed/
+data/datasets/
 .DS_Store
 Thumbs.db
 *.swp
 *.swo
 .vscode/
-
-# Personal notes
 TODO.txt
 commands.txt
-
-# AI settings
-.claude/

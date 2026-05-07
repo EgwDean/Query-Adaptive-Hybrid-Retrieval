@@ -1,0 +1,9 @@
+{
+  "model": "lightgbm",
+  "params": {
+    "learning_rate": 0.05,
+    "n_estimators": 100,
+    "num_leaves": 15
+  },
+  "cv_ndcg@100": 0.4373011879398393
+}

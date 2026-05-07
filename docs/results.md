@@ -1,10 +1,11 @@
 # Experimental Results — Complete Analysis
 
 This document analyses every quantitative result produced by the pipeline.
-All numbers are on the **held-out 15 % test set** (n = 233 queries across six
-BEIR datasets) unless explicitly stated otherwise.  Metrics are NDCG@100,
-MRR@100, and Recall@100; significance is assessed with paired two-sided
-t-tests, Holm-Bonferroni corrected.
+All numbers are on the **held-out 15 % test set** (n = 225 queries: 45 per
+dataset across five BEIR datasets) unless explicitly stated otherwise.
+Metrics are NDCG@100, MRR@100, and Recall@100; significance is assessed with
+paired two-sided t-tests, Holm-Bonferroni corrected across the family of
+comparisons.
 
 ---
 
@@ -24,667 +25,656 @@ t-tests, Holm-Bonferroni corrected.
 
 ### Datasets
 
-| Dataset | Domain | Corpus size | Query type |
-|---------|--------|-------------|------------|
-| scifact | Biomedical claim verification | ~5 k docs | Short claims |
-| nfcorpus | Medical retrieval | ~3.6 k docs | Short keywords |
-| arguana | Counter-argument retrieval | ~8.7 k docs | Long arguments |
-| fiqa | Financial Q&A | ~57 k docs | Questions |
-| scidocs | Scientific document retrieval | ~25 k docs | Paper titles |
-| trec-covid | COVID-19 literature | ~171 k docs | Clinical questions |
+Five BEIR datasets, each truncated to 300 queries (1 500 total) so every
+dataset contributes equally to training and evaluation:
+
+| Dataset | Domain | Corpus size | Avg. relevant docs/query |
+|---------|--------|-------------|--------------------------|
+| scifact | Biomedical claim verification | ~5 k docs | ~1.1 |
+| nfcorpus | Medical retrieval | ~3.6 k docs | ~38.2 |
+| arguana | Counter-argument retrieval | ~8.7 k docs | ~1.0 |
+| fiqa | Financial Q&A | ~57 k docs | ~2.6 |
+| scidocs | Scientific document retrieval | ~25 k docs | ~4.9 |
 
 ### Test set composition
 
-| Dataset | Test queries | % of total test |
-|---------|-------------|-----------------|
-| scifact | 45 | 19.3 % |
-| nfcorpus | 45 | 19.3 % |
-| arguana | 45 | 19.3 % |
-| fiqa | 45 | 19.3 % |
-| scidocs | 45 | 19.3 % |
-| trec-covid | 8 | 3.4 % |
-| **Total** | **233** | 100 % |
+| Split | Queries/dataset | Total |
+|-------|-----------------|-------|
+| Train | 210 | 1 050 |
+| Dev | 45 | 225 |
+| **Test** | **45** | **225** |
 
-trec-covid contributes only 8 test queries because the dataset's total query
-count is smaller than the other five after the 300-query cap.
+The grid searches operate on train + dev (1 275 queries) via 10-fold
+stratified cross-validation; the test split is never observed by any model
+until the per-dataset evaluation steps.
 
 ---
 
-## 2. BM25 optimisation (Step 3)
+## 2. BM25 grid search
 
-Grid: 5 × 5 × 2 = 50 combinations of `(k1, b, use_stemming)`.
+A 5 × 5 × 2 = 50-point grid over `(k1, b, use_stemming)` is evaluated by
+macro NDCG@100 on the 1 500-query merged dataset.
 
-**Best parameters found:**
+**Winner:** `k1 = 1.2`, `b = 0.75`, `use_stemming = True` —
+**macro NDCG@100 = 0.3295**.
 
-| Parameter | Value |
-|-----------|-------|
-| k1 | 1.2 |
-| b | 0.75 |
-| use_stemming | true |
-| Macro NDCG@100 | 0.3265 |
+The top-5 by macro NDCG@100:
 
-**Interpretation.**  `k1 = 1.2` is a mild term-frequency saturation (the
-standard Elasticsearch default is 1.2 as well).  `b = 0.75` is the standard
-Okapi BM25 document-length normalisation factor.  Stemming helped (+NDCG
-vs. unstemmed), which is expected on biomedical and scientific queries where
-morphological variants are common.
+| Rank | k1 | b | stem | Macro NDCG@100 |
+|------|----|---|------|---------------|
+| 1 | 1.2 | 0.75 | ✓ | 0.3295 |
+| 2 | 1.5 | 0.75 | ✓ | 0.3283 |
+| 3 | 1.6 | 0.75 | ✓ | 0.3279 |
+| 4 | 0.8 | 0.75 | ✓ | 0.3277 |
+| 5 | 2.0 | 0.75 | ✓ | 0.3258 |
 
----
+Two consistent patterns emerge:
 
-## 3. Oracle alpha analysis (Step 4)
+* **Stemming helps everywhere.** The best 10 configurations are all
+  stemmed; the best unstemmed configuration is rank 11 (`k1=0.8, b=0.75,
+  no-stem`, NDCG = 0.3138 — a 1.6 point drop).
+* **`b = 0.75` is robust.** The top 5 all use `b = 0.75` (length
+  normalisation matters), with `b = 0.5` second-best.
+* `k1` is far less sensitive: the top 5 span `k1 ∈ {0.8, 1.2, 1.5, 1.6,
+  2.0}` and differ by only 0.004 NDCG.
 
-The oracle alpha is the per-query optimal fusion weight α* that maximises
-NDCG@100 for weighted RRF fusion.  It represents the upper bound achievable
-by any alpha-routing method on this dataset.
-
-### Oracle NDCG@100 ceiling
-
-| Dataset | Oracle NDCG@100 | Best method NDCG@100 | Gap to oracle |
-|---------|----------------|---------------------|---------------|
-| scifact | 0.7697 | 0.7028 (MoE) | −8.7 % |
-| nfcorpus | 0.3340 | 0.2707 (MoE) | −18.9 % |
-| arguana | 0.4782 | 0.4186 (Dense) | −12.5 % |
-| fiqa | 0.5486 | 0.4402 (MoE) | −19.7 % |
-| scidocs | 0.3045 | 0.3125 (wRRF-weak)* | +2.7 %* |
-| trec-covid | 0.4610 | 0.4335 (wRRF-weak) | −6.1 % |
-| **MACRO** | **0.4827** | **0.4254 (MoE)** | **−11.9 %** |
-
-*scidocs test NDCG slightly exceeds per-query oracle because the oracle is
-computed on the full 1 500-query set while these numbers are on the 45-query
-test subset (different query distribution due to stratified sampling).
-
-**Key insight.**  The MoE router reaches 88 % of the oracle ceiling
-(0.4254 / 0.4827).  The remaining 12 % gap is attributable to router
-imperfection — the routers cannot always identify the optimal alpha because
-the 16 hand-crafted features and the embedding-based features are imperfect
-proxies for query difficulty.
-
-### Alpha distribution (test set)
-
-The oracle alphas are not uniformly distributed:
-- **arguana** strongly prefers dense (low α ≈ 0), consistent with this
-  dataset's long, argument-style queries that are semantically rich.
-- **trec-covid** strongly prefers BM25 (high α ≈ 1), consistent with the
-  importance of exact clinical keyword matching in this domain.
-- **scifact**, **fiqa**, **nfcorpus** show a bimodal or spread distribution,
-  suggesting query-level variability in the optimal retriever.
-
-This variability is precisely why a **query-adaptive** routing strategy can
-outperform a fixed α = 0.5 static fusion.
+These tuned BM25 parameters are propagated through every subsequent step —
+all reported BM25 numbers below use this configuration.
 
 ---
 
-## 4. Weak router: feature ablation (Step 7)
+## 3. Oracle ceiling (per-query brute-force)
 
-The weak router uses 16 hand-crafted features trained with the best XGBoost
-configuration (`cv_ndcg@100 = 0.4362`).
+The oracle alpha label is found per query by exhaustive search over
+α ∈ {0.00, 0.01, ..., 1.00} maximising NDCG@100. This is the theoretical
+upper bound for any single-α wRRF method.
 
-### Leave-one-feature-out results (sorted by CV NDCG@100, desc)
+| Dataset | Oracle NDCG@100 |
+|---------|-----------------|
+| scifact | 0.7697 |
+| nfcorpus | 0.3340 |
+| arguana | 0.4782 |
+| fiqa | 0.5486 |
+| scidocs | 0.3045 |
+| **MACRO** | **0.4870** |
 
-| Removed feature | CV NDCG@100 | Delta vs full |
-|-----------------|------------|---------------|
-| top_sparse_score | 0.4367 | **+0.0005** |
-| (full, 16 features) | 0.4362 | 0.000 |
-| dense_confidence | 0.4361 | −0.0001 |
-| rare_term_ratio | 0.4357 | −0.0005 |
-| average_idf | 0.4357 | −0.0005 |
-| query_length | 0.4356 | −0.0006 |
-| has_question_word | 0.4356 | −0.0006 |
-| sparse_entropy_topk | 0.4356 | −0.0006 |
-| spearman_topk | 0.4355 | −0.0007 |
-| sparse_confidence | 0.4354 | −0.0008 |
-| max_idf | 0.4354 | −0.0008 |
-| cross_entropy | 0.4353 | −0.0009 |
-| top_dense_score | 0.4350 | −0.0012 |
-| overlap_at_k | 0.4350 | −0.0012 |
-| first_shared_doc_rank | 0.4342 | −0.0020 |
-| stopword_ratio | 0.4339 | −0.0023 |
-| dense_entropy_topk | 0.4337 | −0.0025 |
+Per-dataset oracle alpha distributions (mean / median / std):
 
-### Leave-one-group-out results
+| Dataset | Mean α | Median α | Std α | % α = 0 (pure dense) | % α = 1 (pure BM25) |
+|---------|--------|----------|-------|----------------------|--------------------|
+| scifact | 0.129 | 0.000 | 0.257 | 69.0 % | 0.0 % |
+| nfcorpus | 0.273 | 0.090 | 0.326 | 42.3 % | 1.3 % |
+| arguana | 0.138 | 0.000 | 0.256 | 69.0 % | 0.0 % |
+| fiqa | 0.137 | 0.000 | 0.244 | 62.0 % | 0.0 % |
+| scidocs | 0.340 | 0.165 | 0.375 | 41.3 % | 0.3 % |
 
-| Removed group | CV NDCG@100 | Delta vs full |
-|---------------|------------|---------------|
-| D: Retriever Agreement | 0.4363 | +0.0001 |
-| B: Vocabulary Match | 0.4362 | −0.0000 |
-| (full) | 0.4362 | 0.000 |
-| E: Distribution Shape | 0.4354 | −0.0008 |
-| C: Retriever Confidence | 0.4352 | −0.0010 |
-| A: Query Surface | 0.4336 | −0.0026 |
+**Interpretation.** Across every dataset the oracle prefers Dense (α near
+0) on the majority of queries — typically 41–69 % of queries pick pure
+dense as optimal. Pure BM25 (α = 1) is virtually never optimal: only on
+some specialised nfcorpus queries does it prevail. nfcorpus and scidocs
+have the highest mean optimal α, consistent with their reliance on
+domain-specific keywords (medical terminology, paper titles) where BM25
+contributes useful signal.
 
-**Findings:**
-
-1. **Removing `top_sparse_score` marginally helps** (+0.0005), suggesting
-   it introduces slight noise.  The final model is trained without it (the
-   ablation winner).
-
-2. **Group A (Query Surface) is the most critical group**: removing it
-   costs −0.0026 NDCG points — the largest group-level drop.  Even simple
-   features like query length and stop-word ratio capture meaningful routing
-   signal.
-
-3. **Group C (Retriever Confidence) and Group E (Distribution Shape)** are
-   the next most impactful individual-feature groups.  The top-dense score
-   and density entropy features encode information about how "peaked" a
-   retriever's ranking is, which correlates with how much a query benefits
-   from that retriever.
-
-4. **Groups B and D contribute very little** (near-zero delta), suggesting
-   vocabulary match and retriever agreement features are largely redundant
-   given the other groups.
-
-5. **No single feature produces a large drop** (maximum −0.0025), which
-   indicates the feature set is reasonably redundant and robust — consistent
-   with a well-designed ensemble of heterogeneous signal sources.
+The macro oracle ceiling of **0.4870** sets the bar for any router. The
+gap between this ceiling and the static-RRF baseline (0.4042) is **8.3
+NDCG points** — that is the maximum achievable adaptive-fusion gain on
+this benchmark.
 
 ---
 
-## 5. Model selection summary
+## 4. Weak-router grid search and ablation
 
-| Stage | Best model | Key hyperparameters | CV NDCG@100 |
-|-------|-----------|---------------------|-------------|
-| Weak router | XGBoost | lr=0.05, depth=4, n_est=300 | 0.4362 |
-| Strong router | KNN | k=5, weights=distance | 0.4343 |
-| MoE meta-learner | SVR | C=1.0, ε=0.05 | 0.4355 |
+### 4.1 Grid search
 
-**XGBoost** won the weak router grid search — it can capture non-linear
-interactions between the 16 hand-crafted features efficiently.
+Six model families × hyperparameter grids = **66 combinations**, evaluated
+by 10-fold CV on 1 275 train+dev queries with a `StandardScaler` fit on
+the training fold only (no leakage).
 
-**KNN (k=5, distance-weighted)** won the strong router.  With 1 024-dimensional
-embedding features, KNN effectively performs nearest-neighbour interpolation
-in embedding space: queries whose embedding is close to a training query
-with a known oracle alpha inherit a similar predicted alpha.  Distance
-weighting ensures closer neighbours have larger influence.
+**Winner:** `lightgbm` with
+`learning_rate = 0.05, n_estimators = 100, num_leaves = 15`.
+**CV NDCG@100 = 0.4373**.
 
-**SVR (C=1.0, ε=0.05)** won the MoE meta-learner.  On a 2–3 dimensional
-input, SVR with a radial basis function kernel is expressive enough to learn
-non-linear corrections to the base predictions without overfitting.  The
-tight ε = 0.05 insensitive zone means only meaningful deviations from the
-base predictions are corrected.
+Top-5 of the grid:
 
----
+| Rank | Model | CV NDCG@100 |
+|------|-------|-------------|
+| 1 | lightgbm (lr=0.05, n=100, leaves=15) | 0.4373 |
+| 2 | logistic_regression (C=10) | 0.4370 |
+| 3 | logistic_regression (C=100) | 0.4370 |
+| 4 | xgboost (lr=0.1, depth=4, n=100) | 0.4370 |
+| 5 | logistic_regression (C=1) | 0.4369 |
 
-## 6. Main retrieval results — NDCG@100
+Notable observations:
 
-### Per-dataset NDCG@100 (test set, n=233 queries)
+* **The performance band is extraordinarily tight.** The best 30
+  combinations sit within 0.001 NDCG of each other. With CV standard
+  deviation of comparable magnitude, the choice between LightGBM,
+  Logistic Regression, XGBoost, and Random Forest is essentially noise.
+  Logistic Regression is competitive — telling you the routing problem
+  on these 16 features is, in large part, *linearly separable*.
+* **High learning rates hurt.** Every `lr = 0.3` boosting configuration
+  ranks at the bottom; tree models prefer slower fits on this small
+  dataset.
 
-| Dataset | BM25 | Dense | Static RRF | wRRF Weak | wRRF Strong | MoE |
-|---------|------|-------|------------|-----------|-------------|-----|
-| scifact | 0.6365 | 0.6985 | 0.6779 | 0.6845 | 0.6934 | **0.7028** |
-| nfcorpus | 0.2319 | 0.2606 | 0.2700 | 0.2687 | 0.2695 | **0.2707** |
-| arguana | 0.2859 | **0.4186** | 0.3796 | 0.4111 | 0.4043 | 0.4104 |
-| fiqa | 0.2410 | 0.4319 | 0.3801 | 0.4329 | 0.4350 | **0.4372** |
-| scidocs | 0.2419 | 0.2909 | 0.3062 | **0.3125** | 0.3036 | 0.3023 |
-| trec-covid | 0.3053 | 0.4204 | 0.4151 | **0.4335** | 0.4304 | 0.4290 |
-| **MACRO** | 0.3238 | 0.4201 | 0.4048 | 0.4239 | 0.4227 | **0.4254** |
+### 4.2 Two-phase ablation
 
-### Relative improvements (MACRO NDCG@100)
+**Phase 1 — leave-one-out:** the full 16-feature model is compared
+against 16 leave-one-feature-out and 5 leave-one-group-out variants.
+A feature/group is **non-damaging** if its removal yields ΔNDCG ≥ 0
+(i.e. did not hurt).
 
-| Comparison | Absolute Δ | Relative Δ |
-|-----------|------------|------------|
-| MoE vs BM25 | +0.1016 | **+31.4 %** |
-| MoE vs Static RRF | +0.0206 | **+5.1 %** |
-| MoE vs Dense | +0.0053 | +1.3 % |
-| wRRF Weak vs Static RRF | +0.0191 | +4.7 % |
-| wRRF Strong vs Static RRF | +0.0179 | +4.4 % |
+Two non-damaging items emerged:
 
-### 95 % bootstrap confidence intervals (MACRO, n=233)
+| Removed | CV NDCG@100 | Δ vs. full |
+|---------|-------------|------------|
+| `dense_confidence` | 0.43744 | **+0.00014** |
+| `top_sparse_score` | 0.43730 | 0.00000 |
 
-| Method | Mean | CI low | CI high |
-|--------|------|--------|---------|
-| BM25 | 0.3267 | 0.2841 | 0.3699 |
-| Dense | 0.4201 | 0.3763 | 0.4594 |
-| Static RRF | 0.4032 | 0.3605 | 0.4443 |
-| wRRF Weak | 0.4223 | 0.3800 | 0.4637 |
-| wRRF Strong | 0.4215 | 0.3774 | 0.4644 |
-| MoE | **0.4248** | 0.3813 | 0.4640 |
+Every other removal hurt. The most damaging single-feature drops:
 
-The CI ranges for Dense, wRRF Weak, wRRF Strong, and MoE substantially
-overlap (widths of ~0.08 NDCG points), reflecting the inherent variance
-over 233 queries.  The BM25 CI is clearly separated from all other methods.
+| Removed feature | Δ vs. full |
+|-----------------|------------|
+| `overlap_at_k` | −0.0024 |
+| `query_length` | −0.0022 |
+| `spearman_topk` | −0.0017 |
+| `dense_entropy_topk` | −0.0016 |
+| `stopword_ratio` | −0.0014 |
 
-**Key interpretations:**
+The most damaging group drops:
 
-- **scifact:** MoE is the clear winner (+0.0043 over dense).  The routing
-  correctly identifies that some claims need sparse keyword matching (claim
-  verification often involves precise terminology) while others benefit from
-  semantic understanding.
+| Removed group | Δ vs. full |
+|--------------|------------|
+| Group A — Query Surface | −0.0017 |
+| Group D — Retriever Agreement | −0.0013 |
+| Group E — Distribution Shape | −0.0011 |
 
-- **nfcorpus:** All fusion methods beat BM25, but differences among
-  Dense/Static/Weak/Strong/MoE are tiny (<0.01).  This dataset is notoriously
-  hard; the corpus is small with complex medical terminology, and no method
-  dominates.
+**Phase 2 — combination test with statistical significance.** All
+2² − 1 = 3 non-empty subsets of the two non-damaging features were
+tested against the full model with paired t-tests over per-query
+NDCG@100, Holm-Bonferroni corrected:
 
-- **arguana:** Dense is the winner (0.4186) and the adaptive routers slightly
-  underperform it.  arguana's queries are long counter-arguments that benefit
-  from dense semantic matching; the oracle alphas are heavily skewed toward
-  α = 0 (dense).  When the router incorrectly predicts a non-zero α, the BM25
-  component hurts.  MoE (0.4104) and wRRF Weak (0.4111) get very close to
-  Dense but do not beat it.
+| Removed | n_features | CV NDCG@100 | Δ | p_holm | sig_better |
+|---------|------------|-------------|---|--------|-----------|
+| `dense_confidence` | 15 | 0.43743 | +0.00014 | 1.0 | False |
+| `dense_confidence` + `top_sparse_score` | 14 | 0.43743 | +0.00014 | 1.0 | False |
+| `top_sparse_score` | 15 | 0.43729 | 0 | 1.0 | False |
 
-- **fiqa:** MoE is best (0.4372), beating dense by +0.0053 and static RRF by
-  +0.0572.  Financial Q&A benefits from both precise term matching (ticker
-  symbols, numbers) and semantic understanding (question intent).
+**Final selection: the full 16-feature set is retained.** No reduced
+combination was Holm-significantly better (p_holm = 1.0 for all). The
+two "non-damaging" features contribute ≈ 0 marginal signal individually
+but are not statistically harmful, so dropping them is unjustified
+under a conservative criterion.
 
-- **scidocs:** wRRF Weak performs best (0.3125 vs. 0.2909 Dense, 0.3062
-  Static RRF).  Document title matching in scientific literature rewards
-  sparse keyword overlap, but the optimal mix varies by query.  Interestingly,
-  wRRF Strong (0.3036) and MoE (0.3023) are slightly *below* Static RRF —
-  the 1024-dim KNN router may be over-fitting to dataset-specific patterns
-  from the training set, while the 16-feature weak router generalises better
-  on this domain.
+### 4.3 SHAP feature importance
 
-- **trec-covid:** wRRF Weak is best (0.4335).  COVID-19 retrieval rewards
-  precise keyword matching; the oracle alphas here tend toward BM25 (high α).
-  The weak router captures this via query surface and vocabulary features.
+The SHAP summary plot (`weak_shap.png`) ranks the 16 features by mean
+absolute SHAP value. Although the per-feature ablation deltas are tiny
+(reflecting strong feature redundancy), the ablation deltas and SHAP
+ranking agree on the discriminative roles of `overlap_at_k`,
+`query_length`, `spearman_topk`, `dense_entropy_topk` — the same features
+that hurt most when removed are the ones SHAP shows as carrying signal.
 
 ---
 
-## 7. MRR@100 results
+## 5. Strong-router grid search
 
-Mean Reciprocal Rank at 100 captures how high the first relevant document
-ranks.
+The strong-router input is the **1 024-dim BGE-M3 query embedding**.
+Eight families × hyperparameter grids = **108 combinations** evaluated
+under the same 10-fold CV protocol.
 
-### Per-dataset MRR@100 (test set)
+**Winner:** `xgboost` with
+`colsample_bytree = 0.3, learning_rate = 0.1, max_depth = 8,
+n_estimators = 100, subsample = 0.8`. **CV NDCG@100 = 0.4356**.
 
-| Dataset | BM25 | Dense | Static RRF | wRRF Weak | wRRF Strong | MoE |
-|---------|------|-------|------------|-----------|-------------|-----|
-| scifact | 0.6045 | 0.6681 | 0.6293 | 0.6402 | 0.6514 | **0.6684** |
-| nfcorpus | 0.4455 | 0.4682 | 0.4821 | 0.4901 | 0.4959 | **0.4948** |
-| arguana | 0.1463 | **0.2603** | 0.2171 | 0.2506 | 0.2473 | 0.2536 |
-| fiqa | 0.2743 | 0.4468 | 0.3827 | 0.4405 | 0.4441 | **0.4602** |
-| scidocs | 0.3395 | 0.4019 | 0.4321 | **0.4456** | 0.4155 | 0.4213 |
-| trec-covid | **0.8203** | 0.7574 | 0.8788 | **0.8824** | 0.8819 | **0.8824** |
-| **MACRO** | 0.4384 | 0.5004 | 0.5037 | 0.5249 | 0.5227 | **0.5301** |
+Top-5:
 
-### MRR@100 relative improvements (MACRO)
+| Rank | Model | CV NDCG@100 |
+|------|-------|-------------|
+| 1 | xgboost (colsample=0.3, lr=0.1, depth=8, n=100) | 0.4356 |
+| 2 | xgboost (colsample=0.3, lr=0.1, depth=4, n=100) | 0.4354 |
+| 3 | xgboost (colsample=0.1, lr=0.1, depth=8, n=100) | 0.4352 |
+| 4 | xgboost (colsample=0.1, lr=0.1, depth=6, n=100) | 0.4348 |
+| 5 | mlp (alpha=0.01, hidden=[512,256]) | 0.4345 |
 
-| Comparison | Absolute Δ | Relative Δ |
-|-----------|------------|------------|
-| MoE vs BM25 | +0.0917 | **+20.9 %** |
-| MoE vs Dense | +0.0297 | **+5.9 %** |
-| MoE vs Static RRF | +0.0264 | **+5.2 %** |
+Tree models with low column-sampling rates dominate the top of the grid —
+on a 1 024-feature input, randomising the per-tree feature subset prevents
+a few high-norm dimensions from monopolising splits.
 
-**Note:** For MRR, the adaptive methods achieve larger absolute gains over
-Dense and Static RRF than for NDCG.  This is because routing correctly
-towards the stronger retriever for a query lifts the first relevant document
-rank, even when the overall list NDCG changes only slightly.
-
-**trec-covid MRR@100 highlight:**  BM25 alone achieves MRR = 0.8203 on
-trec-covid, the highest of all single-retriever scores across all datasets.
-Static RRF (0.8788) and all adaptive methods (≈0.882) push this even higher
-by recovering the rare queries where dense retrieval finds the answer first.
+The strong router achieves **CV NDCG = 0.4356**, slightly *below* the weak
+router (0.4373). The 1 024-dim embedding carries no meaningful additional
+signal on this dataset — the 16 hand-crafted features already capture what
+matters for the routing decision. Section 7 confirms this on the held-out
+test set.
 
 ---
 
-## 8. Recall@100 results
+## 6. MoE meta-learner grid search
 
-Recall@100 measures how many relevant documents appear anywhere in the
-top-100 candidate list.  It is the ceiling for any re-ranker that uses these
-candidates.
+The MoE input is `[α_weak, α_strong, |α_weak − α_strong|]` (3-D for
+non-tree models, 2-D for tree models). Ten model families × small grids
+= **77 combinations**.
 
-### Per-dataset Recall@100 (test set)
+**Winner:** `svr` with `C = 1.0, epsilon = 0.05`.
+**CV NDCG@100 = 0.4362**.
 
-| Dataset | BM25 | Dense | Static RRF | wRRF Weak | wRRF Strong | MoE | Union (ceiling) |
-|---------|------|-------|------------|-----------|-------------|-----|----------------|
-| scifact | 0.7956 | 0.8844 | 0.9067 | 0.9067 | 0.9067 | 0.9067 | 0.9067 |
-| nfcorpus | 0.2186 | 0.2636 | 0.2535 | 0.2703 | 0.2604 | 0.2685 | 0.2997 |
-| arguana | 0.8000 | 0.9556 | 0.9556 | 0.9556 | 0.9333 | 0.9333 | 0.9778 |
-| fiqa | 0.4145 | 0.6848 | 0.6578 | 0.6948 | 0.6856 | 0.6904 | 0.7078 |
-| scidocs | 0.3356 | 0.4300 | 0.4300 | 0.4433 | 0.4344 | 0.4389 | 0.4789 |
-| trec-covid | 0.0747 | 0.0998 | 0.0981 | 0.1038 | 0.1014 | 0.1020 | 0.1509 |
-| **MACRO** | 0.4398 | 0.5530 | 0.5503 | **0.5624** | 0.5536 | 0.5567 | 0.5869 |
+Top-5:
 
-### Gap to recall ceiling
+| Rank | Model | CV NDCG@100 |
+|------|-------|-------------|
+| 1 | svr (C=1.0, ε=0.05) | 0.43618 |
+| 2 | xgboost (lr=0.05, depth=2, n=200) | 0.43617 |
+| 3 | svr (C=10, ε=0.05) | 0.43615 |
+| 4 | lightgbm (lr=0.05, depth=2, n=100) | 0.43610 |
+| 5 | xgboost (lr=0.1, depth=4, n=50) | 0.43607 |
 
-| Method | MACRO Recall@100 | Gap to union ceiling |
-|--------|-----------------|---------------------|
-| BM25 | 0.4398 | −0.1471 (−25.1 %) |
-| Dense | 0.5530 | −0.0339 (−5.8 %) |
-| Static RRF | 0.5503 | −0.0366 (−6.2 %) |
-| wRRF Weak | **0.5624** | **−0.0245 (−4.2 %)** |
-| wRRF Strong | 0.5536 | −0.0333 (−5.7 %) |
-| MoE | 0.5567 | −0.0302 (−5.1 %) |
+Once again the top of the grid is statistically indistinguishable: SVR,
+XGBoost, LightGBM, Ridge, and ElasticNet all sit within 0.0002 NDCG of
+each other. The 2-dimensional input space leaves little room for
+sophisticated model classes to differentiate themselves.
 
-**wRRF Weak has the best Recall@100** and comes closest to the union
-ceiling.  This is somewhat surprising — the strong (embedding-based) router
-does not dominate here.  The explanation: recall is determined by whether
-the router avoids dropping relevant documents that only BM25 or only Dense
-finds.  The 16-feature weak router may be better calibrated at identifying
-these boundary cases, while the KNN strong router sometimes strongly commits
-to one retriever and loses the other's unique relevant docs.
+The MoE CV score (0.4362) is between the weak and strong CV scores. By
+itself this hints at what the test set will confirm: the meta-learner
+adds little when its two base models agree on most queries.
 
-**scifact, arguana:** The three fusion methods (Static, Weak, Strong) all
-achieve 0.9067 and 0.9556 respectively — matching the BM25 ∪ Dense union
-ceiling.  At this recall level any of them is an equally good candidate
-generator for a re-ranker.
-
-**trec-covid Recall@100** is remarkably low even for the union ceiling (0.1509).
-This dataset has thousands of relevant documents per query in the qrels
-(because it was judged exhaustively), so top-100 can only retrieve a tiny
-fraction of all relevant docs.
+**Base-model agreement:** the Pearson correlation between `α_weak` and
+`α_strong` across all 1 500 queries is **0.299**, with a mean absolute
+disagreement of **0.125**. They agree on direction but the strong router
+systematically predicts smaller α values (heavier dense bias) — the MoE
+mostly learns to interpolate.
 
 ---
 
-## 9. Statistical significance
+## 7. Test-set retrieval comparison (NDCG@100)
 
-### NDCG@100 paired t-tests (n=233 queries)
+The headline table on the held-out **225-query test set** (45 per
+dataset). All adaptive methods use a saved router/scaler bundle that was
+trained on the 1 275 train+dev queries and never exposed to a test query
+during training or grid search.
 
-| Method A | Method B | Mean Δ | t-stat | p-value | Cohen's d | Sig. (raw) | Sig. (Holm) |
-|----------|----------|--------|--------|---------|-----------|------------|-------------|
-| wRRF Weak | BM25 | +0.0956 | 6.49 | 5.1e-10 | 0.425 | **yes** | **yes** |
-| wRRF Weak | Static RRF | +0.0191 | 2.78 | 0.0059 | 0.182 | **yes** | **yes** |
-| wRRF Weak | Dense | +0.0022 | 0.36 | 0.719 | 0.024 | no | no |
-| wRRF Strong | BM25 | +0.0948 | 6.77 | 1.0e-10 | 0.444 | **yes** | **yes** |
-| wRRF Strong | Static RRF | +0.0183 | 2.98 | 0.0032 | 0.195 | **yes** | **yes** |
-| wRRF Strong | Dense | +0.0014 | 0.20 | 0.844 | 0.013 | no | no |
-| MoE | BM25 | +0.0981 | 5.99 | 7.8e-09 | 0.393 | **yes** | **yes** |
-| MoE | Static RRF | +0.0216 | 2.42 | 0.0161 | 0.159 | **yes** | no |
-| MoE | Dense | +0.0047 | 1.35 | 0.178 | 0.089 | no | no |
-| wRRF Weak | wRRF Strong | +0.0008 | 0.19 | 0.852 | 0.012 | no | no |
-| wRRF Weak | MoE | −0.0025 | −0.55 | 0.586 | −0.036 | no | no |
-| wRRF Strong | MoE | −0.0034 | −0.57 | 0.567 | −0.038 | no | no |
+### 7.1 Macro NDCG@100
 
-**Key findings — NDCG@100:**
+| Method | Macro NDCG@100 | 95 % CI |
+|--------|---------------|---------|
+| BM25 | 0.3275 | [0.283, 0.371] |
+| Dense (BGE-M3) | 0.4201 | [0.376, 0.461] |
+| Static RRF (α = 0.5) | 0.4042 | [0.362, 0.445] |
+| wRRF (weak) | 0.4221 | [0.378, 0.465] |
+| wRRF (strong) | 0.4243 | [0.377, 0.466] |
+| **wRRF (MoE)** | **0.4256** | [0.380, 0.467] |
+| **Oracle ceiling** | **0.4870** | — |
 
-1. **All three adaptive methods significantly outperform BM25** (p < 1e-8,
-   Holm corrected), with medium effect sizes (Cohen's d ≈ 0.39–0.44).
-   This is the clearest win: query-adaptive fusion is definitively better
-   than sparse-only retrieval.
+### 7.2 Per-dataset NDCG@100
 
-2. **All three adaptive methods significantly outperform Static RRF** (p < 0.02)
-   before Holm correction.  After Holm correction, wRRF Weak and wRRF Strong
-   remain significant (p_holm < 0.05), while MoE becomes borderline
-   (p_holm = 0.113).  This confirms that **per-query alpha routing is better
-   than a fixed equal-weight fusion**.
+| Dataset | BM25 | Dense | Static | Weak | Strong | MoE |
+|---------|------|-------|--------|------|--------|-----|
+| scifact | 0.6365 | 0.6985 | 0.6830 | 0.6846 | 0.6939 | **0.6995** |
+| nfcorpus | 0.2319 | 0.2606 | 0.2673 | **0.2703** | 0.2676 | **0.2711** |
+| arguana | 0.2859 | **0.4186** | 0.3796 | 0.4130 | 0.4159 | 0.4103 |
+| fiqa | 0.2410 | 0.4319 | 0.3850 | 0.4260 | 0.4369 | **0.4371** |
+| scidocs | 0.2419 | 0.2909 | 0.3062 | **0.3164** | 0.3070 | 0.3101 |
+| **MACRO** | 0.3275 | 0.4201 | 0.4042 | 0.4221 | 0.4243 | **0.4256** |
 
-3. **No method significantly beats Dense** (p > 0.17 for all three).  The
-   confidence intervals for Dense, wRRF Weak, wRRF Strong, and MoE overlap
-   substantially.  Dense retrieval (BGE-M3) is a very strong baseline, and
-   while the adaptive methods consistently beat it numerically (+0.001 to
-   +0.005), the differences are not statistically distinguishable at n = 233.
+**Headline observations:**
 
-4. **The three adaptive methods are statistically indistinguishable from
-   each other** (p > 0.55 for all pairwise comparisons).  The weak router
-   (16 features, XGBoost) performs as well as the strong router (1024-dim
-   embeddings, KNN) and the MoE ensemble.  This is a remarkable result:
-   cheap hand-crafted features are sufficient; expensive embedding-based
-   routing provides no additional significant lift.
+1. **All three adaptive routers beat BM25, Dense, and Static RRF on
+   macro NDCG.** The MoE wins on macro and on three of five datasets
+   (scifact, nfcorpus, fiqa). Weak wins scidocs and ties nfcorpus.
+2. **Weak vs. strong router is statistically a tie.** Δ = 0.0022
+   (Section 8 confirms p = 0.65, not significant).
+3. **Dense-only is a genuinely strong baseline.** It already gets
+   0.4201 macro, only 0.005 NDCG behind the MoE — but that gap is
+   per-dataset *negative* on arguana (Dense beats every fusion method
+   there). Section 7.4 explains why.
+4. **Static RRF (α = 0.5) is harmful relative to Dense.** The
+   uniform-fusion baseline pulls 0.0159 NDCG below dense on the macro
+   because BM25 is a weak retriever on most of these corpora.
+   Adaptive fusion fixes this by learning to assign small α values
+   when BM25 is weak.
 
-### MRR@100 paired t-tests (n=233 queries)
+### 7.3 MRR@100
 
-| Method A | Method B | Mean Δ | p-value | Sig. (Holm) |
-|----------|----------|--------|---------|-------------|
-| wRRF Weak | BM25 | +0.0903 | 3.4e-05 | **yes** |
-| wRRF Weak | Dense | +0.0085 | 0.508 | no |
-| wRRF Weak | Static RRF | +0.0240 | 0.063 | no |
-| wRRF Strong | BM25 | +0.0879 | 2.8e-05 | **yes** |
-| wRRF Strong | Dense | +0.0060 | 0.632 | no |
-| wRRF Strong | Static RRF | +0.0215 | 0.081 | no |
-| MoE | BM25 | +0.0964 | 4.8e-05 | **yes** |
-| MoE | Dense | +0.0145 | 0.093 | no |
-| MoE | Static RRF | +0.0301 | 0.056 | no |
+| Method | Macro MRR@100 | 95 % CI |
+|--------|---------------|---------|
+| BM25 | 0.3620 | [0.307, 0.417] |
+| Dense | 0.4491 | [0.391, 0.500] |
+| Static RRF | 0.4308 | [0.373, 0.485] |
+| wRRF (weak) | 0.4572 | [0.401, 0.513] |
+| wRRF (strong) | 0.4533 | [0.397, 0.507] |
+| **wRRF (MoE)** | **0.4618** | [0.406, 0.516] |
 
-For MRR, the pattern is similar to NDCG: strong significance vs. BM25,
-no significance vs. Dense.  Notably, even vs. Static RRF the MRR differences
-are only borderline significant (p = 0.056–0.081) and non-significant after
-Holm correction.  MRR is noisier than NDCG (a single document position
-change can swing MRR substantially), which reduces statistical power.
+The MoE wins on MRR by an even larger margin (Δ vs. dense = +0.013, vs.
+weak = +0.005). Reranking-quality first-position retrieval is precisely
+where adaptive routing helps most.
 
-### Recall@100 paired t-tests (n=233 queries)
+### 7.4 Recall@100
 
-| Method A | Method B | Mean Δ | p-value | Sig. (Holm) |
-|----------|----------|--------|---------|-------------|
-| wRRF Weak | BM25 | +0.1374 | 2.6e-11 | **yes** |
-| wRRF Weak | Dense | +0.0102 | 0.229 | no |
-| wRRF Weak | Static RRF | +0.0132 | 0.0086 | no (Holm) |
-| wRRF Strong | BM25 | +0.1277 | 1.0e-09 | **yes** |
-| wRRF Strong | Dense | +0.0004 | 0.953 | no |
-| wRRF Strong | Static RRF | +0.0034 | 0.599 | no |
-| MoE | BM25 | +0.1310 | 5.5e-10 | **yes** |
-| MoE | Dense | +0.0038 | 0.593 | no |
-| MoE | Static RRF | +0.0067 | 0.318 | no |
+| Method | Macro Recall@100 | 95 % CI |
+|--------|-----------------|---------|
+| BM25 | 0.5128 | [0.457, 0.568] |
+| Dense | 0.6437 | [0.592, 0.696] |
+| Static RRF | 0.6407 | [0.586, 0.692] |
+| wRRF (weak) | 0.6478 | [0.594, 0.700] |
+| **wRRF (strong)** | **0.6512** | [0.598, 0.703] |
+| wRRF (MoE) | 0.6470 | [0.593, 0.701] |
+| BM25 ∪ Dense (union) | **0.6742** | — |
 
-All three adaptive methods significantly improve Recall vs. BM25 (p < 1e-8).
-For Recall vs. Static RRF, only wRRF Weak achieves raw significance
-(p = 0.009), but this does not survive Holm correction.
+The strong router wins on Recall@100 (+0.0034 vs. MoE), driven by fiqa
+where it picks slightly more diverse candidates than the MoE. The
+**union ceiling of 0.6742** (the recall reachable by drawing from both
+top-100 lists without ranking) is **0.023 above** the best fusion method
+— that is what a perfect re-ranker could lift.
 
 ---
 
-## 10. Cross-encoder reranking results (Step 21)
+## 8. Statistical significance (NDCG@100)
 
-The cross-encoder `cross-encoder/ms-marco-MiniLM-L-6-v2` re-ranks the top-100
-candidates from each method.
+Paired two-sided t-tests over per-query NDCG@100 on the 225 test
+queries, with Holm-Bonferroni correction across all 15 unordered method
+pairs.
 
-### NDCG@100 before and after reranking
+| Comparison | Δ NDCG | t | p | p_holm | Cohen's d | Holm-significant? |
+|------------|--------|---|---|--------|-----------|------------------|
+| **wRRF (weak) vs. BM25** | +0.0946 | 6.54 | 4.2e-10 | **5.0e-9** | 0.44 | **Yes** |
+| **wRRF (strong) vs. BM25** | +0.0968 | 5.87 | 1.5e-8 | **1.7e-7** | 0.39 | **Yes** |
+| **wRRF (MoE) vs. BM25** | +0.0982 | 5.79 | 2.4e-8 | **2.4e-7** | 0.39 | **Yes** |
+| wRRF (weak) vs. dense | +0.0020 | 0.28 | 0.78 | 1.0 | 0.02 | No |
+| wRRF (strong) vs. dense | +0.0042 | 0.97 | 0.33 | 1.0 | 0.06 | No |
+| wRRF (MoE) vs. dense | +0.0055 | 1.58 | 0.12 | 0.70 | 0.11 | No |
+| wRRF (weak) vs. Static RRF | +0.0178 | 2.64 | 0.009 | 0.080 | 0.18 | No (raw yes) |
+| wRRF (strong) vs. Static RRF | +0.0200 | 2.21 | 0.028 | 0.22 | 0.15 | No (raw yes) |
+| wRRF (MoE) vs. Static RRF | +0.0214 | 2.20 | 0.029 | 0.22 | 0.15 | No (raw yes) |
+| weak vs. strong | −0.0022 | −0.46 | 0.65 | 1.0 | −0.03 | No |
+| weak vs. MoE | −0.0035 | −0.64 | 0.52 | 1.0 | −0.04 | No |
+| strong vs. MoE | −0.0013 | −0.43 | 0.67 | 1.0 | −0.03 | No |
 
-| Method | Original NDCG@100 | Reranked NDCG@100 | ΔNDCG@100 | Relative gain |
-|--------|------------------|-------------------|-----------|---------------|
-| BM25 | 0.3238 | **0.3600** | **+0.0362** | **+11.2 %** |
-| Dense | 0.4201 | 0.4235 | +0.0034 | +0.8 % |
-| Static RRF | 0.4048 | 0.4206 | +0.0158 | +3.9 % |
-| wRRF Weak | 0.4239 | 0.4265 | +0.0026 | +0.6 % |
-| wRRF Strong | 0.4227 | 0.4229 | +0.0002 | +0.05 % |
-| MoE | 0.4254 | 0.4252 | −0.0002 | −0.05 % |
+**Take-aways:**
 
-### Per-dataset reranking analysis
+1. **All three adaptive methods crush BM25.** Each beats it by ≈ 0.10
+   NDCG with p_holm < 1e-7 and Cohen's d ≈ 0.4 (medium effect). This
+   is the strongest claim the experiment makes.
+2. **Adaptive vs. dense: not statistically significant.** Effect sizes
+   are tiny (d ≤ 0.11). The adaptive methods recover dense's
+   performance and add a small but reliably-non-negative margin.
+3. **Adaptive vs. Static RRF: significant at raw α = 0.05 but not at
+   Holm-corrected α.** All three methods reliably beat the
+   uniform-α baseline at the per-test level (raw p ∈ [0.009, 0.029]),
+   but conservative Holm correction across 15 hypotheses pushes
+   p_holm above 0.05. The conclusion: **the adaptive methods are
+   *probably* better than Static RRF, but the test set (n = 225) is
+   too small to claim that with strict family-wise control.**
+4. **The three routers are statistically indistinguishable.**
+   Pairwise p ∈ [0.52, 0.67], d < 0.05. **The cheap 16-feature weak
+   router matches the expensive 1 024-dim strong router and the MoE
+   ensemble on routing quality.** This is the central practical
+   finding: the router does not need access to the embedding to make
+   a near-optimal α decision.
 
-| Dataset | BM25 gain | Dense gain | Static gain | MoE gain |
-|---------|-----------|------------|-------------|----------|
-| scifact | +0.023 | −0.007 | +0.015 | −0.009 |
-| nfcorpus | +0.036 | +0.033 | +0.023 | +0.029 |
-| arguana | +0.029 | −0.073 | −0.032 | −0.071 |
-| fiqa | +0.074 | +0.009 | +0.058 | +0.008 |
-| scidocs | +0.025 | +0.025 | +0.007 | +0.013 |
-| trec-covid | +0.031 | +0.034 | +0.022 | +0.029 |
+### MRR significance (n = 225)
 
-**Key findings — reranking:**
+| Comparison | Δ MRR | p_holm | Holm-significant? |
+|------------|-------|--------|------------------|
+| weak vs. BM25 | +0.0951 | **1.8e-4** | Yes |
+| strong vs. BM25 | +0.0913 | **1.3e-3** | Yes |
+| MoE vs. BM25 | +0.0998 | **6.3e-4** | Yes |
+| weak vs. Static RRF | +0.0264 | 0.32 | No (raw yes, p=0.035) |
+| Adaptive vs. dense | ≤ 0.013 | ≥ 0.67 | No |
+| Routers vs. each other | ≤ 0.008 | ≥ 0.81 | No |
 
-1. **BM25 benefits most from reranking** (+11.2 % NDCG).  BM25's candidate
-   set has the most room for improvement because the initial ranking by TF-IDF
-   frequency is a crude relevance proxy.  The cross-encoder, which jointly
-   encodes the query and each document, can substantially reorder the candidates.
+### Recall@100 significance (n = 225)
 
-2. **Dense retrieval benefits very little from reranking** (+0.8 %).  The dense
-   ranking (cosine similarity in BGE-M3 embedding space) is already close to
-   what the cross-encoder would produce, since both are neural relevance models.
-   The cross-encoder sometimes even *hurts* the dense ranking (−0.007 on scifact,
-   −0.073 on arguana).
+| Comparison | Δ Recall | p_holm | Holm-significant? |
+|------------|----------|--------|------------------|
+| weak vs. BM25 | +0.135 | **1.2e-9** | Yes |
+| strong vs. BM25 | +0.138 | **7.3e-10** | Yes |
+| MoE vs. BM25 | +0.134 | **8.2e-9** | Yes |
+| Adaptive vs. dense / static / each other | ≤ 0.011 | ≥ 0.38 | No |
 
-3. **MoE + reranking is essentially unchanged** (−0.0002 NDCG).  This shows
-   that the MoE adaptive fusion already produces a near-optimal ranking for
-   the cross-encoder's taste.  The adaptive fusion effectively "pre-aligns"
-   the candidate list with the reranker's preferences.
-
-4. **arguana is adversely affected by reranking** for dense-heavy methods
-   (Dense: −0.073, MoE: −0.071).  This likely occurs because arguana's
-   queries are themselves long arguments — the cross-encoder, trained on
-   ms-marco short-query/short-doc pairs, is not calibrated for this format.
-
-5. **Reranking closes some of the gap between methods.**  After reranking,
-   MoE (0.4252) and Dense (0.4235) and Static (0.4206) are all within 0.005
-   NDCG — the reranker homogenises the rankings to some extent.
-
----
-
-## 11. Latency analysis (Step 25)
-
-All latencies are mean per-query wall-clock times in milliseconds, measured
-on the experimental hardware (AMD Ryzen 9 5950X + RTX 4090, Ubuntu 24.04).
-
-### Mean latency per query by method (MACRO across datasets, ms)
-
-| Method | Retrieval (ms) | With reranking (ms) | CE overhead (ms) |
-|--------|---------------|--------------------|--------------------|
-| BM25 | 213.6 | 326.1 | 112.5 |
-| Dense | 13.9 | 121.6 | 107.7 |
-| Static RRF | 219.4 | 326.6 | 107.2 |
-| wRRF Weak | 220.3 | 327.8 | 107.4 |
-| wRRF Strong | 251.3 | 359.3 | 108.0 |
-| MoE | 257.1 | 366.0 | 109.0 |
-
-**Per-dataset highlights:**
-
-| Dataset | BM25 (ms) | Dense (ms) | Static RRF (ms) | MoE (ms) |
-|---------|-----------|------------|-----------------|----------|
-| scifact | 16.1 | **12.0** | 22.8 | 65.1 |
-| nfcorpus | 4.3 | **12.0** | 13.5 | 54.3 |
-| arguana | 288.2 | **16.1** | 297.2 | 334.0 |
-| fiqa | 236.5 | **13.4** | 232.3 | 284.2 |
-| scidocs | 70.2 | **12.7** | 74.7 | 87.1 |
-| trec-covid | 666.5 | **16.0** | 675.8 | 717.7 |
-
-**Key latency findings:**
-
-1. **Dense retrieval is remarkably fast** (13.9 ms mean).  GPU matrix
-   multiplication over a pre-indexed corpus embedding matrix dominates and
-   is highly parallelised on the RTX 4090.  This is 15× faster than BM25
-   (213.6 ms mean).
-
-2. **BM25 latency varies enormously across datasets** (4.3 ms on nfcorpus
-   vs. 666.5 ms on trec-covid), scaling with corpus size.  trec-covid
-   (171 k docs) is an order of magnitude slower than scifact (5 k docs).
-
-3. **The adaptive overhead (router inference) is small.**  wRRF Weak adds
-   only ~7 ms over Static RRF (the 16-feature XGBoost inference is
-   negligible).  wRRF Strong and MoE add ~30–40 ms (BGE-M3 embedding of the
-   query is already computed during dense retrieval, so only KNN search and
-   SVR inference add overhead).
-
-4. **The cross-encoder dominates latency at ~108–112 ms per query**
-   (CE-only column), regardless of which first-stage retrieval method is
-   used.  This is consistent: the CE always scores exactly 100 candidates.
-   With reranking, all methods cost approximately `retrieval_time + 110 ms`.
-
-5. **arguana's high BM25 latency** (288 ms) stems from long query strings
-   (counter-arguments can be 100+ tokens) requiring more BM25 computation.
+The same pattern: adaptive ≫ BM25, adaptive ≈ Dense/Static, adaptive
+routers among each other indistinguishable.
 
 ---
 
-## 12. Summary of wins and conclusions
+## 9. Per-dataset routing analysis
 
-### Where adaptive routing wins decisively
+The mean predicted alpha per dataset on the test set (lower = more
+weight on dense):
 
-| Claim | Evidence |
-|-------|---------|
-| Adaptive fusion beats BM25 | All three routers: p < 1e-8, Cohen's d ≈ 0.4, +31 % NDCG |
-| Adaptive fusion beats static equal-weight RRF | wRRF Weak + wRRF Strong: Holm-corrected p < 0.05 on NDCG |
-| Weak router matches strong router | pairwise p = 0.85, Δ = 0.001 NDCG |
-| MoE is the overall best system | Highest NDCG@100 (0.4254), MRR@100 (0.5301) macro |
-| BM25 gains most from reranking | +11.2 % NDCG; adaptive fusion already near CE optimum |
+| Dataset | Oracle α | Weak α | Strong α | MoE α |
+|---------|----------|--------|----------|-------|
+| scifact | 0.088 | 0.186 | 0.075 | (—) |
+| nfcorpus | 0.264 | 0.238 | 0.127 | (—) |
+| arguana | 0.124 | 0.125 | 0.052 | (—) |
+| fiqa | 0.182 | 0.183 | 0.059 | (—) |
+| scidocs | 0.307 | 0.281 | 0.178 | (—) |
 
-### Where the differences are not significant
+(MoE alphas are query-level and not summarised per-dataset; see
+`moe_alphas_boxplot.png` and the heatmap below.)
 
-| Claim | Evidence |
-|-------|---------|
-| Adaptive fusion vs. Dense | p > 0.17 (NDCG), p > 0.09 (MRR) — no significance |
-| Weak vs. Strong vs. MoE | All pairwise p > 0.55 — statistically tied |
-| MoE vs. Static RRF (Holm) | p_holm = 0.113 — does not survive correction |
+**Calibration of the weak router is excellent** — its per-dataset mean
+predicted α matches the oracle mean to within 0.03 on three datasets
+(arguana, fiqa, scidocs). The two exceptions:
 
-### The "query-adaptive routing is worth the cost" verdict
+* **scifact:** weak overestimates (0.186 vs. oracle 0.088). scifact's
+  oracle distribution is bimodal — 69 % of queries are pure-dense
+  (α = 0), so the mean is dragged down. The weak router predicts
+  intermediate values when dense doesn't dominate, which is the
+  correct conservative behaviour.
+* **nfcorpus:** weak underestimates (0.238 vs. oracle 0.264). The
+  retriever-confidence features in Group C respond strongly to high
+  BM25 top-1 scores (which are common in nfcorpus medical-keyword
+  queries), but the optimal α distribution there has heavy weight at
+  intermediate α ≈ 0.1, which the regressor smooths.
 
-The three adaptive routers (wRRF Weak, wRRF Strong, MoE) all statistically
-and consistently outperform both BM25 and Static RRF, confirming the central
-thesis hypothesis: **knowing which retriever to trust for a given query
-improves retrieval quality**.
+**The strong router is systematically over-confident toward dense.**
+On every dataset its mean α is far below both the oracle and the weak
+router. This explains why it ties the weak router on macro NDCG despite
+having access to a 64× richer feature space — its decisions cluster too
+tightly around α ≈ 0.05, so it loses on queries that need BM25's lexical
+signal (visible in arguana, where Dense is already optimal and the
+strong router agrees, but in nfcorpus where BM25 should pull harder,
+strong does not).
 
-Dense retrieval (BGE-M3) is a very strong individual baseline, and the
-adaptive methods numerically surpass it on macro NDCG (+0.14–0.53 %) and
-macro MRR (+0.60–2.97 %), but the improvement is not statistically
-significant at n = 233.  A larger test set (e.g. 1 000+ queries per dataset)
-would likely reveal significance given the consistent directional advantage.
-
-The weak router — using only 16 hand-crafted query surface, vocabulary, and
-retriever-agreement features — achieves results statistically
-indistinguishable from the expensive embedding-based strong router (1024-dim
-BGE-M3 query embeddings, KNN).  This is a strong practical result: routing
-decisions can be made with negligible additional cost (7 ms overhead) without
-sacrificing quality.
-
-The MoE meta-learner, while nominally the best system, does not significantly
-beat the individual routers.  Its value lies in combining their complementary
-strengths: the weak router's domain-general hand-crafted signals and the
-strong router's semantic representation.  In practice, the SVR meta-learner
-learns to weight them nearly equally, resulting in marginal but consistent gains.
-
-### Recall perspective
-
-All adaptive fusion methods significantly improve Recall@100 vs. BM25
-(p < 1e-8), recovering relevant documents that sparse retrieval misses.
-The best recall system is wRRF Weak (MACRO 0.5624), closest to the theoretical
-union ceiling (0.5869).  This means adaptive routing also makes the candidate
-set better for any downstream reranker.
-
-### Reranking perspective
-
-Cross-encoder reranking adds consistent NDCG gains for BM25 (+11.2 %) and
-moderate gains for Static RRF (+3.9 %), but negligible or slightly negative
-gains for the adaptive methods.  This shows that adaptive fusion already
-optimises the ranking in a way that aligns with the cross-encoder's quality
-judgement.  The practical implication: **if a reranker is available, use
-adaptive fusion as the first stage rather than pure BM25 or static RRF** —
-the adaptive list is better both before and after reranking.
+The MoE essentially blends: on queries where weak and strong agree, it
+takes their value; where they disagree (which happens primarily on
+nfcorpus and scidocs), it learns a context-dependent compromise. The
+decision-heatmap plot (`moe_decision_heatmap.png`) shows a smooth
+diagonal landscape — the MoE does not over-fit any localised region.
 
 ---
 
-## 13. Dataset-level characterisation
+## 10. Cross-encoder reranking
 
-| Dataset | Dominant retriever | Fusion benefit | Notes |
-|---------|-------------------|----------------|-------|
-| scifact | Dense (slightly) | Moderate | Short scientific claims; both retrievers useful |
-| nfcorpus | Roughly equal | Small | Very hard dataset; small corpus; marginal gains |
-| arguana | Dense strongly | Negative (slight) | Long queries; purely semantic; BM25 hurts |
-| fiqa | Dense (slightly) | Moderate | Financial Q&A; numbers + semantics |
-| scidocs | BM25 (slightly) | Moderate | Document titles; keyword overlap matters |
-| trec-covid | BM25 (strongly) | Moderate | Clinical keywords; exact matching critical |
+The `cross-encoder/ms-marco-MiniLM-L-6-v2` model rescored the top-100
+candidate list of every method on every test query. Re-ranking metrics
+are computed from the scored ordering (NDCG@100 over the 100 candidates,
+re-sorted by CE score).
 
-This dataset-level characterisation explains why a single fixed alpha (Static
-RRF, α = 0.5) underperforms adaptive methods: the optimal alpha varies
-dramatically across datasets (0 for arguana, 1 for trec-covid), and even
-within datasets across queries.
+### 10.1 Re-ranking gain (Δ NDCG@100 from re-ranking)
+
+| Method | Original NDCG | Re-ranked NDCG | Δ | p_holm | Holm-significant? |
+|--------|---------------|----------------|---|--------|------------------|
+| BM25 | 0.3275 | **0.3647** | **+0.0373** | **0.012** | **Yes** |
+| Dense | 0.4201 | 0.4173 | −0.0028 | 1.0 | No |
+| Static RRF | 0.4042 | 0.4173 | +0.0131 | 1.0 | No |
+| wRRF (weak) | 0.4221 | 0.4185 | −0.0035 | 1.0 | No |
+| wRRF (strong) | 0.4243 | 0.4192 | −0.0051 | 1.0 | No |
+| wRRF (MoE) | 0.4256 | 0.4185 | −0.0071 | 1.0 | No |
+
+**This is one of the most important findings of the thesis.** The
+cross-encoder *only meaningfully helps BM25*. On Dense, Static RRF, and
+all three adaptive methods, re-ranking produces a small (and
+statistically insignificant) **drop** in NDCG@100. The reason is
+straightforward: when the first-stage candidate list is already
+relevance-ranked well, the cross-encoder reorders it modestly, and on
+average the reordering is a wash relative to the already-good
+first-stage order.
+
+The **MRR@100 ranking gain pattern is similar:**
+
+| Method | Δ MRR@100 from rerank | p_holm |
+|--------|----------------------|--------|
+| BM25 | **+0.0740** | **1.4e-3** |
+| Dense | +0.0031 | 1.0 |
+| Static RRF | +0.0242 | 0.96 |
+| wRRF (weak) | −0.0031 | 1.0 |
+| wRRF (strong) | +0.0013 | 1.0 |
+| wRRF (MoE) | −0.0079 | 1.0 |
+
+Only BM25 + cross-encoder is a real gain — both NDCG and MRR Holm-significant.
+
+### 10.2 Re-ranked methods compared
+
+After re-ranking, do the adaptive methods still beat BM25?
+
+| Comparison (post-rerank) | Δ NDCG | p_holm |
+|--------------------------|--------|--------|
+| Weak (rerank) vs. BM25 (rerank) | +0.0538 | **2.0e-5** |
+| Strong (rerank) vs. BM25 (rerank) | +0.0544 | **1.6e-5** |
+| MoE (rerank) vs. BM25 (rerank) | +0.0538 | **2.5e-5** |
+| Weak (rerank) vs. Dense (rerank) | +0.0012 | 1.0 |
+| Adaptive routers vs. each other (rerank) | ≤ 0.0006 | 1.0 |
+
+**Yes.** Even after the BM25 column gets its full +0.037 reranking
+boost, all three adaptive methods still beat re-ranked BM25 by ≈ 0.054
+NDCG with p_holm < 3e-5. The adaptive routers' first-stage advantage is
+not erasable by a strong reranker.
+
+### 10.3 Practical implication
+
+The thesis's adaptive routing produces a candidate set that is **already
+near the upper bound of what re-ranking can extract**. From the union
+ceiling (Section 7.4) we know the recall@100 ceiling is 0.674; the best
+adaptive method already reaches 0.651, so the reranker has at most
+0.023 recall to convert into NDCG, and the data show it converts
+essentially none of it on the merged test set.
+
+**Recommendation:** in a production system, the cross-encoder is only
+worth its 110 ms/query cost when the first-stage retriever is BM25-only
+(or otherwise weak). Once the first stage is dense-only, Static RRF,
+or any adaptive wRRF, **the cross-encoder is a net latency cost with no
+NDCG benefit.**
 
 ---
 
-## Appendix: Metric definitions
+## 11. Latency benchmarks
 
-**NDCG@k (Normalised Discounted Cumulative Gain at rank k):**
-```
-DCG@k = Σ_{i=1}^{k} (2^{rel_i} - 1) / log2(i+1)
-NDCG@k = DCG@k / IDCG@k
-```
-where IDCG@k is the DCG of the ideal (perfect) ranking.  Higher is better.
-All results use k = 100.
+End-to-end query latency, mean ms/query, on the test set (the macro is
+the dataset-weighted mean). All numbers measured with
+`time.perf_counter()` after a GPU warm-up.
 
-**MRR@k (Mean Reciprocal Rank at rank k):**
-```
-RR = 1 / rank_of_first_relevant_document  (0 if no relevant doc in top-k)
-MRR@k = mean(RR) over queries
-```
-Higher is better.  All results use k = 100.
+| Method | Macro mean (ms) | Macro median (ms) | Macro p95 (ms) |
+|--------|-----------------|-------------------|---------------|
+| BM25 | 122.8 | 118.3 | 203.2 |
+| Dense | 13.7 | 13.1 | 16.3 |
+| Static RRF | 126.6 | 123.3 | 202.6 |
+| wRRF (weak) | 126.7 | 118.6 | 202.6 |
+| wRRF (strong) | 127.1 | 124.3 | 208.0 |
+| wRRF (MoE) | 128.6 | 124.0 | 212.6 |
+| BM25 + reranker | 236.6 | 235.4 | 327.1 |
+| Dense + reranker | 124.9 | 121.8 | 137.4 |
+| wRRF + reranker (any) | ≈ 240 | ≈ 235 | ≈ 330 |
+| Cross-encoder only | ≈ 113 | — | — |
 
-**Recall@k:**
-```
-Recall@k = |{relevant docs in top-k}| / |{all relevant docs}|
-```
-Higher is better.  All results use k = 100.
+Per-dataset BM25 latency reveals the corpus-size scaling clearly:
 
-**Weighted RRF (wRRF) fusion score:**
-```
-score(d) = α · 1/(k + rank_bm25(d))  +  (1−α) · 1/(k + rank_dense(d))
-```
-where k = 60 (rrf.k config parameter), α ∈ [0, 1].
-α = 1 → pure BM25; α = 0 → pure Dense; α = 0.5 → Static RRF.
+| Dataset | BM25 (ms) | Dense (ms) |
+|---------|-----------|------------|
+| scifact (~5 k docs) | 17.5 | 13.3 |
+| nfcorpus (~3.6 k docs) | 4.4 | 12.0 |
+| arguana (~8.7 k docs) | 279.4 | 16.2 |
+| fiqa (~57 k docs) | 236.7 | 14.0 |
+| scidocs (~25 k docs) | 76.2 | 12.7 |
 
-**Bootstrap 95 % CI:**  1 000 resamples with replacement, seed = 42.
-The CI bounds are the 2.5th and 97.5th percentiles of the bootstrap
-distribution of the sample mean.
+**Key observations:**
 
-**Paired t-test:**  `scipy.stats.ttest_rel`, two-sided, n = 233 query pairs.
+1. **Dense retrieval is constant-time** (≈ 13 ms for all five datasets)
+   because the dot-product against pre-computed corpus embeddings is a
+   single GPU matrix multiplication. The cost is dominated by the query
+   encoding step, which is corpus-independent.
+2. **BM25 latency scales with corpus tokenisation cost.** arguana and
+   fiqa show 230–280 ms because their `BM25Okapi.get_scores` performs
+   per-query iteration over a long tokenised vocabulary. nfcorpus
+   and scifact, with smaller corpora, complete in single-digit
+   milliseconds. This is the rank_bm25 implementation, not BM25 in
+   principle — a sparse-index implementation (PISA, terrier, etc.)
+   would close this gap.
+3. **Router inference is ≈ 1 ms.** The weak (LightGBM), strong
+   (XGBoost), and MoE (SVR) routers each add ≤ 2 ms over the BM25 +
+   Dense baseline. Latency cost of adaptivity is negligible on top of
+   the first-stage retrieval.
+4. **The cross-encoder costs ≈ 113 ms per query** (1 forward pass per
+   query × 100 candidates, batched on GPU). This is comparable to the
+   sum of BM25 + Dense for arguana/fiqa, so on those datasets adding
+   reranking roughly doubles end-to-end latency.
 
-**Holm-Bonferroni correction:**  Applied across the 15 pairwise comparisons
-within each metric (NDCG, MRR, Recall) to control the family-wise error rate
-at α = 0.05.  The p-values are sorted ascending; each p_i is compared to
-α / (15 − i + 1).
+### Cost–benefit summary
 
-**Cohen's d:**  `mean_diff / pooled_std(per_query_scores_A, per_query_scores_B)`.
-d ≈ 0.2 = small, d ≈ 0.5 = medium, d ≈ 0.8 = large effect.
+| Stack | Macro NDCG | Latency | NDCG / latency |
+|-------|-----------|---------|----------------|
+| Dense only | 0.4201 | 13.7 ms | 30.7 |
+| wRRF (MoE) | 0.4256 | 128.6 ms | 3.31 |
+| wRRF (MoE) + rerank | 0.4185 | ≈ 240 ms | 1.74 |
+| BM25 + rerank | 0.3647 | 236.6 ms | 1.54 |
+
+If you have a GPU and want maximum NDCG/latency, dense retrieval alone
+already extracts most of the NDCG at 1/10 the cost of fusion. wRRF (MoE)
+buys 0.005 NDCG at a 9× latency penalty (driven by the BM25 step). The
+cross-encoder is only an attractive add-on for BM25-only pipelines.
+
+---
+
+## 12. Reproducibility and stability
+
+* All seeds derive from `sampling.random_seed = 42` plus a deterministic
+  per-dataset MD5 offset.
+* The 1 500-query selection and 70/15/15 split are cached to
+  `data/results/merged_qids.json` and `data/results/merged_split.json`
+  and never recomputed once written, so re-running the pipeline produces
+  exactly the same train/dev/test queries.
+* All grid searches use the **same 10 CV folds** (same seed, same
+  `StratifiedKFold` object), so the OOF predictions in Step 15 use
+  queries that no base model saw during training in the same fold —
+  zero leakage.
+* Per-fold scaler statistics are fit on training-fold rows only.
+* Boost-strap CIs use 1 000 resamples with seed = 42.
+
+---
+
+## 13. Summary of wins
+
+The thesis's contribution can be summarised by what it demonstrably
+proves on the held-out test set:
+
+1. **Adaptive routing significantly beats lexical-only retrieval.**
+   wRRF (weak / strong / MoE) all beat BM25 with p_holm < 1e-7,
+   Cohen's d ≈ 0.4 — on NDCG, MRR, and Recall — across five
+   heterogeneous BEIR datasets.
+2. **Adaptive routing matches dense-only retrieval and improves on
+   Static RRF.** Macro NDCG: 0.426 (MoE) vs. 0.420 (dense) vs. 0.404
+   (Static RRF). Static RRF is significantly worse than the adaptive
+   methods at raw α = 0.05 (p ≤ 0.029); the adaptive-vs-Static gap
+   does not survive Holm correction at n = 225, but the direction is
+   consistent across all three metrics.
+3. **The cheap 16-feature weak router is statistically as good as the
+   expensive 1 024-dim strong router and the MoE ensemble.** On
+   NDCG, MRR, and Recall, all pairwise comparisons among the three
+   routers have p ≥ 0.49 and |d| < 0.05. The 16 hand-crafted features
+   capture the routing decision sufficiently well — the BGE-M3
+   embedding is *not* needed for routing.
+4. **Cross-encoder reranking is only worth its cost on BM25-only
+   first-stage retrieval.** It produces a Holm-significant
+   +0.037 NDCG / +0.074 MRR gain on BM25, and a statistically null
+   change on every other method. Adaptive wRRF is therefore a complete
+   first-stage solution that does not require a downstream reranker
+   to extract its NDCG.
+5. **The adaptive routing router itself adds ~ 1 ms latency** on top
+   of BM25 + Dense — the routing component is essentially free.
+   The end-to-end latency cost of adaptivity is dominated by the BM25
+   sparse retrieval step, not the router.
+
+The remaining gap to the oracle ceiling (0.487 vs. 0.426 = 0.061
+NDCG) measures how much further per-query α prediction could lift
+performance. Closing this gap is the natural next step for the line of
+work — likely via richer per-query features that capture the
+relevance-density variation across BEIR's heterogeneous domains.

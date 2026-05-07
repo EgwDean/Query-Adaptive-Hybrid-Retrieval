@@ -34,11 +34,11 @@ For each query q the system:
 3. **Router** — predicts α(q) ∈ [0, 1].  Three router variants are trained:
    - **Weak router:** 16 hand-crafted features (query length, IDF statistics,
      retriever confidence margins, retriever agreement, score entropy) →
-     XGBoost regressor.
-   - **Strong router:** 1024-dimensional BGE-M3 query embedding → distance-
-     weighted KNN regressor.
+     LightGBM regressor (best of a 66-combination grid).
+   - **Strong router:** 1024-dimensional BGE-M3 query embedding → XGBoost
+     regressor (best of a 108-combination grid).
    - **MoE meta-learner:** takes the weak and strong predictions as input →
-     SVR regressor.
+     SVR regressor (best of a 77-combination grid).
 4. **Weighted RRF fusion** — the two ranked lists are merged:
 
 ```
@@ -55,37 +55,46 @@ judgements (oracle alpha).
 
 ## Key results
 
-Macro NDCG@100, MRR@100, Recall@100 across **6 BEIR datasets**, **233
-held-out test queries**:
+Macro NDCG@100, MRR@100, Recall@100 across **5 BEIR datasets**, **225
+held-out test queries** (45 per dataset):
 
 | Method | NDCG@100 | MRR@100 | Recall@100 |
 |--------|----------|---------|------------|
-| BM25 | 0.324 | 0.438 | 0.440 |
-| Dense (BGE-M3) | 0.420 | 0.500 | 0.553 |
-| Static RRF (α = 0.5) | 0.405 | 0.504 | 0.550 |
-| wRRF Weak (XGBoost) | 0.424 | 0.525 | **0.562** |
-| wRRF Strong (KNN) | 0.423 | 0.523 | 0.554 |
-| **wRRF MoE (SVR)** | **0.425** | **0.530** | 0.557 |
-| Oracle ceiling | 0.483 | — | — |
+| BM25 | 0.327 | 0.362 | 0.513 |
+| Dense (BGE-M3) | 0.420 | 0.449 | 0.644 |
+| Static RRF (α = 0.5) | 0.404 | 0.431 | 0.641 |
+| wRRF Weak (LightGBM) | 0.422 | 0.457 | 0.648 |
+| wRRF Strong (XGBoost) | 0.424 | 0.453 | **0.651** |
+| **wRRF MoE (SVR)** | **0.426** | **0.462** | 0.647 |
+| Oracle ceiling | 0.487 | — | — |
 
-All three adaptive methods **significantly outperform BM25** (p < 1e-8,
-Holm-Bonferroni corrected, Cohen's d ≈ 0.4) and **significantly outperform
-Static RRF** on NDCG (Holm-corrected p < 0.05 for Weak and Strong).
+All three adaptive methods **significantly outperform BM25** (p_holm < 1e-7,
+Holm-Bonferroni corrected, Cohen's d ≈ 0.4) on NDCG, MRR, and Recall@100.
+They also beat Static RRF on every metric — significantly at raw α = 0.05
+on NDCG (p ≤ 0.029), although Holm correction across 15 family-wise
+comparisons brings p_holm to 0.08–0.22 at n = 225.
 
 The cheap 16-feature weak router performs **statistically indistinguishably**
-from the expensive embedding-based strong router (p = 0.85, Δ = 0.001 NDCG)
-and from the MoE ensemble — at a fraction of the inference cost.
+from the expensive 1024-dim strong router (p = 0.65, Δ = 0.002 NDCG) and
+from the MoE ensemble (p = 0.52, Δ = 0.004) — at a fraction of the
+inference cost (~1 ms router overhead vs. 13 ms dense + ~120 ms BM25).
+
+A cross-encoder reranker only meaningfully helps **BM25-only** retrieval
+(+0.037 NDCG, p_holm = 0.012); for Dense, Static RRF, and all adaptive
+methods the rerank delta is statistically null. Adaptive wRRF is therefore
+a complete first-stage solution — no downstream reranker required.
 
 See [`docs/results.md`](docs/results.md) for the full per-dataset breakdown,
-significance tables, reranking analysis, and latency benchmarks.
+significance tables, ablation analysis, reranking analysis, and latency
+benchmarks.
 
 ---
 
 ## Datasets
 
-Six BEIR datasets: `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`,
-`trec-covid`.  300 queries per dataset are sampled (1 500 total), split
-70 % train / 15 % dev / 15 % test per dataset.
+Five BEIR datasets: `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`.
+300 queries per dataset are sampled (1 500 total), split
+70 % train / 15 % dev / 15 % test per dataset (1 050 / 225 / 225).
 
 ---
 
@@ -123,6 +132,12 @@ python -m src.pipeline
 The pipeline runs all 25 steps in sequence, caching every intermediate result
 to disk.  It prints a per-step summary to stdout.  All outputs are written to
 `data/results/` and `data/models/`.
+
+The three trained routers from the published run are saved under
+[`data/models/`](data/models/) — `weak_model.pkl`, `strong_model.pkl`, and
+`moe_model.pkl` — so you can load them directly without rerunning the
+pipeline. Each pickle is a dict containing the trained estimator, the
+fitted `StandardScaler`, and the feature column list used at training time.
 
 **Resuming after interruption:** re-run the same command.  Every step checks
 whether its outputs already exist before running and skips if so.

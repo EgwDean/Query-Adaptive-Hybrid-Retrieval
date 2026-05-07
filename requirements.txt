@@ -1,29 +1,16 @@
-# Core
 pyyaml
 tqdm
-
-# Dataset management
 beir
-
-# NLP
 nltk
-
-# Information retrieval
 rank_bm25
-
-# Embeddings & deep learning
 sentence-transformers
 torch
 FlagEmbedding
-
-# Scientific computing
 numpy
 scipy
 scikit-learn
 xgboost
 lightgbm
 joblib>=1.3
-
-# Visualization
 matplotlib
 shap
