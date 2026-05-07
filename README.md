@@ -1,13 +1,12 @@
 # Query-Adaptive Hybrid Retrieval
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-<!-- After your first Zenodo release, uncomment and replace XXXXXXX with the concept DOI (the "all-versions" DOI Zenodo issues): -->
-<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20073288.svg)](https://doi.org/10.5281/zenodo.20073288)
 
 > **Diploma Thesis — Computer Engineering and Informatics Department (CEID), University of Patras**
 >
-> **Author:** Konstantinos Anastasopoulos &lt;k.matsaniaou2003@gmail.com&gt;
-> **Supervisor:** &lt;SUPERVISOR FULL NAME&gt;, &lt;TITLE / DEPT&gt;
+> **Author:** Konstantinos Anastasopoulos &lt;up1093320@ac.upatras.gr&gt;
+> **Supervisor:** Prof. Spyridon Sioutas &lt;ssioutas@ceid.upatras.gr&gt;, Computer Engineering and Informatics Department (CEID), University of Patras
 > **Year:** 2026
 
 A query-adaptive hybrid retrieval system that learns, per query, the
@@ -119,7 +118,7 @@ Five BEIR datasets: `scifact`, `nfcorpus`, `arguana`, `fiqa`, `scidocs`.
 
 ```bash
 # Clone the repository
-git clone <repo-url>
+git clone https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval.git
 cd Query-Adaptive-Hybrid-Retrieval
 
 # Create a virtual environment
@@ -288,7 +287,9 @@ metadata in [`CITATION.cff`](CITATION.cff). GitHub renders a "Cite this
 repository" button on the project page that returns BibTeX and APA forms
 generated from that file.
 
-After the first Zenodo release the canonical citation will be:
+The archived release is on Zenodo (DOI:
+[10.5281/zenodo.20073288](https://doi.org/10.5281/zenodo.20073288)).
+BibTeX:
 
 ```bibtex
 @software{anastasopoulos_qahr_2026,
@@ -297,10 +298,7 @@ After the first Zenodo release the canonical citation will be:
   year      = {2026},
   publisher = {Zenodo},
   version   = {v1.0.0},
-  doi       = {10.5281/zenodo.XXXXXXX},
-  url       = {https://github.com/<YOUR-GITHUB-USER>/Query-Adaptive-Hybrid-Retrieval}
+  doi       = {10.5281/zenodo.20073288},
+  url       = {https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval}
 }
 ```
-
-Replace `XXXXXXX` and `<YOUR-GITHUB-USER>` once the Zenodo DOI and the
-public GitHub URL are known.

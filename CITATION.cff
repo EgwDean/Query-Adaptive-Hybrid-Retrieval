@@ -23,7 +23,7 @@ contact:
   - family-names: "Sioutas"
     given-names: "Spyridon"
     affiliation: "Computer Engineering and Informatics Department (CEID), University of Patras"
-    email: "<ssioutas@ceid.upatras.gr"
+    email: "ssioutas@ceid.upatras.gr"
 
 version: "1.0.0"                 
 date-released: "2026-05-07"       
@@ -31,8 +31,7 @@ license: Apache-2.0
 repository-code: "https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval"
 url: "https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval"
 
-# Add this line once Zenodo issues a DOI for your first GitHub release:
-# doi: "10.5281/zenodo.XXXXXXX"
+doi: "10.5281/zenodo.20073288"
 
 keywords:
   - "information retrieval"
