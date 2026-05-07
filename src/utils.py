@@ -22,6 +22,8 @@ Sections
 11. K-fold CV index helper
 12. Plot helpers
 13. Statistical helpers
+14. Pipeline glue helpers
+15. Routing-feature helpers
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ def model_short_name(full_name: str) -> str:
 def bm25_signature(k1: float, b: float, use_stemming: bool) -> str:
     """Return a filesystem-safe signature for BM25 cache files."""
     def fmt(x: float) -> str:
+        """Format *x* as a stable, trailing-zero-stripped decimal string."""
         s = f"{float(x):.4f}".rstrip("0").rstrip(".")
         return s if "." in s else s + ".0"
     return f"bm25_k1_{fmt(k1)}_b_{fmt(b)}_stem_{1 if use_stemming else 0}"
@@ -110,10 +113,16 @@ def ensure_dir(path: str) -> None:
 
 
 def file_exists(path: str) -> bool:
+    """``True`` if *path* exists and is a regular file."""
     return bool(path) and os.path.isfile(path)
 
 
 def is_nonempty_file(path: str) -> bool:
+    """``True`` if *path* exists, is a regular file, and has size > 0.
+
+    Used as the cache-skip gate for every pipeline step so that crash-time
+    zero-byte files are never treated as valid cache.
+    """
     return file_exists(path) and os.path.getsize(path) > 0
 
 
@@ -138,6 +147,7 @@ def save_pickle(data, filepath: str) -> None:
 
 
 def load_pickle(filepath: str):
+    """Unpickle and return the object stored at *filepath*."""
     with open(filepath, "rb") as f:
         return pickle.load(f)
 
@@ -150,11 +160,13 @@ def save_json(data, filepath: str) -> None:
 
 
 def load_json(filepath: str):
+    """Read and return the JSON object stored at *filepath*."""
     with open(filepath, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _json_default(o):
+    """Fallback encoder used by :func:`save_json` for numpy scalars/arrays."""
     if isinstance(o, (np.integer,)):
         return int(o)
     if isinstance(o, (np.floating,)):
@@ -175,6 +187,7 @@ def save_csv_dicts(rows: Sequence[dict], fieldnames: Sequence[str], filepath: st
 
 
 def load_csv_dicts(filepath: str) -> List[dict]:
+    """Return every row of *filepath* as a dict (header-row → keys)."""
     with open(filepath, "r", encoding="utf-8", newline="") as f:
         return list(csv.DictReader(f))
 
@@ -236,6 +249,7 @@ def load_beir_dataset(dataset_path: str):
 # ============================================================
 
 def write_corpus_jsonl(corpus_dict: dict, filepath: str) -> None:
+    """Write a BEIR-style corpus dict to a JSONL file (one doc per line)."""
     ensure_dir(os.path.dirname(filepath))
     with open(filepath, "w", encoding="utf-8") as f:
         for doc_id, doc in corpus_dict.items():
@@ -249,6 +263,7 @@ def write_corpus_jsonl(corpus_dict: dict, filepath: str) -> None:
 
 
 def write_queries_jsonl(queries_dict: dict, filepath: str) -> None:
+    """Write a BEIR-style queries dict to a JSONL file (one query per line)."""
     ensure_dir(os.path.dirname(filepath))
     with open(filepath, "w", encoding="utf-8") as f:
         for q_id, q_text in queries_dict.items():
@@ -257,6 +272,7 @@ def write_queries_jsonl(queries_dict: dict, filepath: str) -> None:
 
 
 def write_qrels_tsv(qrels_dict: dict, filepath: str) -> None:
+    """Write nested ``{qid: {doc_id: score}}`` qrels as a TREC-style TSV."""
     ensure_dir(os.path.dirname(filepath))
     with open(filepath, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter="\t")
@@ -267,6 +283,7 @@ def write_qrels_tsv(qrels_dict: dict, filepath: str) -> None:
 
 
 def load_queries(filepath: str) -> Dict[str, str]:
+    """Read a JSONL queries file as a ``{qid: text}`` dict."""
     queries = {}
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
@@ -276,6 +293,7 @@ def load_queries(filepath: str) -> Dict[str, str]:
 
 
 def load_qrels(filepath: str) -> Dict[str, Dict[str, int]]:
+    """Read a TREC-style qrels TSV into nested ``{qid: {doc_id: score}}``."""
     qrels: Dict[str, Dict[str, int]] = {}
     with open(filepath, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -856,3 +874,260 @@ def holm_correction(p_values: Sequence[float],
     p_adj[order] = p_adj_sorted
     rejected = p_adj <= float(alpha)
     return rejected, p_adj
+
+
+# ============================================================
+# 14. Pipeline glue helpers
+# ============================================================
+
+def get_device():
+    """Return ``torch.device('cuda')`` if a CUDA device is available, else CPU.
+
+    Imported lazily so the rest of utils.py stays torch-free at import time.
+    """
+    import torch
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def dataset_processed_dir(cfg: dict, ds_name: str) -> str:
+    """Resolve ``data/processed/<embedding_short_name>/<dataset>/``.
+
+    Every per-dataset preprocessed artefact (BM25 indices, tokenised corpora,
+    embeddings) is rooted at this path, so all pipeline steps go through this
+    helper to stay in lockstep with the configured embedding model.
+    """
+    short = model_short_name(cfg["embeddings"]["model_name"])
+    root  = get_config_path(cfg, "processed_folder", "data/processed")
+    return os.path.join(root, short, ds_name)
+
+
+def zscore_stats(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Return per-column ``(mean, std)`` for *X*.
+
+    Columns whose standard deviation is below 1e-12 (i.e. constant features)
+    have their std clamped to 1.0 so downstream ``(X - mu) / sigma`` does
+    not divide by zero. Used by every grid search to fit a per-fold scaler.
+    """
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma <= 1e-12] = 1.0
+    return mu, sigma
+
+
+def load_oracle_alphas(cfg: dict) -> Dict[Tuple[str, str], float]:
+    """Load Step 4's per-query oracle alphas as a ``(ds_name, qid) -> alpha`` map.
+
+    Reads ``<results_folder>/oracle_alphas.csv`` produced by
+    ``step_04_oracle_alpha`` and returns a flat lookup keyed by the
+    (dataset, query) pair so subsequent steps can attach the regression
+    target to any query without re-scanning the CSV.
+    """
+    rows = load_csv_dicts(os.path.join(
+        get_config_path(cfg, "results_folder", "data/results"),
+        "oracle_alphas.csv",
+    ))
+    return {(r["ds_name"], r["qid"]): float(r["oracle_alpha"]) for r in rows}
+
+
+def print_step_header(n: int, title: str) -> None:
+    """Print a 72-char banner used by every ``step_NN_xxx`` function."""
+    bar = "=" * 72
+    print(f"\n\n{bar}\nSTEP {n:02d} — {title}\n{bar}")
+
+
+# ============================================================
+# 15. Routing-feature helpers
+#
+# The 16 hand-crafted features that drive the weak router (Section
+# `weak_model_grid_search` in config.yaml).  See docs/pipeline_steps.md
+# §STEP 5 for the full feature description.  These live here, not in
+# pipeline.py, so that any external script (e.g. an inference demo
+# loading data/models/weak_model.pkl) can compute them without
+# importing the orchestration module.
+# ============================================================
+
+QUESTION_WORDS = frozenset(
+    ["who", "what", "when", "where", "why", "how", "which", "whose", "whom"]
+)
+
+
+def normalize_pairs_minmax(pairs: list, eps: float):
+    """Min-max normalise scores in a list of ``(doc_id, score)`` pairs.
+
+    Returns pairs with scores rescaled to ``[0, 1]``. If the score range is
+    smaller than *eps* (e.g. all-equal scores), every score is set to 0.0
+    so downstream confidence and entropy features are well-defined instead
+    of NaN.
+    """
+    if not pairs:
+        return []
+    scores = [float(s) for _, s in pairs]
+    lo, hi = min(scores), max(scores)
+    rng = hi - lo
+    if rng < eps:
+        return [(d, 0.0) for d, _ in pairs]
+    return [(d, (float(s) - lo) / (rng + eps)) for d, s in pairs]
+
+
+def wrrf_query_ndcg(alpha: float, qid: str,
+                    bm25_res: dict, dense_res: dict, qrels: dict,
+                    rrf_k: int, ndcg_k: int) -> float:
+    """Fuse BM25 and dense rankings for *qid* with weight *alpha* and score NDCG@``ndcg_k``.
+
+    Helper used by every grid search and retrieval comparison: applies
+    :func:`wrrf_fuse` to the per-query result lists and immediately scores
+    the fused ranking against *qrels* via :func:`query_ndcg_at_k`.
+    """
+    ranked = wrrf_fuse(alpha, bm25_res.get(qid, []), dense_res.get(qid, []), rrf_k)
+    return query_ndcg_at_k(ranked, qrels.get(qid, {}), ndcg_k)
+
+
+def compute_query_features(raw_text: str,
+                           query_tokens: list,
+                           bm25_pairs: list,
+                           dense_pairs: list,
+                           word_freq: dict,
+                           total_corpus_tokens: int,
+                           doc_freq: dict,
+                           total_docs: int,
+                           stopword_stems: frozenset,
+                           overlap_k: int,
+                           feature_stat_k: int,
+                           epsilon: float,
+                           ce_alpha: float) -> Dict[str, float]:
+    """Compute the 16 hand-crafted routing features for one query.
+
+    Parameters
+    ----------
+    raw_text : str
+        Original query string (used for the ``has_question_word`` feature).
+    query_tokens : list[str]
+        Tokenised query (already stemmed / lowercased to match the corpus).
+    bm25_pairs, dense_pairs : list[(doc_id, score)]
+        Top-k retrieval results from BM25 and the dense retriever.
+    word_freq, doc_freq : dict
+        Term-frequency and document-frequency indices over the corpus.
+    total_corpus_tokens, total_docs : int
+        Aggregate corpus statistics for IDF and cross-entropy.
+    stopword_stems : frozenset
+        Stemmed/cased stopword set used for the ``stopword_ratio`` feature.
+    overlap_k, feature_stat_k : int
+        Cut-off depths for retriever-agreement features (Group D) and for
+        score-distribution features (Group E).
+    epsilon : float
+        Numerical-stability floor used inside log/normalisation steps.
+    ce_alpha : float
+        Laplace smoothing weight for the unigram language-model
+        cross-entropy feature.
+
+    Returns
+    -------
+    dict
+        Feature name → float value, with keys matching ``FEATURE_NAMES``
+        in pipeline.py. The 16 features are organised in five groups:
+        Group A query surface (3), B vocabulary match (4), C retriever
+        confidence (4), D retriever agreement (3), E distribution shape (2).
+        See ``docs/pipeline_steps.md`` §STEP 5 for the full feature
+        definitions.
+    """
+    bm25_norm  = normalize_pairs_minmax(bm25_pairs, epsilon)
+    dense_norm = normalize_pairs_minmax(dense_pairs, epsilon)
+    n_tok = len(query_tokens)
+
+    # Group A — Query Surface
+    query_length = float(n_tok)
+    if n_tok == 0:
+        stopword_ratio = 0.0
+        clean = []
+    else:
+        n_stop = sum(1 for t in query_tokens if t in stopword_stems)
+        stopword_ratio = n_stop / n_tok
+        clean = [t for t in query_tokens if t not in stopword_stems]
+    first_word = raw_text.strip().split()[0].lower() if raw_text.strip() else ""
+    has_qw = 1.0 if first_word in QUESTION_WORDS else 0.0
+
+    # Group B — Vocabulary Match
+    vocab_size  = max(1, len(word_freq))
+    corpus_mass = total_corpus_tokens + ce_alpha * vocab_size
+    if not clean:
+        cross_entropy = average_idf = max_idf = rare_term_ratio = 0.0
+    else:
+        ce_sum = 0.0; idfs = []
+        for t in clean:
+            prob = (word_freq.get(t, 0) + ce_alpha) / corpus_mass
+            ce_sum += -math.log2(max(prob, epsilon))
+            idfs.append(math.log((total_docs + 1.0) / (doc_freq.get(t, 0) + 1.0)) + 1.0)
+        cross_entropy = ce_sum / len(clean)
+        average_idf = sum(idfs) / len(idfs)
+        max_idf     = max(idfs)
+        idf_std     = float(np.std(idfs))
+        thresh      = average_idf + idf_std
+        rare_term_ratio = sum(1 for v in idfs if v >= thresh) / len(idfs)
+
+    # Group C — Retriever Confidence
+    def _conf(normed):
+        """Top-1 minus top-2 score margin on a min-max-normalised list."""
+        if len(normed) >= 2:
+            return normed[0][1] - normed[1][1]
+        return normed[0][1] if normed else 0.0
+    dense_confidence  = _conf(dense_norm)
+    sparse_confidence = _conf(bm25_norm)
+    top_dense_score   = dense_norm[0][1] if dense_norm else 0.0
+    top_sparse_score  = bm25_norm[0][1]  if bm25_norm  else 0.0
+
+    # Group D — Retriever Agreement
+    top_sp = [d for d, _ in bm25_pairs[:overlap_k]]
+    top_de = [d for d, _ in dense_pairs[:overlap_k]]
+    overlap_at_k = len(set(top_sp) & set(top_de)) / max(1, overlap_k)
+    sp_rank = {d: r for r, d in enumerate([d for d, _ in bm25_pairs[:feature_stat_k]], 1)}
+    de_rank = {d: r for r, d in enumerate([d for d, _ in dense_pairs[:feature_stat_k]], 1)}
+    shared = set(sp_rank) & set(de_rank)
+    if shared:
+        first_shared_doc_rank = min((sp_rank[d] + de_rank[d]) / 2.0 for d in shared)
+    else:
+        first_shared_doc_rank = float(feature_stat_k + 1)
+    if len(shared) >= 2:
+        # Must convert absolute top-k positions to relative ranks within the
+        # shared set (1..n) before applying the d^2 shortcut formula, otherwise
+        # the formula produces values outside [-1, 1].
+        sp_rel = {d: r for r, d in enumerate(sorted(shared, key=lambda x: sp_rank[x]), 1)}
+        de_rel = {d: r for r, d in enumerate(sorted(shared, key=lambda x: de_rank[x]), 1)}
+        diffs = [(sp_rel[d] - de_rel[d]) ** 2 for d in shared]
+        n = len(diffs)
+        spearman_topk = 1.0 - (6.0 * sum(diffs)) / (n * (n ** 2 - 1.0))
+    else:
+        spearman_topk = 0.0
+
+    # Group E — Distribution Shape
+    def _entropy(normed_pairs, k):
+        """Shannon entropy of the top-k score distribution (normalised)."""
+        pairs = normed_pairs[:k]
+        if not pairs:
+            return 0.0
+        scores = np.array([max(s, 0.0) for _, s in pairs], dtype=np.float64)
+        total = scores.sum()
+        if total <= epsilon:
+            return 0.0
+        p = scores / total
+        return float(-np.sum(p * np.log2(np.maximum(p, epsilon))))
+    dense_entropy_topk  = _entropy(dense_norm,  feature_stat_k)
+    sparse_entropy_topk = _entropy(bm25_norm,   feature_stat_k)
+
+    return {
+        "query_length":         float(query_length),
+        "stopword_ratio":       float(stopword_ratio),
+        "has_question_word":    float(has_qw),
+        "average_idf":          float(average_idf),
+        "max_idf":              float(max_idf),
+        "rare_term_ratio":      float(rare_term_ratio),
+        "cross_entropy":        float(cross_entropy),
+        "top_dense_score":      float(top_dense_score),
+        "top_sparse_score":     float(top_sparse_score),
+        "dense_confidence":     float(dense_confidence),
+        "sparse_confidence":    float(sparse_confidence),
+        "overlap_at_k":         float(overlap_at_k),
+        "first_shared_doc_rank": float(first_shared_doc_rank),
+        "spearman_topk":        float(spearman_topk),
+        "dense_entropy_topk":   float(dense_entropy_topk),
+        "sparse_entropy_topk":  float(sparse_entropy_topk),
+    }

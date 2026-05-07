@@ -55,13 +55,18 @@ from src.utils import (
     alpha_box_plot,
     alpha_sorted_plot,
     bm25_artifact_paths,
+    bootstrap_ci_mean,
+    compute_query_features,
+    dataset_processed_dir,
     dataset_seed_offset,
     download_beir_dataset,
     ensure_dir,
     ensure_english_stopwords,
     get_config_path,
+    get_device,
     grouped_bar_chart,
     grouped_bar_chart_with_ci,
+    holm_correction,
     init_stem_worker,
     is_nonempty_file,
     kfold_indices,
@@ -71,13 +76,13 @@ from src.utils import (
     load_csv_dicts,
     load_full_corpus,
     load_json,
+    load_oracle_alphas,
     load_pickle,
-    bootstrap_ci_mean,
-    holm_correction,
     load_qrels,
     load_queries,
     model_short_name,
     paired_t_test,
+    print_step_header,
     query_mrr_at_k,
     query_ndcg_at_k,
     query_recall_at_k,
@@ -93,7 +98,9 @@ from src.utils import (
     write_qrels_tsv,
     write_queries_jsonl,
     wrrf_fuse,
+    wrrf_query_ndcg,
     wrrf_top_k,
+    zscore_stats,
 )
 
 
@@ -139,10 +146,6 @@ FEATURE_GROUPS = {
         "dense_entropy_topk", "sparse_entropy_topk",
     ],
 }
-
-QUESTION_WORDS = frozenset(
-    ["who", "what", "when", "where", "why", "how", "which", "whose", "whom"]
-)
 
 # Models that produce probabilities for binary labels (logistic_regression).
 # All other model factories return regressors that we clip to [0, 1].
@@ -192,10 +195,6 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 def get_active_bm25_params(cfg: dict) -> dict:
     """Return BM25 params from the cached best.json (Step 3) if present,
     otherwise from cfg['bm25']."""
@@ -211,19 +210,6 @@ def get_active_bm25_params(cfg: dict) -> dict:
         "b":            float(raw.get("b",  0.75)),
         "use_stemming": bool(raw.get("use_stemming", True)),
     }
-
-
-def dataset_processed_dir(cfg: dict, ds_name: str) -> str:
-    short = model_short_name(cfg["embeddings"]["model_name"])
-    root  = get_config_path(cfg, "processed_folder", "data/processed")
-    return os.path.join(root, short, ds_name)
-
-
-def zscore_stats(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    mu = X.mean(axis=0)
-    sigma = X.std(axis=0)
-    sigma[sigma <= 1e-12] = 1.0
-    return mu, sigma
 
 
 def make_model(model_name: str, params: dict, seed: int):
@@ -416,6 +402,7 @@ def _plot_ci_from_csv(ci_csv: str,
     rows = [{"group": g} for g in groups]
 
     def _lookup(g: str, m: str) -> Tuple[float, float, float]:
+        """Return the (mean, ci_low, ci_high) triple for one (group, method)."""
         return ci_dict.get((g, m), (0.0, 0.0, 0.0))
 
     grouped_bar_chart_with_ci(
@@ -522,6 +509,12 @@ def expand_grid(grid_cfg: dict) -> List[Tuple[str, dict]]:
 # ------------------------------------------------------------
 
 def step_01_download(cfg: dict) -> None:
+    """STEP 1 — Download every BEIR dataset listed in ``cfg['datasets']``.
+
+    Each dataset is fetched into ``<datasets_folder>/<dataset>/``; if a
+    target directory already exists, the download is skipped. Uses BEIR's
+    official ``util.download_and_unzip`` so file integrity is guaranteed.
+    """
     print_step_header(1, "Download datasets")
     datasets         = cfg.get("datasets", []) or []
     datasets_folder  = get_config_path(cfg, "datasets_folder", "data/datasets")
@@ -653,6 +646,11 @@ def _build_doc_freq_only(tokenized_corpus_jsonl: str):
 
 def _preprocess_queries(queries_jsonl: str, tokenized_queries_jsonl: str,
                         query_tokens_pkl: str, stemmer_lang: str, use_stemming: bool):
+    """Tokenise (and optionally stem) every query in *queries_jsonl*.
+
+    Writes both a JSONL of tokenised queries and a pickle dict
+    ``{qid: tokens}`` for fast lookup. No-ops if both targets exist.
+    """
     if (is_nonempty_file(tokenized_queries_jsonl) and is_nonempty_file(query_tokens_pkl)):
         return
     from nltk.stem.snowball import SnowballStemmer
@@ -708,6 +706,14 @@ def _encode_with_oom_retry(model, texts, device, batch_size):
 
 
 def _build_corpus_embeddings(corpus_jsonl, model, batch_size, device):
+    """Embed every document in *corpus_jsonl* with *model* on *device*.
+
+    Returns ``(corpus_embeddings_tensor, corpus_ids)`` where the tensor
+    rows are aligned positionally with the id list. Streams the corpus
+    in batches via :func:`utils.load_corpus_batch_generator` and uses
+    :func:`_encode_with_oom_retry` so a single CUDA OOM only halves
+    the sub-batch instead of aborting the whole pass.
+    """
     all_ids, all_embs = [], []
     total = u.count_lines(corpus_jsonl)
     for ids, texts in tqdm(
@@ -724,6 +730,12 @@ def _build_corpus_embeddings(corpus_jsonl, model, batch_size, device):
 
 
 def _build_query_embeddings(queries: Dict[str, str], model, batch_size, device):
+    """Embed every query in *queries* with *model* on *device*.
+
+    Returns ``(query_embeddings_tensor, qids)`` aligned positionally so
+    later steps can re-key by qid. OOM-resilient via
+    :func:`_encode_with_oom_retry`.
+    """
     qids = list(queries.keys())
     qtexts = [queries[q] for q in qids]
     all_embs = []
@@ -738,6 +750,18 @@ def _build_query_embeddings(queries: Dict[str, str], model, batch_size, device):
 
 
 def step_02_preprocess(cfg: dict, device: torch.device) -> None:
+    """STEP 2 — Build all per-dataset preprocessed artefacts.
+
+    For every dataset the function writes the canonical export files
+    (``corpus.jsonl``, ``queries.jsonl``, ``qrels.tsv``), tokenises the
+    corpus and queries (with and without stemming), constructs
+    ``BM25Okapi`` indices for every ``(k1, b, use_stemming)`` triple
+    encountered by the grid search, builds the word-frequency and
+    document-frequency indices in a single corpus pass, and computes
+    BGE-M3 corpus and query embeddings on the GPU. Each output is
+    cached to :func:`dataset_processed_dir`; the step is fully
+    idempotent.
+    """
     print_step_header(2, "Preprocessing")
     datasets = cfg["datasets"]
     bm25_params = get_active_bm25_params(cfg)
@@ -917,6 +941,15 @@ def _bm25_results_for_params(cfg: dict, ds_name: str, k1: float, b: float,
 
 
 def step_03_optimize_bm25(cfg: dict, device: torch.device) -> None:
+    """STEP 3 — Macro-NDCG@100 grid search over BM25 ``(k1, b, use_stemming)``.
+
+    Builds (or reuses) every BM25 index defined by ``bm25_grid_search`` in
+    the config, scores the 1500 selected queries per combination, and
+    macro-averages NDCG@100 across the five datasets. The full ranked
+    grid is written to ``bm25_grid_search.csv``; the single best triple
+    is saved to ``bm25_best_params.json`` and is then read by every
+    later step via :func:`get_active_bm25_params`.
+    """
     print_step_header(3, "Optimize BM25 (k1, b, use_stemming)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     ensure_dir(results_root)
@@ -1164,6 +1197,15 @@ def _oracle_alpha_for_query(qid: str, qrel: Dict[str, int],
 
 
 def step_04_oracle_alpha(cfg: dict, device: torch.device) -> None:
+    """STEP 4 — Per-query oracle α via brute-force search over [0, 1].
+
+    For each of the 1500 selected queries, evaluates wRRF NDCG@100 at every
+    α in ``{alpha_min, alpha_min+step, ..., alpha_max}`` and stores the
+    argmax. Queries with no relevant document get α = 0.5 and
+    ``oracle_ndcg = 0`` as a placeholder. Outputs the per-query labels to
+    ``oracle_alphas.csv`` and the macro+per-dataset oracle ceiling to
+    ``oracle_ndcg_per_dataset.json``.
+    """
     print_step_header(4, "Oracle alpha grid search (per query)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "oracle_alphas.csv")
@@ -1266,145 +1308,23 @@ def _load_split(cfg: dict) -> Dict[str, dict]:
     return split
 
 
-def _load_oracle_alphas(cfg: dict) -> Dict[Tuple[str, str], float]:
-    rows = load_csv_dicts(os.path.join(
-        get_config_path(cfg, "results_folder", "data/results"),
-        "oracle_alphas.csv",
-    ))
-    return {(r["ds_name"], r["qid"]): float(r["oracle_alpha"]) for r in rows}
-
-
 # ------------------------------------------------------------
 # STEP 5 — Weak-model dataset (16 features + oracle alpha label)
+#
+# Feature computation lives in src.utils.compute_query_features so an
+# external inference script can rebuild the input vector for a saved
+# weak_model.pkl without importing this orchestration module.
 # ------------------------------------------------------------
 
-def _normalize_pairs_minmax(pairs: list, eps: float):
-    """Min-max normalise scores in a list of (doc_id, score) pairs."""
-    if not pairs:
-        return []
-    scores = [float(s) for _, s in pairs]
-    lo, hi = min(scores), max(scores)
-    rng = hi - lo
-    if rng < eps:
-        return [(d, 0.0) for d, _ in pairs]
-    return [(d, (float(s) - lo) / (rng + eps)) for d, s in pairs]
-
-
-def _compute_query_features(raw_text: str,
-                            query_tokens: list,
-                            bm25_pairs: list,
-                            dense_pairs: list,
-                            word_freq: dict,
-                            total_corpus_tokens: int,
-                            doc_freq: dict,
-                            total_docs: int,
-                            stopword_stems: frozenset,
-                            overlap_k: int,
-                            feature_stat_k: int,
-                            epsilon: float,
-                            ce_alpha: float) -> Dict[str, float]:
-    bm25_norm  = _normalize_pairs_minmax(bm25_pairs, epsilon)
-    dense_norm = _normalize_pairs_minmax(dense_pairs, epsilon)
-    n_tok = len(query_tokens)
-
-    # Group A
-    query_length = float(n_tok)
-    if n_tok == 0:
-        stopword_ratio = 0.0
-        clean = []
-    else:
-        n_stop = sum(1 for t in query_tokens if t in stopword_stems)
-        stopword_ratio = n_stop / n_tok
-        clean = [t for t in query_tokens if t not in stopword_stems]
-    first_word = raw_text.strip().split()[0].lower() if raw_text.strip() else ""
-    has_qw = 1.0 if first_word in QUESTION_WORDS else 0.0
-
-    # Group B
-    vocab_size  = max(1, len(word_freq))
-    corpus_mass = total_corpus_tokens + ce_alpha * vocab_size
-    if not clean:
-        cross_entropy = average_idf = max_idf = rare_term_ratio = 0.0
-    else:
-        ce_sum = 0.0; idfs = []
-        for t in clean:
-            prob = (word_freq.get(t, 0) + ce_alpha) / corpus_mass
-            ce_sum += -math.log2(max(prob, epsilon))
-            idfs.append(math.log((total_docs + 1.0) / (doc_freq.get(t, 0) + 1.0)) + 1.0)
-        cross_entropy = ce_sum / len(clean)
-        average_idf = sum(idfs) / len(idfs)
-        max_idf     = max(idfs)
-        idf_std     = float(np.std(idfs))
-        thresh      = average_idf + idf_std
-        rare_term_ratio = sum(1 for v in idfs if v >= thresh) / len(idfs)
-
-    # Group C
-    def _conf(normed):
-        if len(normed) >= 2:
-            return normed[0][1] - normed[1][1]
-        return normed[0][1] if normed else 0.0
-    dense_confidence  = _conf(dense_norm)
-    sparse_confidence = _conf(bm25_norm)
-    top_dense_score   = dense_norm[0][1] if dense_norm else 0.0
-    top_sparse_score  = bm25_norm[0][1]  if bm25_norm  else 0.0
-
-    # Group D
-    top_sp = [d for d, _ in bm25_pairs[:overlap_k]]
-    top_de = [d for d, _ in dense_pairs[:overlap_k]]
-    overlap_at_k = len(set(top_sp) & set(top_de)) / max(1, overlap_k)
-    sp_rank = {d: r for r, d in enumerate([d for d, _ in bm25_pairs[:feature_stat_k]], 1)}
-    de_rank = {d: r for r, d in enumerate([d for d, _ in dense_pairs[:feature_stat_k]], 1)}
-    shared = set(sp_rank) & set(de_rank)
-    if shared:
-        first_shared_doc_rank = min((sp_rank[d] + de_rank[d]) / 2.0 for d in shared)
-    else:
-        first_shared_doc_rank = float(feature_stat_k + 1)
-    if len(shared) >= 2:
-        # Must convert absolute top-k positions to relative ranks within the
-        # shared set (1..n) before applying the d^2 shortcut formula, otherwise
-        # the formula produces values outside [-1, 1].
-        sp_rel = {d: r for r, d in enumerate(sorted(shared, key=lambda x: sp_rank[x]), 1)}
-        de_rel = {d: r for r, d in enumerate(sorted(shared, key=lambda x: de_rank[x]), 1)}
-        diffs = [(sp_rel[d] - de_rel[d]) ** 2 for d in shared]
-        n = len(diffs)
-        spearman_topk = 1.0 - (6.0 * sum(diffs)) / (n * (n ** 2 - 1.0))
-    else:
-        spearman_topk = 0.0
-
-    # Group E
-    def _entropy(normed_pairs, k):
-        pairs = normed_pairs[:k]
-        if not pairs:
-            return 0.0
-        scores = np.array([max(s, 0.0) for _, s in pairs], dtype=np.float64)
-        total = scores.sum()
-        if total <= epsilon:
-            return 0.0
-        p = scores / total
-        return float(-np.sum(p * np.log2(np.maximum(p, epsilon))))
-    dense_entropy_topk  = _entropy(dense_norm,  feature_stat_k)
-    sparse_entropy_topk = _entropy(bm25_norm,   feature_stat_k)
-
-    return {
-        "query_length":         float(query_length),
-        "stopword_ratio":       float(stopword_ratio),
-        "has_question_word":    float(has_qw),
-        "average_idf":          float(average_idf),
-        "max_idf":              float(max_idf),
-        "rare_term_ratio":      float(rare_term_ratio),
-        "cross_entropy":        float(cross_entropy),
-        "top_dense_score":      float(top_dense_score),
-        "top_sparse_score":     float(top_sparse_score),
-        "dense_confidence":     float(dense_confidence),
-        "sparse_confidence":    float(sparse_confidence),
-        "overlap_at_k":         float(overlap_at_k),
-        "first_shared_doc_rank": float(first_shared_doc_rank),
-        "spearman_topk":        float(spearman_topk),
-        "dense_entropy_topk":   float(dense_entropy_topk),
-        "sparse_entropy_topk":  float(sparse_entropy_topk),
-    }
-
-
 def step_05_weak_dataset(cfg: dict, device: torch.device) -> None:
+    """STEP 5 — Build the 16-feature weak-router training set.
+
+    For every selected query computes the 16 hand-crafted routing features
+    (via :func:`utils.compute_query_features`) and joins them with the
+    oracle α label from Step 4 and the train/dev/test split. Queries with
+    no relevant document are marked ``split = "drop"`` so they don't
+    pollute training. Output: ``weak_dataset.csv``.
+    """
     print_step_header(5, "Weak-model dataset (16 features + oracle alpha)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "weak_dataset.csv")
@@ -1414,7 +1334,7 @@ def step_05_weak_dataset(cfg: dict, device: torch.device) -> None:
 
     selected = _select_merged_qids(cfg)
     split    = _load_split(cfg)
-    oracle   = _load_oracle_alphas(cfg)
+    oracle   = load_oracle_alphas(cfg)
 
     rcfg = cfg.get("routing_features", {}) or {}
     overlap_k      = int(rcfg.get("overlap_k", 10))
@@ -1450,7 +1370,7 @@ def step_05_weak_dataset(cfg: dict, device: torch.device) -> None:
         test_set  = set(split[ds_name]["test"])
 
         for qid in tqdm(selected[ds_name], desc=f"  features [{ds_name}]", dynamic_ncols=True):
-            feats = _compute_query_features(
+            feats = compute_query_features(
                 queries[qid], query_tokens.get(qid, []),
                 bm25_results.get(qid, []), dense_results.get(qid, []),
                 word_freq, total_corpus_tokens, doc_freq, total_docs,
@@ -1492,6 +1412,7 @@ def _load_weak_dataset(cfg: dict):
             by_split[r["split"]].append(r)
 
     def _slice(split_rows):
+        """Project rows of one split into ``(X, y, qids, ds_names)`` arrays."""
         X = np.array([[float(r[k]) for k in FEATURE_NAMES] for r in split_rows], dtype=np.float32)
         y = np.array([float(r["oracle_alpha"]) for r in split_rows], dtype=np.float32)
         qids = [r["qid"] for r in split_rows]
@@ -1520,14 +1441,10 @@ def _load_weak_dataset(cfg: dict):
 
 
 # ------------------------------------------------------------
-# Per-query wRRF NDCG (used by every grid search and comparison)
+# Per-query wRRF NDCG (used by every grid search and comparison) lives in
+# src.utils.wrrf_query_ndcg.  Kept here as a one-line bridge so anyone
+# searching this file can still find it.
 # ------------------------------------------------------------
-
-def _wrrf_query_ndcg(alpha: float, qid: str,
-                     bm25_res: dict, dense_res: dict, qrels: dict,
-                     rrf_k: int, ndcg_k: int) -> float:
-    ranked = wrrf_fuse(alpha, bm25_res.get(qid, []), dense_res.get(qid, []), rrf_k)
-    return query_ndcg_at_k(ranked, qrels.get(qid, {}), ndcg_k)
 
 
 def _retrieval_data_per_dataset(cfg: dict, device: torch.device,
@@ -1553,6 +1470,16 @@ def _cv_score_one_combo(model_name: str, params: dict,
                         retrieval_data: Dict[str, dict],
                         folds: list, seed: int,
                         rrf_k: int, ndcg_k: int) -> float:
+    """Score one ``(model_name, params, feature_cols)`` combo via 10-fold CV.
+
+    For each fold: fits a fresh ``StandardScaler`` on the training rows
+    only, trains the requested model, predicts α on the validation rows,
+    plugs the predicted α into the wRRF formula against the real BM25 +
+    dense top-k lists, and computes per-query NDCG@``ndcg_k``. Returns the
+    mean validation NDCG averaged across all folds. A model that fails to
+    fit a fold (degenerate input, single-class classifier, etc.) silently
+    falls back to predicting α = 0.5 for that fold.
+    """
     Xc = X_td[:, feature_cols] if feature_cols is not None else X_td
     fold_means = []
     for tr_idx, va_idx in folds:
@@ -1576,7 +1503,7 @@ def _cv_score_one_combo(model_name: str, params: dict,
         for i, alpha in zip(va_idx, preds):
             qid = qids_td[i]; ds = ds_td[i]
             rd  = retrieval_data[ds]
-            ndcgs.append(_wrrf_query_ndcg(
+            ndcgs.append(wrrf_query_ndcg(
                 float(alpha), qid,
                 rd["bm25_results"], rd["dense_results"], rd["qrels"],
                 rrf_k, ndcg_k,
@@ -1616,7 +1543,7 @@ def _cv_perquery_scores(model_name: str, params: dict,
         for i, alpha in zip(va_idx, preds):
             qid = qids_td[i]; ds = ds_td[i]
             rd = retrieval_data[ds]
-            per_query[i] = _wrrf_query_ndcg(
+            per_query[i] = wrrf_query_ndcg(
                 float(alpha), qid,
                 rd["bm25_results"], rd["dense_results"], rd["qrels"],
                 rrf_k, ndcg_k,
@@ -1629,6 +1556,16 @@ def _cv_perquery_scores(model_name: str, params: dict,
 # ------------------------------------------------------------
 
 def step_06_weak_grid_search(cfg: dict, device: torch.device) -> None:
+    """STEP 6 — Grid-search the weak router (16 features → α).
+
+    Enumerates every ``(family, hyperparameters)`` combination under
+    ``weak_model_grid_search`` and scores each via 10-fold CV on the
+    train+dev rows of ``weak_dataset.csv`` (NDCG@100 on the wRRF-fused
+    candidate lists). Outputs the ranked grid to
+    ``weak_grid_search_top.csv``, the winner to ``weak_best_params.json``,
+    and the retrained-on-train+dev bundle to ``data/models/weak_model.pkl``
+    (dict with ``model``, ``scaler``, ``feature_cols``, ``feature_names``).
+    """
     print_step_header(6, "Weak-model grid search")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv      = os.path.join(results_root, "weak_grid_search_top.csv")
@@ -1688,6 +1625,24 @@ def step_06_weak_grid_search(cfg: dict, device: torch.device) -> None:
 # ------------------------------------------------------------
 
 def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
+    """STEP 7 — Two-phase feature ablation for the weak router.
+
+    Phase 1: leave-one-feature-out and leave-one-group-out 10-fold CV vs.
+    the full 16-feature baseline; identifies "non-damaging" items (Δ ≥ 0)
+    and writes ``weak_ablation.csv`` + ``weak_ablation.png``.
+
+    Phase 2: enumerates every non-empty subset of those non-damaging
+    items, runs 10-fold CV per combination, runs a paired t-test on
+    per-query NDCG@100 against the full model, and Holm-Bonferroni
+    corrects across the family. ``sig_better = True`` requires a
+    Holm-significant p AND a strictly positive mean diff. Outputs go to
+    ``weak_ablation_combo.{csv,png}``.
+
+    Final selection: the highest-mean ``sig_better`` combination if any
+    qualifies, otherwise the full 16 features. The winning bundle is
+    retrained on the full train+dev set and overwrites
+    ``data/models/weak_model.pkl``.
+    """
     print_step_header(7, "Weak-model feature ablation (phase 1 + phase 2 combo)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     models_root  = get_config_path(cfg, "models_folder",  "data/models")
@@ -1937,6 +1892,12 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
 
 def _plot_ablation(rows: List[dict], full_score: float,
                    ndcg_k: int, out_path: str) -> None:
+    """Render the Phase-1 ablation chart (leave-one-feature + leave-one-group).
+
+    Two stacked horizontal bar charts: per-feature deltas above, per-group
+    deltas below. Each bar is annotated with its absolute CV NDCG and the
+    delta against *full_score*. Saved to *out_path* as PNG.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -2135,6 +2096,14 @@ def _predict_weak(cfg: dict) -> Dict[Tuple[str, str], float]:
 
 
 def step_08_weak_retrieval_comparison(cfg: dict, device: torch.device) -> None:
+    """STEP 8 — Test-set NDCG@100 for {BM25, Dense, Static RRF, wRRF (weak)}.
+
+    Loads the saved ``weak_model.pkl`` bundle, predicts α for every test
+    query using the bundle's scaler + model, and evaluates the four
+    methods over the held-out 225-query test set. Per-dataset and macro
+    NDCG@100 are written to ``weak_retrieval_comparison.csv`` and
+    plotted in ``weak_retrieval_comparison.png``.
+    """
     print_step_header(8, "Weak retrieval comparison (test set)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "weak_retrieval_comparison.csv")
@@ -2168,6 +2137,14 @@ def step_08_weak_retrieval_comparison(cfg: dict, device: torch.device) -> None:
 # ------------------------------------------------------------
 
 def step_09_plot_weak_alphas(cfg: dict) -> None:
+    """STEP 9 — Diagnostic plots of the weak router's predicted α distribution.
+
+    Two PNGs over the test set: ``weak_alphas_boxplot.png`` (per-dataset
+    box plot of predicted α with mean + median annotations) and
+    ``weak_alphas_sorted.png`` (oracle α sorted ascending with the
+    weak prediction overlaid in the same order — closer alignment to
+    the oracle diagonal indicates better calibration).
+    """
     print_step_header(9, "Plot weak alphas (box + sorted)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     box_png    = os.path.join(results_root, "weak_alphas_boxplot.png")
@@ -2177,7 +2154,7 @@ def step_09_plot_weak_alphas(cfg: dict) -> None:
         return
 
     weak_alphas = _predict_weak(cfg)
-    oracle      = _load_oracle_alphas(cfg)
+    oracle      = load_oracle_alphas(cfg)
 
     rows = load_csv_dicts(os.path.join(results_root, "weak_dataset.csv"))
     test_rows = [r for r in rows if r["split"] == "test"]
@@ -2206,6 +2183,13 @@ def step_09_plot_weak_alphas(cfg: dict) -> None:
 # ------------------------------------------------------------
 
 def step_10_weak_shap(cfg: dict) -> None:
+    """STEP 10 — SHAP summary plot for the saved weak router.
+
+    Uses ``shap.TreeExplainer`` for tree-based winners (XGBoost, LightGBM,
+    RandomForest, ExtraTrees) and falls back to ``shap.KernelExplainer``
+    (100-row background, 200 samples per explanation) otherwise. Features
+    are sorted by mean |SHAP value|; output is ``weak_shap.png``.
+    """
     print_step_header(10, "Weak SHAP (merged dataset)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_png      = os.path.join(results_root, "weak_shap.png")
@@ -2262,6 +2246,15 @@ def step_10_weak_shap(cfg: dict) -> None:
 # ------------------------------------------------------------
 
 def step_11_strong_dataset(cfg: dict, device: torch.device) -> None:
+    """STEP 11 — Build the strong-router dataset (1024-dim BGE-M3 embeddings).
+
+    Loads each dataset's cached ``query_vectors.pt`` and ``query_ids.pkl``,
+    re-keys to the canonical ``merged_qids`` order, attaches the same
+    train/dev/test split + oracle α as the weak dataset, and saves a
+    pickle holding ``rows`` (split metadata) and ``X`` (a ``(1500, 1024)``
+    ``float32`` matrix). Queries with no relevant document are marked
+    ``split = "drop"`` to match Step 5.
+    """
     print_step_header(11, "Strong-model dataset (BGE-M3 query embeddings)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_pkl = os.path.join(results_root, "strong_dataset.pkl")
@@ -2271,7 +2264,7 @@ def step_11_strong_dataset(cfg: dict, device: torch.device) -> None:
 
     selected = _select_merged_qids(cfg)
     split    = _load_split(cfg)
-    oracle   = _load_oracle_alphas(cfg)
+    oracle   = load_oracle_alphas(cfg)
 
     rows: List[dict] = []
     X_parts: List[np.ndarray] = []
@@ -2330,6 +2323,7 @@ def _load_strong_dataset(cfg: dict):
             indices_by_split[r["split"]].append(i)
 
     def _slice(idxs):
+        """Materialise the (X, y, qids, ds_names) slice for one split."""
         Xs = X[idxs]
         ys = np.array([rows[i]["oracle_alpha"] for i in idxs], dtype=np.float32)
         qids = [rows[i]["qid"] for i in idxs]
@@ -2361,6 +2355,15 @@ def _load_strong_dataset(cfg: dict):
 # ------------------------------------------------------------
 
 def step_12_strong_grid_search(cfg: dict, device: torch.device) -> None:
+    """STEP 12 — Grid-search the strong router (1024-dim embedding → α).
+
+    Same 10-fold CV protocol as Step 6 but on the BGE-M3 query embeddings.
+    The per-fold ``StandardScaler`` is critical here: distance- and
+    kernel-based candidates (KNN, SVR) and high-dimensional gradient
+    boosters need normalised inputs. Outputs:
+    ``strong_grid_search_top.csv``, ``strong_best_params.json``, and the
+    retrained-on-train+dev bundle ``data/models/strong_model.pkl``.
+    """
     print_step_header(12, "Strong-model grid search")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     models_root  = get_config_path(cfg, "models_folder",  "data/models")
@@ -2458,6 +2461,14 @@ def _predict_strong(cfg: dict) -> Dict[Tuple[str, str], float]:
 # ------------------------------------------------------------
 
 def step_13_strong_retrieval_comparison(cfg: dict, device: torch.device) -> None:
+    """STEP 13 — Test-set NDCG@100 for {BM25, Dense, Static, weak, strong}.
+
+    Identical to Step 8 plus an extra column for the strong router's
+    predictions. The strong bundle's saved scaler is applied to the test
+    embeddings before α prediction. Outputs:
+    ``strong_retrieval_comparison.csv``,
+    ``strong_retrieval_comparison.png``.
+    """
     print_step_header(13, "Strong retrieval comparison (test set)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "strong_retrieval_comparison.csv")
@@ -2493,6 +2504,12 @@ def step_13_strong_retrieval_comparison(cfg: dict, device: torch.device) -> None
 # ------------------------------------------------------------
 
 def step_14_plot_strong_alphas(cfg: dict) -> None:
+    """STEP 14 — Diagnostic plots of the strong router's predicted α distribution.
+
+    Same two PNGs as Step 9 (per-dataset boxplot + sorted-oracle overlay)
+    but using the strong router's predictions. Outputs:
+    ``strong_alphas_boxplot.png``, ``strong_alphas_sorted.png``.
+    """
     print_step_header(14, "Plot strong alphas (box + sorted)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     box_png    = os.path.join(results_root, "strong_alphas_boxplot.png")
@@ -2502,7 +2519,7 @@ def step_14_plot_strong_alphas(cfg: dict) -> None:
         return
 
     strong_alphas = _predict_strong(cfg)
-    oracle = _load_oracle_alphas(cfg)
+    oracle = load_oracle_alphas(cfg)
     ds = _load_strong_dataset(cfg)
 
     by_ds: Dict[str, List[float]] = {d: [] for d in cfg["datasets"]}
@@ -2577,6 +2594,16 @@ def _oof_predictions_for(model_bundle_kind: str, cfg: dict, device: torch.device
 
 
 def step_15_moe_dataset(cfg: dict, device: torch.device) -> None:
+    """STEP 15 — Build the MoE meta-dataset (zero-leakage OOF α predictions).
+
+    Train+dev rows are produced by 10-fold OOF: each fold retrains the
+    weak and strong base models from scratch on the other 9 folds and
+    predicts on the held-out fold, so no train+dev query ever
+    contaminates its own meta-feature. Test rows reuse the already-saved
+    weak and strong bundles (which were trained on all 1275 train+dev
+    queries — never on test). Asserts that weak and strong qid orders
+    align before saving. Output: ``moe_dataset.csv``.
+    """
     print_step_header(15, "MoE meta-learner dataset (OOF base predictions)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "moe_dataset.csv")
@@ -2639,11 +2666,18 @@ def step_15_moe_dataset(cfg: dict, device: torch.device) -> None:
 
 
 def _load_moe_dataset(cfg: dict):
+    """Load Step 15's MoE meta-dataset (`moe_dataset.csv`) and split it.
+
+    Returns a dict with parallel ``aw_td/as_td/gt_td/...`` (train+dev OOF
+    rows) and ``aw_te/as_te/...`` (test rows). The MoE grid search and
+    the final fit (Steps 16, 18) consume these arrays.
+    """
     rows = load_csv_dicts(os.path.join(
         get_config_path(cfg, "results_folder", "data/results"), "moe_dataset.csv"))
     td = [r for r in rows if r["split"] == "traindev"]
     te = [r for r in rows if r["split"] == "test"]
     def _arr(rows_):
+        """Stack the MoE meta-features and label of *rows_* into ndarrays."""
         aw = np.array([float(r["alpha_weak"])   for r in rows_], dtype=np.float32)
         as_ = np.array([float(r["alpha_strong"]) for r in rows_], dtype=np.float32)
         gt = np.array([float(r["alpha_gt"])     for r in rows_], dtype=np.float32)
@@ -2676,6 +2710,13 @@ def _moe_features(aw, as_, model_name):
 def _cv_score_moe_combo(model_name: str, params: dict,
                         moe: dict, retrieval_data: Dict[str, dict],
                         folds: list, seed: int, rrf_k: int, ndcg_k: int) -> float:
+    """Score one MoE ``(model_name, params)`` combo via 10-fold CV.
+
+    Same protocol as :func:`_cv_score_one_combo` but on the 2-D MoE
+    feature space (``[α_weak, α_strong]`` for tree models, plus
+    ``|α_weak − α_strong|`` for linear/distance/kernel models). NDCG@``ndcg_k``
+    is evaluated against the actual BM25+dense retrieval results.
+    """
     fold_means = []
     for tr_idx, va_idx in folds:
         X_tr = _moe_features(moe["aw_td"][tr_idx], moe["as_td"][tr_idx], model_name)
@@ -2693,7 +2734,7 @@ def _cv_score_moe_combo(model_name: str, params: dict,
         for i, alpha in zip(va_idx, preds):
             qid = moe["qid_td"][i]; ds = moe["ds_td"][i]
             rd  = retrieval_data[ds]
-            ndcgs.append(_wrrf_query_ndcg(
+            ndcgs.append(wrrf_query_ndcg(
                 float(alpha), qid,
                 rd["bm25_results"], rd["dense_results"], rd["qrels"],
                 rrf_k, ndcg_k,
@@ -2703,6 +2744,15 @@ def _cv_score_moe_combo(model_name: str, params: dict,
 
 
 def step_16_moe_grid_search(cfg: dict, device: torch.device) -> None:
+    """STEP 16 — Grid-search the MoE meta-learner.
+
+    The MoE input is a small 2- or 3-D vector (``[α_weak, α_strong]`` and
+    optionally ``|α_weak − α_strong|`` for non-tree models), so the model
+    grid stays shallow on purpose. Same fit-on-train-fold scaler protocol
+    as Steps 6 and 12. Outputs: ``moe_grid_search_top.csv``,
+    ``moe_best_params.json``, and the retrained-on-train+dev bundle
+    ``data/models/moe_model.pkl``.
+    """
     print_step_header(16, "MoE meta-learner grid search")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     models_root  = get_config_path(cfg, "models_folder",  "data/models")
@@ -2793,6 +2843,15 @@ def _predict_moe(cfg: dict) -> Dict[Tuple[str, str], float]:
 # ------------------------------------------------------------
 
 def step_17_moe_decision_heatmap(cfg: dict) -> None:
+    """STEP 17 — Render the MoE meta-learner's decision surface.
+
+    Samples the ``(α_strong, α_weak) ∈ [0, 1]²`` unit square on a 100 ×
+    100 grid, predicts the MoE α at every cell, and draws a 30-level
+    filled contour plot (``RdYlBu_r`` palette: blue = MoE prefers Dense,
+    red = MoE prefers BM25). Real queries are scatter-overlaid with
+    train+dev as small translucent markers and test as larger markers
+    with black edges. Output: ``moe_decision_heatmap.png``.
+    """
     print_step_header(17, "MoE decision heatmap")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_png = os.path.join(results_root, "moe_decision_heatmap.png")
@@ -2854,6 +2913,14 @@ def step_17_moe_decision_heatmap(cfg: dict) -> None:
 # ------------------------------------------------------------
 
 def step_18_moe_retrieval_comparison(cfg: dict, device: torch.device) -> None:
+    """STEP 18 — Test-set NDCG@100 for all 6 methods (head-to-head).
+
+    Plots BM25, Dense, Static RRF, wRRF (weak), wRRF (strong), and wRRF
+    (MoE) side by side per dataset and macro. The MoE prediction comes
+    from ``data/models/moe_model.pkl`` applied to the OOF-style meta-
+    features of each test query. Outputs:
+    ``moe_retrieval_comparison.csv``, ``moe_retrieval_comparison.png``.
+    """
     print_step_header(18, "MoE retrieval comparison (all 6 methods)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv = os.path.join(results_root, "moe_retrieval_comparison.csv")
@@ -2886,6 +2953,11 @@ def step_18_moe_retrieval_comparison(cfg: dict, device: torch.device) -> None:
 # ------------------------------------------------------------
 
 def step_19_plot_moe_alphas(cfg: dict) -> None:
+    """STEP 19 — Diagnostic plots of the MoE router's predicted α distribution.
+
+    Same two PNGs as Steps 9 and 14 but using the MoE's predictions.
+    Outputs: ``moe_alphas_boxplot.png``, ``moe_alphas_sorted.png``.
+    """
     print_step_header(19, "Plot MoE alphas (box + sorted)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     box_png    = os.path.join(results_root, "moe_alphas_boxplot.png")
@@ -2896,7 +2968,7 @@ def step_19_plot_moe_alphas(cfg: dict) -> None:
 
     moe_alphas = _predict_moe(cfg)
     moe = _load_moe_dataset(cfg)
-    oracle = _load_oracle_alphas(cfg)
+    oracle = load_oracle_alphas(cfg)
 
     by_ds: Dict[str, List[float]] = {d: [] for d in cfg["datasets"]}
     for d, q in zip(moe["ds_te"], moe["qid_te"]):
@@ -2921,6 +2993,16 @@ def step_19_plot_moe_alphas(cfg: dict) -> None:
 # ------------------------------------------------------------
 
 def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
+    """STEP 20 — Recall@100 for all 6 methods + the BM25 ∪ Dense union ceiling.
+
+    Computes per-query Recall@100 on the test set (queries with no
+    relevant document are excluded from per-method averages so the
+    metric is not deflated). The union (200 unique docs) is reported
+    as the upper-bound any reranker could reach drawing from both
+    first-stage retrievers. 95 % bootstrap CIs are computed and plotted
+    as error bars. Outputs: ``recall_at_100.csv``, ``recall_at_100.png``,
+    ``recall_ci.csv``.
+    """
     print_step_header(20, "Recall@100 (test set)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv    = os.path.join(results_root, "recall_at_100.csv")
@@ -3096,6 +3178,19 @@ TTEST_FIELDS_RERANK = [
 
 
 def step_21_rerank(cfg: dict, device: torch.device) -> None:
+    """STEP 21 — Cross-encoder reranking and rerank-vs-original significance tests.
+
+    Loads ``cross-encoder/ms-marco-MiniLM-L-6-v2`` and reranks each of
+    the six methods' top-100 candidate lists on the test set. Streams
+    only the union of needed ``(qid, doc_id)`` pairs from disk and
+    caches scored pairs to ``rerank_scores_<ce>_<dataset>.pkl`` to avoid
+    redundant scoring across methods. Computes both NDCG@100 and MRR@100
+    before and after reranking, plus paired t-tests with Holm correction
+    on (a) rerank-vs-original deltas per method and (b) reranked-method
+    pairwise comparisons. Outputs: ``rerank_ndcg.{csv,png}``,
+    ``rerank_mrr.{csv,png}``, ``rerank_gain.png``,
+    ``rerank_mrr_gain.png``, ``rerank_ttest.csv``.
+    """
     print_step_header(21, "Cross-encoder reranking (test set)")
     results_root = get_config_path(cfg, "results_folder", "data/results")
     out_csv     = os.path.join(results_root, "rerank_ndcg.csv")
@@ -3352,6 +3447,15 @@ def _ensure_ce_scores(cache_path: str, ce_model, batch_size: int,
 # ------------------------------------------------------------
 
 def step_22_significance(cfg: dict, device: torch.device) -> None:
+    """STEP 22 — Paired t-tests on test-set NDCG@100 across all 15 method pairs.
+
+    Collects per-query NDCG@100 scores for each of the six methods on
+    the merged 225-query test set, runs ``scipy.stats.ttest_rel`` over
+    every unordered pair, computes Cohen's d, and applies Holm-Bonferroni
+    correction across the family. Also bootstraps 95 % CIs (1000
+    resamples, ``seed = 42``). Outputs: ``significance_tests.csv``,
+    ``ndcg_ci.csv``, ``ndcg_ci.png``.
+    """
     rrf_k     = int(cfg["benchmark"]["rrf"]["k"])
     ndcg_k    = int(cfg["benchmark"]["ndcg_k"])
     sig_alpha = float(cfg.get("significance_test", {}).get("alpha", 0.05))
@@ -3448,6 +3552,15 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
 # ------------------------------------------------------------
 
 def step_23_mrr(cfg: dict, device: torch.device) -> None:
+    """STEP 23 — MRR@100 + Recall@100 paired t-tests across all 15 method pairs.
+
+    Same protocol as Step 22 but for MRR@100 (and Recall@100 via the
+    Step 20 outputs). Per-method scores, 95 % bootstrap CIs, and pairwise
+    Holm-corrected significance are written. Outputs:
+    ``mrr_at_100.csv``, ``mrr_ci.csv``, ``mrr_ttest.csv``,
+    ``mrr_at_100.png``, ``mrr_ci.png``, ``recall_ttest.csv``,
+    ``recall_ci.{csv,png}``.
+    """
     ndcg_k    = int(cfg["benchmark"]["ndcg_k"])
     sig_alpha = float(cfg.get("significance_test", {}).get("alpha", 0.05))
     print_step_header(23, f"MRR@{ndcg_k}  (test set, before reranking)")
@@ -3874,6 +3987,7 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
     split = _load_split(cfg)
 
     def _sync():
+        """Block until queued CUDA kernels finish — required for accurate timing."""
         if device.type == "cuda":
             torch.cuda.synchronize()
 
@@ -3959,7 +4073,7 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
             bm_w, q_tok_w = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
             de_w, _       = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
                                               top_k, c_chunk, cur_device)
-            feats_w = _compute_query_features(
+            feats_w = compute_query_features(
                 q_text, q_tok_w, bm_w, de_w,
                 word_freq, total_corpus_tokens, doc_freq, total_docs,
                 stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
@@ -3991,7 +4105,7 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
             bm_m, q_tok_m = _bm25_search_one(q_text, bm25, doc_ids, stemmer, top_k)
             de_m, q_vec_m = _dense_search_one(q_text, st_model, corpus_embs, doc_ids,
                                                top_k, c_chunk, cur_device)
-            feats_m = _compute_query_features(
+            feats_m = compute_query_features(
                 q_text, q_tok_m, bm_m, de_m,
                 word_freq, total_corpus_tokens, doc_freq, total_docs,
                 stopword_stems, overlap_k, feature_stat_k, epsilon, ce_alpha,
@@ -4097,15 +4211,19 @@ def step_25_latency(cfg: dict, device: torch.device) -> None:
 
 
 # ============================================================
-# Section C — Pretty headers and main()
+# Section C — main() entry point
+# (print_step_header lives in src.utils for reuse.)
 # ============================================================
-
-def print_step_header(n: int, title: str) -> None:
-    bar = "=" * 72
-    print(f"\n\n{bar}\nSTEP {n:02d} — {title}\n{bar}")
 
 
 def main() -> None:
+    """Run the full 25-step pipeline (or a subset via ``--start/--end``).
+
+    Loads ``config.yaml``, seeds all RNGs, picks the CUDA device if
+    available, and dispatches each ``step_NN_xxx`` in sequence. Every
+    step is idempotent — outputs cached on disk skip themselves on a
+    re-run, so this entry point can be killed and restarted at any time.
+    """
     warnings.filterwarnings("ignore")
     cfg = load_config()
     seed = int(cfg["sampling"]["random_seed"])
