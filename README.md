@@ -1,6 +1,23 @@
 # Query-Adaptive Hybrid Retrieval
 
-Diploma Thesis — Konstantinos Anastasopoulos, CEID
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+<!-- After your first Zenodo release, uncomment and replace XXXXXXX with the concept DOI (the "all-versions" DOI Zenodo issues): -->
+<!-- [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX) -->
+
+> **Diploma Thesis — Computer Engineering and Informatics Department (CEID), University of Patras**
+>
+> **Author:** Konstantinos Anastasopoulos &lt;k.matsaniaou2003@gmail.com&gt;
+> **Supervisor:** &lt;SUPERVISOR FULL NAME&gt;, &lt;TITLE / DEPT&gt;
+> **Year:** 2026
+
+A query-adaptive hybrid retrieval system that learns, per query, the
+optimal weight α between BM25 and BGE-M3 dense retrieval and merges the
+two ranked lists via weighted Reciprocal Rank Fusion. Three router
+variants — a 16-feature LightGBM, a 1024-dim BGE-M3 embedding XGBoost,
+and an SVR-based Mixture-of-Experts meta-learner — are trained and
+compared against BM25, dense, and a Static-RRF (α = 0.5) baseline on
+five BEIR datasets. See [`docs/results.md`](docs/results.md) for the
+full empirical analysis.
 
 ---
 
@@ -151,6 +168,43 @@ python -m src.pipeline --start 6 --end 8
 
 ---
 
+## Quickstart — load a saved router and predict α
+
+The three trained routers in [`data/models/`](data/models/) are dictionaries
+containing `model`, `scaler`, `feature_cols`, and `feature_names`. The
+snippet below loads the **weak router** and predicts α for a single
+feature vector. The 16 feature values must be supplied in the order given
+by `feature_names` (and computed against the same BM25 + dense top-100
+lists used at training time — see
+[`docs/pipeline_steps.md`](docs/pipeline_steps.md) §STEP 5).
+
+```python
+import joblib, numpy as np
+
+bundle = joblib.load("data/models/weak_model.pkl")
+model, scaler, feat_cols = bundle["model"], bundle["scaler"], bundle["feature_cols"]
+print("Feature order:", bundle["feature_names"])
+
+# Replace the zeros below with the 16 features for your query, in the
+# order printed above. See docs/pipeline_steps.md §STEP 5 for definitions
+# (query_length, stopword_ratio, has_question_word, average_idf, ...).
+features = np.zeros((1, 16), dtype=np.float32)
+
+X_scaled = scaler.transform(features[:, feat_cols])
+alpha = float(np.clip(model.predict(X_scaled)[0], 0.0, 1.0))
+print(f"Predicted alpha = {alpha:.3f}")
+```
+
+For an end-to-end example that runs BM25, dense retrieval, computes the
+16 features, predicts α, and produces the wRRF-fused ranked list, see
+the test-set evaluation block in
+[`src/pipeline.py`](src/pipeline.py) (Step 8 — `step_08_weak_retrieval_comparison`).
+The strong and MoE routers load the same way; the strong bundle expects
+a 1024-dim BGE-M3 query embedding as input, the MoE bundle expects
+`[α_weak, α_strong, |α_weak − α_strong|]`.
+
+---
+
 ## Source files
 
 | File | Purpose |
@@ -224,3 +278,29 @@ and `data/results/merged_split.json` and never recomputed once written.
 
 Hardware used for published results: AMD Ryzen 9 5950X, NVIDIA RTX 4090
 (24 GB), 62.7 GB RAM, Ubuntu 24.04, CUDA 13.0, PyTorch 2.11.
+
+---
+
+## Citing this work
+
+If you use this code or its results, please cite the repository via the
+metadata in [`CITATION.cff`](CITATION.cff). GitHub renders a "Cite this
+repository" button on the project page that returns BibTeX and APA forms
+generated from that file.
+
+After the first Zenodo release the canonical citation will be:
+
+```bibtex
+@software{anastasopoulos_qahr_2026,
+  author    = {Anastasopoulos, Konstantinos},
+  title     = {Query-Adaptive Hybrid Retrieval},
+  year      = {2026},
+  publisher = {Zenodo},
+  version   = {v1.0.0},
+  doi       = {10.5281/zenodo.XXXXXXX},
+  url       = {https://github.com/<YOUR-GITHUB-USER>/Query-Adaptive-Hybrid-Retrieval}
+}
+```
+
+Replace `XXXXXXX` and `<YOUR-GITHUB-USER>` once the Zenodo DOI and the
+public GitHub URL are known.

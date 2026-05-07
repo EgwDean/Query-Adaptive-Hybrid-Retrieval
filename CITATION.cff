@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this software or its results, please cite it as below."
+type: software
+
+title: "Query-Adaptive Hybrid Retrieval"
+abstract: >-
+  A query-adaptive hybrid retrieval system that learns, per query, the
+  optimal weight α between BM25 (sparse, lexical) and BGE-M3 dense
+  retrieval and merges the two ranked lists via weighted Reciprocal Rank
+  Fusion. Three router variants are trained and compared (16 hand-crafted
+  features → LightGBM; 1024-dim BGE-M3 embedding → XGBoost; an SVR-based
+  Mixture-of-Experts meta-learner). Evaluated on five BEIR datasets
+  (scifact, nfcorpus, arguana, fiqa, scidocs) with paired t-tests and
+  Holm–Bonferroni correction.
+
+authors:
+  - family-names: "Anastasopoulos"
+    given-names: "Konstantinos"
+    affiliation: "Computer Engineering and Informatics Department (CEID), University of Patras"
+    email: "up1093320@ac.upatras.gr"
+
+contact:
+  - family-names: "Sioutas"
+    given-names: "Spyridon"
+    affiliation: "Computer Engineering and Informatics Department (CEID), University of Patras"
+    email: "<ssioutas@ceid.upatras.gr"
+
+version: "1.0.0"                 
+date-released: "2026-05-07"       
+license: Apache-2.0
+repository-code: "https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval"
+url: "https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval"
+
+# Add this line once Zenodo issues a DOI for your first GitHub release:
+# doi: "10.5281/zenodo.XXXXXXX"
+
+keywords:
+  - "information retrieval"
+  - "hybrid retrieval"
+  - "BM25"
+  - "dense retrieval"
+  - "BGE-M3"
+  - "reciprocal rank fusion"
+  - "query routing"
+  - "mixture of experts"
+  - "BEIR benchmark"

@@ -1,16 +1,34 @@
-pyyaml
-tqdm
-beir
-nltk
-rank_bm25
-sentence-transformers
-torch
-FlagEmbedding
-numpy
-scipy
-scikit-learn
-xgboost
-lightgbm
-joblib>=1.3
-matplotlib
-shap
+# Pinned to the versions that produced the published results.
+# See data/results/hardware.json for the full hardware/software fingerprint.
+# Python 3.12 is required.
+
+# Core scientific stack — pinned exactly to the published-run versions
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.8.0
+
+# PyTorch — the published run used the CUDA 13.0 build (torch==2.11.0+cu130).
+# On systems without CUDA 13 you may need to install torch separately from
+# https://pytorch.org/get-started/locally/ (the requirement below is the
+# upstream version; pip will pick the build matching your platform).
+torch==2.11.0
+
+# Embeddings + reranking
+sentence-transformers==5.3.0
+FlagEmbedding>=1.2.10
+
+# Retrieval / IR
+beir==2.2.0
+rank_bm25==0.2.2
+nltk==3.9.4
+
+# Gradient boosting (used by weak / strong / MoE grids)
+xgboost==3.2.0
+lightgbm>=4.0,<5.0
+
+# Persistence, plotting, and utilities
+joblib==1.5.3
+matplotlib==3.10.8
+shap==0.51.0
+pyyaml==6.0.3
+tqdm==4.67.3
