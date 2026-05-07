@@ -1,7 +1,7 @@
 # Query-Adaptive Hybrid Retrieval
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20073288.svg)](https://doi.org/10.5281/zenodo.20073288)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20073287.svg)](https://doi.org/10.5281/zenodo.20073287)
 
 > **Diploma Thesis — Computer Engineering and Informatics Department (CEID), University of Patras**
 >
@@ -287,8 +287,13 @@ metadata in [`CITATION.cff`](CITATION.cff). GitHub renders a "Cite this
 repository" button on the project page that returns BibTeX and APA forms
 generated from that file.
 
-The archived release is on Zenodo (DOI:
-[10.5281/zenodo.20073288](https://doi.org/10.5281/zenodo.20073288)).
+The repository is archived on Zenodo. Please cite the **concept DOI**
+[10.5281/zenodo.20073287](https://doi.org/10.5281/zenodo.20073287) — this
+identifier always resolves to the latest archived version. Per-version
+DOIs (e.g. `10.5281/zenodo.20073721` for v1.0.1) are listed on the
+Zenodo record under "View all versions" if you need to pin to a specific
+snapshot.
+
 BibTeX:
 
 ```bibtex
@@ -297,8 +302,7 @@ BibTeX:
   title     = {Query-Adaptive Hybrid Retrieval},
   year      = {2026},
   publisher = {Zenodo},
-  version   = {v1.0.0},
-  doi       = {10.5281/zenodo.20073288},
+  doi       = {10.5281/zenodo.20073287},
   url       = {https://github.com/EgwDean/Query-Adaptive-Hybrid-Retrieval}
 }
 ```
