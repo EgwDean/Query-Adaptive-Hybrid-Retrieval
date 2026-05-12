@@ -85,10 +85,11 @@ held-out test queries** (45 per dataset):
 | Oracle ceiling | 0.487 | — | — |
 
 All three adaptive methods **significantly outperform BM25** (paired
-t-test, p < 1e-7, Cohen's d ≈ 0.4) on NDCG, MRR, and Recall@100. They
-also significantly beat Static RRF on NDCG (p ≤ 0.029, n = 225). Each
-method pair is treated as an independent, pre-specified comparison;
-no multiple-comparison correction is applied.
+t-test, p < 1e-4, Cohen's d ≈ 0.3–0.45) on NDCG, MRR, and Recall@100.
+They also **significantly beat Static RRF on NDCG** (p ≤ 0.018, n = 225);
+on MRR and Recall the same direction holds but reaches significance
+only for the weak router. Each method pair is treated as an independent,
+pre-specified comparison; no multiple-comparison correction is applied.
 
 The cheap 16-feature weak router performs **statistically indistinguishably**
 from the expensive 1024-dim strong router (p = 0.65, Δ = 0.002 NDCG) and

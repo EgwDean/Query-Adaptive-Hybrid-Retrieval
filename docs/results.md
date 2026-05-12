@@ -383,9 +383,9 @@ comparison; no multiple-comparison correction is applied.
 | wRRF (weak) vs. dense | +0.0020 | 0.28 | 0.78 | 0.02 | No |
 | wRRF (strong) vs. dense | +0.0042 | 0.97 | 0.33 | 0.06 | No |
 | wRRF (MoE) vs. dense | +0.0055 | 1.58 | 0.12 | 0.11 | No |
-| **wRRF (weak) vs. Static RRF** | +0.0178 | 2.64 | **0.009** | 0.18 | **Yes** |
-| **wRRF (strong) vs. Static RRF** | +0.0200 | 2.21 | **0.028** | 0.15 | **Yes** |
-| **wRRF (MoE) vs. Static RRF** | +0.0214 | 2.20 | **0.029** | 0.15 | **Yes** |
+| **wRRF (weak) vs. Static RRF** | +0.0190 | 2.96 | **0.0034** | 0.20 | **Yes** |
+| **wRRF (strong) vs. Static RRF** | +0.0212 | 2.40 | **0.017** | 0.16 | **Yes** |
+| **wRRF (MoE) vs. Static RRF** | +0.0225 | 2.37 | **0.018** | 0.16 | **Yes** |
 | weak vs. strong | −0.0022 | −0.46 | 0.65 | −0.03 | No |
 | weak vs. MoE | −0.0035 | −0.64 | 0.52 | −0.04 | No |
 | strong vs. MoE | −0.0013 | −0.43 | 0.67 | −0.03 | No |
@@ -395,9 +395,11 @@ comparison; no multiple-comparison correction is applied.
 1. **All three adaptive methods crush BM25.** Each beats it by ≈ 0.10
    NDCG with p < 1e-7 and Cohen's d ≈ 0.4 (medium effect). This is the
    strongest claim the experiment makes.
-2. **All three adaptive methods significantly beat Static RRF.**
-   wRRF beats the uniform-α baseline by 0.018–0.021 NDCG with raw
-   p ∈ [0.009, 0.029] — all significant at α = 0.05.
+2. **All three adaptive methods significantly beat Static RRF on NDCG.**
+   wRRF beats the uniform-α baseline by 0.019–0.022 NDCG with raw
+   p ∈ [0.003, 0.018] — all significant at α = 0.05. The MRR and
+   Recall advantages are smaller (see below) and only the weak router
+   reaches significance on those two metrics at n = 225.
 3. **Adaptive vs. dense: not statistically significant.** Effect sizes
    are tiny (d ≤ 0.11). The adaptive methods recover dense's
    performance and add a small but reliably-non-negative margin.
@@ -415,9 +417,9 @@ comparison; no multiple-comparison correction is applied.
 | weak vs. BM25 | +0.0951 | **1.5e-5** | Yes |
 | strong vs. BM25 | +0.0913 | **1.3e-4** | Yes |
 | MoE vs. BM25 | +0.0998 | **5.7e-5** | Yes |
-| weak vs. Static RRF | +0.0264 | **0.035** | Yes |
-| strong vs. Static RRF | +0.0226 | 0.157 | No |
-| MoE vs. Static RRF | +0.0310 | 0.072 | No |
+| weak vs. Static RRF | +0.0281 | **0.022** | Yes |
+| strong vs. Static RRF | +0.0243 | 0.123 | No |
+| MoE vs. Static RRF | +0.0327 | 0.055 | No (borderline) |
 | Adaptive vs. dense | ≤ 0.013 | ≥ 0.10 | No |
 | Routers vs. each other | ≤ 0.008 | ≥ 0.13 | No |
 
@@ -428,14 +430,19 @@ comparison; no multiple-comparison correction is applied.
 | weak vs. BM25 | +0.135 | **1.1e-10** | Yes |
 | strong vs. BM25 | +0.138 | **6.1e-11** | Yes |
 | MoE vs. BM25 | +0.134 | **8.2e-10** | Yes |
-| weak vs. Static RRF | +0.007 | **0.010** | Yes |
-| strong vs. Static RRF | +0.011 | **0.047** | Yes |
-| MoE vs. Static RRF | +0.006 | 0.38 | No |
-| Adaptive vs. dense / routers vs. each other | ≤ 0.008 | ≥ 0.38 | No |
+| weak vs. Static RRF | +0.007 | **0.011** | Yes |
+| strong vs. Static RRF | +0.010 | 0.050 | No (right on the threshold) |
+| MoE vs. Static RRF | +0.006 | 0.39 | No |
+| Adaptive vs. dense | ≤ 0.008 | ≥ 0.38 | No |
+| Routers vs. each other | ≤ 0.004 | ≥ 0.39 | No |
 
-The same pattern: adaptive ≫ BM25, adaptive > Static RRF (significant
-on most metrics), adaptive ≈ Dense, and the three routers among each
-other are indistinguishable.
+**Pattern across metrics:**
+
+- **All three adaptive methods ≫ BM25** on all three metrics (every p < 1e-4).
+- **All three adaptive methods > Static RRF on NDCG** (p ≤ 0.018).
+- **On MRR and Recall, the Static-RRF advantage is significant only for the weak router**; strong and MoE show the same direction but fail at α = 0.05 (n = 225 is the limiting factor — every per-query Δ is positive but the variance is large).
+- **Adaptive ≈ Dense** on every metric.
+- **The three routers among each other are indistinguishable** on every metric.
 
 ---
 
@@ -500,7 +507,7 @@ re-sorted by CE score).
 |--------|---------------|----------------|---|-------|--------------|
 | **BM25** | 0.3275 | **0.3647** | **+0.0373** | **0.002** | **Yes** |
 | Dense | 0.4201 | 0.4173 | −0.0028 | 0.80 | No |
-| Static RRF | 0.4042 | 0.4173 | +0.0131 | 0.24 | No |
+| Static RRF | 0.4042 | 0.4186 | +0.0143 | 0.21 | No |
 | wRRF (weak) | 0.4221 | 0.4185 | −0.0035 | 0.75 | No |
 | wRRF (strong) | 0.4243 | 0.4192 | −0.0051 | 0.66 | No |
 | wRRF (MoE) | 0.4256 | 0.4185 | −0.0071 | 0.52 | No |
@@ -520,7 +527,7 @@ The **MRR@100 ranking gain pattern is similar:**
 |--------|----------------------|-------|--------------|
 | **BM25** | **+0.0740** | **2.3e-4** | **Yes** |
 | Dense | +0.0031 | 0.87 | No |
-| Static RRF | +0.0242 | 0.19 | No |
+| Static RRF | +0.0259 | 0.17 | No |
 | wRRF (weak) | −0.0031 | 0.86 | No |
 | wRRF (strong) | +0.0013 | 0.95 | No |
 | wRRF (MoE) | −0.0079 | 0.67 | No |
@@ -537,6 +544,9 @@ After re-ranking, do the adaptive methods still beat BM25?
 | Strong (rerank) vs. BM25 (rerank) | +0.0544 | **1.3e-6** | Yes |
 | MoE (rerank) vs. BM25 (rerank) | +0.0538 | **2.5e-6** | Yes |
 | Weak (rerank) vs. Dense (rerank) | +0.0012 | 0.66 | No |
+| Weak (rerank) vs. Static RRF (rerank) | +0.0011 | 0.29 | No |
+| Strong (rerank) vs. Static RRF (rerank) | +0.0018 | 0.20 | No |
+| MoE (rerank) vs. Static RRF (rerank) | +0.0011 | 0.57 | No |
 | Adaptive routers vs. each other (rerank) | ≤ 0.0006 | ≥ 0.57 | No |
 
 **Yes.** Even after the BM25 column gets its full +0.037 reranking
@@ -651,14 +661,16 @@ The thesis's contribution can be summarised by what it demonstrably
 proves on the held-out test set:
 
 1. **Adaptive routing significantly beats lexical-only retrieval.**
-   wRRF (weak / strong / MoE) all beat BM25 with p < 1e-7,
-   Cohen's d ≈ 0.4 — on NDCG, MRR, and Recall — across five
+   wRRF (weak / strong / MoE) all beat BM25 with p < 1e-4,
+   Cohen's d ≈ 0.3–0.45 — on NDCG, MRR, and Recall — across five
    heterogeneous BEIR datasets.
 2. **Adaptive routing matches dense-only retrieval and significantly
-   beats Static RRF.** Macro NDCG: 0.426 (MoE) vs. 0.420 (dense) vs.
-   0.404 (Static RRF). All three adaptive methods beat Static RRF at
-   α = 0.05 (p ≤ 0.029), with consistent direction across all three
-   metrics.
+   beats Static RRF on NDCG.** Macro NDCG: 0.426 (MoE) vs. 0.420
+   (dense) vs. 0.404 (Static RRF). All three adaptive methods beat
+   Static RRF on NDCG at α = 0.05 (p ≤ 0.018). On MRR and Recall the
+   advantage holds in the same direction; significance is reached for
+   the weak router on both, while the strong and MoE routers fall just
+   short of α = 0.05 (limited by n = 225).
 3. **The cheap 16-feature weak router is statistically as good as the
    expensive 1 024-dim strong router and the MoE ensemble.** On
    NDCG, MRR, and Recall, all pairwise comparisons among the three
