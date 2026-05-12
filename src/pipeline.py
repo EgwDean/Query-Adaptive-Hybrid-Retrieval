@@ -3512,7 +3512,7 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
     )
     print(f"  NDCG@{ndcg_k} CI plot saved to {ci_png}")
 
-    # ---- Scoped pairwise t-tests with Cohen's d (no multiple-comparison correction) ----
+    # ---- Scoped pairwise t-tests with Cohen's d ----
     rows = _scoped_pairwise_tests(per_method_scores, sig_alpha)
     save_csv_dicts(rows, TTEST_FIELDS_BASE, out_csv)
     print(f"  Saved {len(rows)} paired tests to {out_csv}")
