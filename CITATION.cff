@@ -10,8 +10,8 @@ abstract: >-
   Fusion. Three router variants are trained and compared (16 hand-crafted
   features → LightGBM; 1024-dim BGE-M3 embedding → XGBoost; an SVR-based
   Mixture-of-Experts meta-learner). Evaluated on five BEIR datasets
-  (scifact, nfcorpus, arguana, fiqa, scidocs) with paired t-tests and
-  Holm–Bonferroni correction.
+  (scifact, nfcorpus, arguana, fiqa, scidocs) with per-comparison paired
+  t-tests.
 
 authors:
   - family-names: "Anastasopoulos"

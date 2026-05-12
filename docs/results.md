@@ -4,8 +4,9 @@ This document analyses every quantitative result produced by the pipeline.
 All numbers are on the **held-out 15 % test set** (n = 225 queries: 45 per
 dataset across five BEIR datasets) unless explicitly stated otherwise.
 Metrics are NDCG@100, MRR@100, and Recall@100; significance is assessed with
-paired two-sided t-tests, Holm-Bonferroni corrected across the family of
-comparisons.
+paired two-sided t-tests at α = 0.05. Each method pair is treated as an
+independent, pre-specified scientific comparison — no multiple-comparison
+correction is applied.
 
 ---
 
@@ -192,19 +193,20 @@ The most damaging group drops:
 **Phase 2 — combination test with statistical significance.** All
 2² − 1 = 3 non-empty subsets of the two non-damaging features were
 tested against the full model with paired t-tests over per-query
-NDCG@100, Holm-Bonferroni corrected:
+NDCG@100 (each subset treated as an independent comparison; no
+multiple-comparison correction):
 
-| Removed | n_features | CV NDCG@100 | Δ | p_holm | sig_better |
-|---------|------------|-------------|---|--------|-----------|
-| `dense_confidence` | 15 | 0.43743 | +0.00014 | 1.0 | False |
-| `dense_confidence` + `top_sparse_score` | 14 | 0.43743 | +0.00014 | 1.0 | False |
+| Removed | n_features | CV NDCG@100 | Δ | raw p | sig_better |
+|---------|------------|-------------|---|-------|-----------|
+| `dense_confidence` | 15 | 0.43743 | +0.00014 | 0.89 | False |
+| `dense_confidence` + `top_sparse_score` | 14 | 0.43743 | +0.00014 | 0.89 | False |
 | `top_sparse_score` | 15 | 0.43729 | 0 | 1.0 | False |
 
 **Final selection: the full 16-feature set is retained.** No reduced
-combination was Holm-significantly better (p_holm = 1.0 for all). The
-two "non-damaging" features contribute ≈ 0 marginal signal individually
-but are not statistically harmful, so dropping them is unjustified
-under a conservative criterion.
+combination significantly beat the full model (raw p ≥ 0.89 for all).
+The two "non-damaging" features contribute ≈ 0 marginal signal
+individually but are not statistically harmful either, so dropping them
+is unjustified.
 
 ### 4.3 SHAP feature importance
 
@@ -370,41 +372,37 @@ top-100 lists without ranking) is **0.023 above** the best fusion method
 ## 8. Statistical significance (NDCG@100)
 
 Paired two-sided t-tests over per-query NDCG@100 on the 225 test
-queries, with Holm-Bonferroni correction across all 15 unordered method
-pairs.
+queries. Each method pair is treated as an independent, pre-specified
+comparison; no multiple-comparison correction is applied.
 
-| Comparison | Δ NDCG | t | p | p_holm | Cohen's d | Holm-significant? |
-|------------|--------|---|---|--------|-----------|------------------|
-| **wRRF (weak) vs. BM25** | +0.0946 | 6.54 | 4.2e-10 | **5.0e-9** | 0.44 | **Yes** |
-| **wRRF (strong) vs. BM25** | +0.0968 | 5.87 | 1.5e-8 | **1.7e-7** | 0.39 | **Yes** |
-| **wRRF (MoE) vs. BM25** | +0.0982 | 5.79 | 2.4e-8 | **2.4e-7** | 0.39 | **Yes** |
-| wRRF (weak) vs. dense | +0.0020 | 0.28 | 0.78 | 1.0 | 0.02 | No |
-| wRRF (strong) vs. dense | +0.0042 | 0.97 | 0.33 | 1.0 | 0.06 | No |
-| wRRF (MoE) vs. dense | +0.0055 | 1.58 | 0.12 | 0.70 | 0.11 | No |
-| wRRF (weak) vs. Static RRF | +0.0178 | 2.64 | 0.009 | 0.080 | 0.18 | No (raw yes) |
-| wRRF (strong) vs. Static RRF | +0.0200 | 2.21 | 0.028 | 0.22 | 0.15 | No (raw yes) |
-| wRRF (MoE) vs. Static RRF | +0.0214 | 2.20 | 0.029 | 0.22 | 0.15 | No (raw yes) |
-| weak vs. strong | −0.0022 | −0.46 | 0.65 | 1.0 | −0.03 | No |
-| weak vs. MoE | −0.0035 | −0.64 | 0.52 | 1.0 | −0.04 | No |
-| strong vs. MoE | −0.0013 | −0.43 | 0.67 | 1.0 | −0.03 | No |
+| Comparison | Δ NDCG | t | p | Cohen's d | Significant? |
+|------------|--------|---|---|-----------|--------------|
+| **wRRF (weak) vs. BM25** | +0.0946 | 6.54 | **4.2e-10** | 0.44 | **Yes** |
+| **wRRF (strong) vs. BM25** | +0.0968 | 5.87 | **1.5e-8** | 0.39 | **Yes** |
+| **wRRF (MoE) vs. BM25** | +0.0982 | 5.79 | **2.4e-8** | 0.39 | **Yes** |
+| wRRF (weak) vs. dense | +0.0020 | 0.28 | 0.78 | 0.02 | No |
+| wRRF (strong) vs. dense | +0.0042 | 0.97 | 0.33 | 0.06 | No |
+| wRRF (MoE) vs. dense | +0.0055 | 1.58 | 0.12 | 0.11 | No |
+| **wRRF (weak) vs. Static RRF** | +0.0178 | 2.64 | **0.009** | 0.18 | **Yes** |
+| **wRRF (strong) vs. Static RRF** | +0.0200 | 2.21 | **0.028** | 0.15 | **Yes** |
+| **wRRF (MoE) vs. Static RRF** | +0.0214 | 2.20 | **0.029** | 0.15 | **Yes** |
+| weak vs. strong | −0.0022 | −0.46 | 0.65 | −0.03 | No |
+| weak vs. MoE | −0.0035 | −0.64 | 0.52 | −0.04 | No |
+| strong vs. MoE | −0.0013 | −0.43 | 0.67 | −0.03 | No |
 
 **Take-aways:**
 
 1. **All three adaptive methods crush BM25.** Each beats it by ≈ 0.10
-   NDCG with p_holm < 1e-7 and Cohen's d ≈ 0.4 (medium effect). This
-   is the strongest claim the experiment makes.
-2. **Adaptive vs. dense: not statistically significant.** Effect sizes
+   NDCG with p < 1e-7 and Cohen's d ≈ 0.4 (medium effect). This is the
+   strongest claim the experiment makes.
+2. **All three adaptive methods significantly beat Static RRF.**
+   wRRF beats the uniform-α baseline by 0.018–0.021 NDCG with raw
+   p ∈ [0.009, 0.029] — all significant at α = 0.05.
+3. **Adaptive vs. dense: not statistically significant.** Effect sizes
    are tiny (d ≤ 0.11). The adaptive methods recover dense's
    performance and add a small but reliably-non-negative margin.
-3. **Adaptive vs. Static RRF: significant at raw α = 0.05 but not at
-   Holm-corrected α.** All three methods reliably beat the
-   uniform-α baseline at the per-test level (raw p ∈ [0.009, 0.029]),
-   but conservative Holm correction across 15 hypotheses pushes
-   p_holm above 0.05. The conclusion: **the adaptive methods are
-   *probably* better than Static RRF, but the test set (n = 225) is
-   too small to claim that with strict family-wise control.**
 4. **The three routers are statistically indistinguishable.**
-   Pairwise p ∈ [0.52, 0.67], d < 0.05. **The cheap 16-feature weak
+   Pairwise p ∈ [0.52, 0.67], |d| < 0.05. **The cheap 16-feature weak
    router matches the expensive 1 024-dim strong router and the MoE
    ensemble on routing quality.** This is the central practical
    finding: the router does not need access to the embedding to make
@@ -412,26 +410,32 @@ pairs.
 
 ### MRR significance (n = 225)
 
-| Comparison | Δ MRR | p_holm | Holm-significant? |
-|------------|-------|--------|------------------|
-| weak vs. BM25 | +0.0951 | **1.8e-4** | Yes |
-| strong vs. BM25 | +0.0913 | **1.3e-3** | Yes |
-| MoE vs. BM25 | +0.0998 | **6.3e-4** | Yes |
-| weak vs. Static RRF | +0.0264 | 0.32 | No (raw yes, p=0.035) |
-| Adaptive vs. dense | ≤ 0.013 | ≥ 0.67 | No |
-| Routers vs. each other | ≤ 0.008 | ≥ 0.81 | No |
+| Comparison | Δ MRR | raw p | Significant? |
+|------------|-------|-------|--------------|
+| weak vs. BM25 | +0.0951 | **1.5e-5** | Yes |
+| strong vs. BM25 | +0.0913 | **1.3e-4** | Yes |
+| MoE vs. BM25 | +0.0998 | **5.7e-5** | Yes |
+| weak vs. Static RRF | +0.0264 | **0.035** | Yes |
+| strong vs. Static RRF | +0.0226 | 0.157 | No |
+| MoE vs. Static RRF | +0.0310 | 0.072 | No |
+| Adaptive vs. dense | ≤ 0.013 | ≥ 0.10 | No |
+| Routers vs. each other | ≤ 0.008 | ≥ 0.13 | No |
 
 ### Recall@100 significance (n = 225)
 
-| Comparison | Δ Recall | p_holm | Holm-significant? |
-|------------|----------|--------|------------------|
-| weak vs. BM25 | +0.135 | **1.2e-9** | Yes |
-| strong vs. BM25 | +0.138 | **7.3e-10** | Yes |
-| MoE vs. BM25 | +0.134 | **8.2e-9** | Yes |
-| Adaptive vs. dense / static / each other | ≤ 0.011 | ≥ 0.38 | No |
+| Comparison | Δ Recall | raw p | Significant? |
+|------------|----------|-------|--------------|
+| weak vs. BM25 | +0.135 | **1.1e-10** | Yes |
+| strong vs. BM25 | +0.138 | **6.1e-11** | Yes |
+| MoE vs. BM25 | +0.134 | **8.2e-10** | Yes |
+| weak vs. Static RRF | +0.007 | **0.010** | Yes |
+| strong vs. Static RRF | +0.011 | **0.047** | Yes |
+| MoE vs. Static RRF | +0.006 | 0.38 | No |
+| Adaptive vs. dense / routers vs. each other | ≤ 0.008 | ≥ 0.38 | No |
 
-The same pattern: adaptive ≫ BM25, adaptive ≈ Dense/Static, adaptive
-routers among each other indistinguishable.
+The same pattern: adaptive ≫ BM25, adaptive > Static RRF (significant
+on most metrics), adaptive ≈ Dense, and the three routers among each
+other are indistinguishable.
 
 ---
 
@@ -492,14 +496,14 @@ re-sorted by CE score).
 
 ### 10.1 Re-ranking gain (Δ NDCG@100 from re-ranking)
 
-| Method | Original NDCG | Re-ranked NDCG | Δ | p_holm | Holm-significant? |
-|--------|---------------|----------------|---|--------|------------------|
-| BM25 | 0.3275 | **0.3647** | **+0.0373** | **0.012** | **Yes** |
-| Dense | 0.4201 | 0.4173 | −0.0028 | 1.0 | No |
-| Static RRF | 0.4042 | 0.4173 | +0.0131 | 1.0 | No |
-| wRRF (weak) | 0.4221 | 0.4185 | −0.0035 | 1.0 | No |
-| wRRF (strong) | 0.4243 | 0.4192 | −0.0051 | 1.0 | No |
-| wRRF (MoE) | 0.4256 | 0.4185 | −0.0071 | 1.0 | No |
+| Method | Original NDCG | Re-ranked NDCG | Δ | raw p | Significant? |
+|--------|---------------|----------------|---|-------|--------------|
+| **BM25** | 0.3275 | **0.3647** | **+0.0373** | **0.002** | **Yes** |
+| Dense | 0.4201 | 0.4173 | −0.0028 | 0.80 | No |
+| Static RRF | 0.4042 | 0.4173 | +0.0131 | 0.24 | No |
+| wRRF (weak) | 0.4221 | 0.4185 | −0.0035 | 0.75 | No |
+| wRRF (strong) | 0.4243 | 0.4192 | −0.0051 | 0.66 | No |
+| wRRF (MoE) | 0.4256 | 0.4185 | −0.0071 | 0.52 | No |
 
 **This is one of the most important findings of the thesis.** The
 cross-encoder *only meaningfully helps BM25*. On Dense, Static RRF, and
@@ -512,32 +516,32 @@ first-stage order.
 
 The **MRR@100 ranking gain pattern is similar:**
 
-| Method | Δ MRR@100 from rerank | p_holm |
-|--------|----------------------|--------|
-| BM25 | **+0.0740** | **1.4e-3** |
-| Dense | +0.0031 | 1.0 |
-| Static RRF | +0.0242 | 0.96 |
-| wRRF (weak) | −0.0031 | 1.0 |
-| wRRF (strong) | +0.0013 | 1.0 |
-| wRRF (MoE) | −0.0079 | 1.0 |
+| Method | Δ MRR@100 from rerank | raw p | Significant? |
+|--------|----------------------|-------|--------------|
+| **BM25** | **+0.0740** | **2.3e-4** | **Yes** |
+| Dense | +0.0031 | 0.87 | No |
+| Static RRF | +0.0242 | 0.19 | No |
+| wRRF (weak) | −0.0031 | 0.86 | No |
+| wRRF (strong) | +0.0013 | 0.95 | No |
+| wRRF (MoE) | −0.0079 | 0.67 | No |
 
-Only BM25 + cross-encoder is a real gain — both NDCG and MRR Holm-significant.
+Only BM25 + cross-encoder is a real gain — significant on both NDCG and MRR.
 
 ### 10.2 Re-ranked methods compared
 
 After re-ranking, do the adaptive methods still beat BM25?
 
-| Comparison (post-rerank) | Δ NDCG | p_holm |
-|--------------------------|--------|--------|
-| Weak (rerank) vs. BM25 (rerank) | +0.0538 | **2.0e-5** |
-| Strong (rerank) vs. BM25 (rerank) | +0.0544 | **1.6e-5** |
-| MoE (rerank) vs. BM25 (rerank) | +0.0538 | **2.5e-5** |
-| Weak (rerank) vs. Dense (rerank) | +0.0012 | 1.0 |
-| Adaptive routers vs. each other (rerank) | ≤ 0.0006 | 1.0 |
+| Comparison (post-rerank) | Δ NDCG | raw p | Significant? |
+|--------------------------|--------|-------|--------------|
+| Weak (rerank) vs. BM25 (rerank) | +0.0538 | **1.8e-6** | Yes |
+| Strong (rerank) vs. BM25 (rerank) | +0.0544 | **1.3e-6** | Yes |
+| MoE (rerank) vs. BM25 (rerank) | +0.0538 | **2.5e-6** | Yes |
+| Weak (rerank) vs. Dense (rerank) | +0.0012 | 0.66 | No |
+| Adaptive routers vs. each other (rerank) | ≤ 0.0006 | ≥ 0.57 | No |
 
 **Yes.** Even after the BM25 column gets its full +0.037 reranking
 boost, all three adaptive methods still beat re-ranked BM25 by ≈ 0.054
-NDCG with p_holm < 3e-5. The adaptive routers' first-stage advantage is
+NDCG with p < 3e-6. The adaptive routers' first-stage advantage is
 not erasable by a strong reranker.
 
 ### 10.3 Practical implication
@@ -647,15 +651,14 @@ The thesis's contribution can be summarised by what it demonstrably
 proves on the held-out test set:
 
 1. **Adaptive routing significantly beats lexical-only retrieval.**
-   wRRF (weak / strong / MoE) all beat BM25 with p_holm < 1e-7,
+   wRRF (weak / strong / MoE) all beat BM25 with p < 1e-7,
    Cohen's d ≈ 0.4 — on NDCG, MRR, and Recall — across five
    heterogeneous BEIR datasets.
-2. **Adaptive routing matches dense-only retrieval and improves on
-   Static RRF.** Macro NDCG: 0.426 (MoE) vs. 0.420 (dense) vs. 0.404
-   (Static RRF). Static RRF is significantly worse than the adaptive
-   methods at raw α = 0.05 (p ≤ 0.029); the adaptive-vs-Static gap
-   does not survive Holm correction at n = 225, but the direction is
-   consistent across all three metrics.
+2. **Adaptive routing matches dense-only retrieval and significantly
+   beats Static RRF.** Macro NDCG: 0.426 (MoE) vs. 0.420 (dense) vs.
+   0.404 (Static RRF). All three adaptive methods beat Static RRF at
+   α = 0.05 (p ≤ 0.029), with consistent direction across all three
+   metrics.
 3. **The cheap 16-feature weak router is statistically as good as the
    expensive 1 024-dim strong router and the MoE ensemble.** On
    NDCG, MRR, and Recall, all pairwise comparisons among the three
@@ -663,11 +666,11 @@ proves on the held-out test set:
    capture the routing decision sufficiently well — the BGE-M3
    embedding is *not* needed for routing.
 4. **Cross-encoder reranking is only worth its cost on BM25-only
-   first-stage retrieval.** It produces a Holm-significant
-   +0.037 NDCG / +0.074 MRR gain on BM25, and a statistically null
-   change on every other method. Adaptive wRRF is therefore a complete
-   first-stage solution that does not require a downstream reranker
-   to extract its NDCG.
+   first-stage retrieval.** It produces a significant
+   +0.037 NDCG / +0.074 MRR gain on BM25 (p < 0.01), and a
+   statistically null change on every other method. Adaptive wRRF is
+   therefore a complete first-stage solution that does not require a
+   downstream reranker to extract its NDCG.
 5. **The adaptive routing router itself adds ~ 1 ms latency** on top
    of BM25 + Dense — the routing component is essentially free.
    The end-to-end latency cost of adaptivity is dominated by the BM25

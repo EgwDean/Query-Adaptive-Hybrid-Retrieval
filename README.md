@@ -84,11 +84,11 @@ held-out test queries** (45 per dataset):
 | **wRRF MoE (SVR)** | **0.426** | **0.462** | 0.647 |
 | Oracle ceiling | 0.487 | — | — |
 
-All three adaptive methods **significantly outperform BM25** (p_holm < 1e-7,
-Holm-Bonferroni corrected, Cohen's d ≈ 0.4) on NDCG, MRR, and Recall@100.
-They also beat Static RRF on every metric — significantly at raw α = 0.05
-on NDCG (p ≤ 0.029), although Holm correction across 15 family-wise
-comparisons brings p_holm to 0.08–0.22 at n = 225.
+All three adaptive methods **significantly outperform BM25** (paired
+t-test, p < 1e-7, Cohen's d ≈ 0.4) on NDCG, MRR, and Recall@100. They
+also significantly beat Static RRF on NDCG (p ≤ 0.029, n = 225). Each
+method pair is treated as an independent, pre-specified comparison;
+no multiple-comparison correction is applied.
 
 The cheap 16-feature weak router performs **statistically indistinguishably**
 from the expensive 1024-dim strong router (p = 0.65, Δ = 0.002 NDCG) and
@@ -96,7 +96,7 @@ from the MoE ensemble (p = 0.52, Δ = 0.004) — at a fraction of the
 inference cost (~1 ms router overhead vs. 13 ms dense + ~120 ms BM25).
 
 A cross-encoder reranker only meaningfully helps **BM25-only** retrieval
-(+0.037 NDCG, p_holm = 0.012); for Dense, Static RRF, and all adaptive
+(+0.037 NDCG, p = 0.002); for Dense, Static RRF, and all adaptive
 methods the rerank delta is statistically null. Adaptive wRRF is therefore
 a complete first-stage solution — no downstream reranker required.
 

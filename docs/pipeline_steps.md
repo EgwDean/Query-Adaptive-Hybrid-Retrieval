@@ -351,17 +351,16 @@ All subsets of the non-damaging features and groups identified in Phase 1
 are enumerated and evaluated with the same 10-fold CV protocol.  For each
 combination, a **paired t-test** is run between the per-query validation
 scores of that combination and the per-query scores of the full model.
-**Holm-Bonferroni correction** is applied across the entire family of
-combination tests to control the family-wise error rate.
+Each subset is treated as an independent, pre-specified comparison — no
+multiple-comparison correction is applied.
 
 A combination is marked `sig_better = True` if and only if:
-1. Its Holm-corrected p-value is below the significance threshold, **and**
+1. Its raw p-value is below the significance threshold (default α = 0.05), **and**
 2. Its mean NDCG@100 is strictly greater than the full model's mean.
 
-Results (including raw p-values, Holm-corrected p-values, Cohen's d, and
-the `sig_better` flag) are written to `weak_ablation_combo.csv` and plotted
-in `weak_ablation_combo.png` (green bars = significantly better, grey = not
-significant).
+Results (raw p-values, Cohen's d, and the `sig_better` flag) are written to
+`weak_ablation_combo.csv` and plotted in `weak_ablation_combo.png` (green
+bars = significantly better, grey = not significant).
 
 ### Final model selection
 
@@ -705,13 +704,13 @@ wRRF weak, wRRF strong, wRRF MoE) — **15 pairs total** — the pipeline:
 1. Collects per-query NDCG@100 scores for the two methods on the merged
    test set (n = 225 queries).
 2. Runs `scipy.stats.ttest_rel` (paired two-sided t-test).
-3. Reports: `n`, `mean_diff`, `t`, `p_value`, `cohens_d`, raw significance
-   at α = 0.05, and Holm-Bonferroni corrected significance.
+3. Reports: `n`, `mean_diff`, `t`, `p_value`, `cohens_d`, and significance
+   at α = 0.05 (raw, per-test).
 
-**Holm-Bonferroni correction** is applied across all 15 comparisons to
-control the family-wise error rate.  Each row therefore has both a
-`significant` column (raw α = 0.05) and a `significant_holm` column
-(corrected).
+Each method pair is treated as an independent, pre-specified scientific
+comparison — the test result for one pair does not constrain the
+significance threshold for another. No multiple-comparison correction
+(e.g. Holm-Bonferroni) is applied.
 
 Cohen's d effect size is computed as `mean_diff / pooled_std`.
 

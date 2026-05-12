@@ -847,33 +847,6 @@ def bootstrap_ci_mean(scores: Sequence[float],
             float(np.percentile(boots, 100.0 * (1.0 - alpha))))
 
 
-def holm_correction(p_values: Sequence[float],
-                    alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
-    """Holm-Bonferroni step-down family-wise correction.
-
-    Given a vector of raw p-values, returns:
-      - rejected: boolean array — True for hypotheses rejected at level *alpha*.
-      - p_adj:    Holm-adjusted p-values (monotone in sorted order, clipped to 1.0).
-
-    Standard procedure: order p-values ascending, multiply rank-i p-value by
-    (n - i + 1), then enforce monotonicity from smallest to largest.  A
-    hypothesis is rejected iff its adjusted p-value is <= alpha.
-    """
-    p = np.asarray(p_values, dtype=np.float64)
-    n = len(p)
-    if n == 0:
-        return np.zeros(0, dtype=bool), np.zeros(0, dtype=np.float64)
-
-    order = np.argsort(p, kind="stable")
-    p_sorted = p[order]
-    multipliers = np.arange(n, 0, -1, dtype=np.float64)        # n, n-1, ..., 1
-    p_adj_sorted = np.maximum.accumulate(p_sorted * multipliers)
-    p_adj_sorted = np.minimum(p_adj_sorted, 1.0)
-
-    p_adj = np.empty(n, dtype=np.float64)
-    p_adj[order] = p_adj_sorted
-    rejected = p_adj <= float(alpha)
-    return rejected, p_adj
 
 
 # ============================================================

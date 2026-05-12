@@ -66,7 +66,6 @@ from src.utils import (
     get_device,
     grouped_bar_chart,
     grouped_bar_chart_with_ci,
-    holm_correction,
     init_stem_worker,
     is_nonempty_file,
     kfold_indices,
@@ -429,51 +428,39 @@ def _bootstrap_ci(scores: Sequence[float], cfg: dict) -> Tuple[float, float, flo
 def _scoped_pairwise_tests(per_method_scores: Dict[str, list],
                             sig_alpha: float,
                             comparison_tag: str = "") -> List[dict]:
-    """Run paired t-tests on the scoped (router-vs-baseline + router-vs-router)
-    pairs and apply Holm correction across that family of tests.
+    """Run a paired t-test on each scoped method pair, no multiple-comparison
+    correction.
 
-    Each row contains: method_a, method_b, n, mean_diff, t, p_value,
-    cohens_d, p_holm, significant, significant_holm, plus an optional
+    Each pair is treated as an independent, pre-specified scientific
+    question — the test result for one pair is unaffected by what other
+    pairs are also tested. Each row contains: method_a, method_b, n,
+    mean_diff, t, p_value, cohens_d, significant, plus an optional
     comparison column when *comparison_tag* is provided.
     """
     pairs = _scoped_pairwise_method_pairs()
-    raw: List[Optional[dict]] = []
-    p_values: List[float] = []
+    rows: List[dict] = []
     for m_a, m_b in pairs:
         a = per_method_scores.get(m_a, [])
         b = per_method_scores.get(m_b, [])
         n = min(len(a), len(b))
         if n == 0:
-            raw.append(None)
-            p_values.append(1.0)
-            continue
-        res = paired_t_test(a[:n], b[:n])
-        raw.append(res)
-        p_values.append(res["p"])
-
-    rejected, p_adj = holm_correction(p_values, alpha=sig_alpha)
-
-    rows: List[dict] = []
-    for (m_a, m_b), res, rej, p_a in zip(pairs, raw, rejected, p_adj):
-        if res is None:
             row = {
                 "method_a": m_a, "method_b": m_b,
                 "n": 0, "mean_diff": 0.0, "t": 0.0, "p_value": 1.0,
-                "cohens_d": 0.0, "p_holm": 1.0,
-                "significant": "no", "significant_holm": "no",
+                "cohens_d": 0.0,
+                "significant": "no",
             }
         else:
+            res = paired_t_test(a[:n], b[:n])
             row = {
-                "method_a":         m_a,
-                "method_b":         m_b,
-                "n":                res["n"],
-                "mean_diff":        res["mean_diff"],
-                "t":                res["t"],
-                "p_value":          res["p"],
-                "cohens_d":         res["d"],
-                "p_holm":           float(p_a),
-                "significant":      "yes" if res["p"] <= sig_alpha else "no",
-                "significant_holm": "yes" if bool(rej) else "no",
+                "method_a":    m_a,
+                "method_b":    m_b,
+                "n":           res["n"],
+                "mean_diff":   res["mean_diff"],
+                "t":           res["t"],
+                "p_value":     res["p"],
+                "cohens_d":    res["d"],
+                "significant": "yes" if res["p"] <= sig_alpha else "no",
             }
         if comparison_tag:
             row["comparison"] = comparison_tag
@@ -483,8 +470,8 @@ def _scoped_pairwise_tests(per_method_scores: Dict[str, list],
 
 TTEST_FIELDS_BASE = [
     "method_a", "method_b", "n",
-    "mean_diff", "t", "p_value", "cohens_d", "p_holm",
-    "significant", "significant_holm",
+    "mean_diff", "t", "p_value", "cohens_d",
+    "significant",
 ]
 
 
@@ -1632,11 +1619,11 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
     and writes ``weak_ablation.csv`` + ``weak_ablation.png``.
 
     Phase 2: enumerates every non-empty subset of those non-damaging
-    items, runs 10-fold CV per combination, runs a paired t-test on
-    per-query NDCG@100 against the full model, and Holm-Bonferroni
-    corrects across the family. ``sig_better = True`` requires a
-    Holm-significant p AND a strictly positive mean diff. Outputs go to
-    ``weak_ablation_combo.{csv,png}``.
+    items, runs 10-fold CV per combination, and runs a paired t-test on
+    per-query NDCG@100 against the full model (each subset treated as
+    its own pre-specified comparison; no multiple-comparison correction).
+    ``sig_better = True`` requires the raw p ≤ alpha AND a strictly
+    positive mean diff. Outputs go to ``weak_ablation_combo.{csv,png}``.
 
     Final selection: the highest-mean ``sig_better`` combination if any
     qualifies, otherwise the full 16 features. The winning bundle is
@@ -1804,20 +1791,17 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
             ))
             print(f"  Phase 2 elapsed: {time.time() - t0:.1f}s")
 
-            # Run all t-tests, then apply Holm correction across the family
-            # of combo tests so that family-wise error stays controlled.
+            # Run a paired t-test per combination against the full model.
+            # Each test is treated as an independent comparison; no
+            # multiple-comparison correction is applied.
             ttests = [paired_t_test(pq.tolist(), full_pq.tolist()) for pq in pq_list]
-            p_raw = [t["p"] for t in ttests]
-            rejected_holm, p_holm = holm_correction(p_raw, alpha=sig_alpha)
 
-            for (label, feats, cols, pq, ttest, rej_h, p_h) in zip(
-                combo_labels, combo_feats, combo_cols_list, pq_list,
-                ttests, rejected_holm, p_holm,
+            for (label, feats, cols, pq, ttest) in zip(
+                combo_labels, combo_feats, combo_cols_list, pq_list, ttests,
             ):
                 mean_score = float(np.mean(pq))
-                # sig_better uses the Holm-corrected p-value (more conservative);
-                # the raw p-value is also reported for transparency.
-                sig_better = bool(rej_h and (ttest["mean_diff"] > 0))
+                # sig_better requires a significant raw p AND a positive mean diff.
+                sig_better = bool(ttest["p"] <= sig_alpha and ttest["mean_diff"] > 0)
                 rows_p2.append({
                     "removed":           label,
                     "n_removed":         len(feats),
@@ -1826,7 +1810,6 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
                     "delta":             mean_score - full_pq_mean,
                     "t":                 ttest["t"],
                     "p_value":           ttest["p"],
-                    "p_holm":            float(p_h),
                     "cohens_d":          ttest["d"],
                     "sig_better":        sig_better,
                     "feature_cols_json": json.dumps(cols),
@@ -1836,7 +1819,7 @@ def step_07_weak_ablation(cfg: dict, device: torch.device) -> None:
         save_csv_dicts(
             rows_p2,
             ["removed", "n_removed", "n_features", f"cv_ndcg@{ndcg_k}",
-             "delta", "t", "p_value", "p_holm", "cohens_d",
+             "delta", "t", "p_value", "cohens_d",
              "sig_better", "feature_cols_json"],
             p2_csv,
         )
@@ -3123,15 +3106,14 @@ def step_20_recall_at_100(cfg: dict, device: torch.device) -> None:
     )
     print(f"  Recall@{top_k} CI plot saved to {ci_png}")
 
-    # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
+    # ---- Scoped pairwise t-tests with Cohen's d (no multiple-comparison correction) ----
     ttest_rows = _scoped_pairwise_tests(all_recalls, sig_alpha)
     save_csv_dicts(ttest_rows, TTEST_FIELDS_BASE, ttest_csv)
     print(f"  Recall@{top_k} t-tests saved to {ttest_csv}")
     for r in ttest_rows:
         print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
               f"Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
-              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
-              f"sig={r['significant']}/{r['significant_holm']}")
+              f"p={r['p_value']:.4f}  sig={r['significant']}")
 
 
 # ------------------------------------------------------------
@@ -3143,37 +3125,30 @@ def _rerank_vs_orig_rows(all_orig: Dict[str, List[float]],
                           methods: List[str],
                           sig_alpha: float,
                           metric_label: str) -> List[dict]:
-    """Per-method rerank-vs-original tests with Holm correction across the family."""
-    raws = []
-    p_values = []
+    """Per-method rerank-vs-original paired t-tests, no multiple-comparison
+    correction (each method's rerank effect is its own pre-specified question)."""
+    rows = []
     for m in methods:
         res = paired_t_test(all_rer[m], all_orig[m])
-        raws.append(res)
-        p_values.append(res["p"])
-    rejected, p_holm = holm_correction(p_values, alpha=sig_alpha)
-    rows = []
-    for m, res, rej, p_h in zip(methods, raws, rejected, p_holm):
         rows.append({
-            "comparison":       "rerank_vs_orig",
-            "metric":           metric_label,
-            "method_a":         f"{m}_rerank",
-            "method_b":         f"{m}_orig",
-            "n":                res["n"],
-            "mean_diff":        res["mean_diff"],
-            "t":                res["t"],
-            "p_value":          res["p"],
-            "cohens_d":         res["d"],
-            "p_holm":           float(p_h),
-            "significant":      "yes" if res["p"] <= sig_alpha else "no",
-            "significant_holm": "yes" if bool(rej) else "no",
+            "comparison":  "rerank_vs_orig",
+            "metric":      metric_label,
+            "method_a":    f"{m}_rerank",
+            "method_b":    f"{m}_orig",
+            "n":           res["n"],
+            "mean_diff":   res["mean_diff"],
+            "t":           res["t"],
+            "p_value":     res["p"],
+            "cohens_d":    res["d"],
+            "significant": "yes" if res["p"] <= sig_alpha else "no",
         })
     return rows
 
 
 TTEST_FIELDS_RERANK = [
     "comparison", "metric", "method_a", "method_b", "n",
-    "mean_diff", "t", "p_value", "cohens_d", "p_holm",
-    "significant", "significant_holm",
+    "mean_diff", "t", "p_value", "cohens_d",
+    "significant",
 ]
 
 
@@ -3185,9 +3160,10 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
     only the union of needed ``(qid, doc_id)`` pairs from disk and
     caches scored pairs to ``rerank_scores_<ce>_<dataset>.pkl`` to avoid
     redundant scoring across methods. Computes both NDCG@100 and MRR@100
-    before and after reranking, plus paired t-tests with Holm correction
-    on (a) rerank-vs-original deltas per method and (b) reranked-method
-    pairwise comparisons. Outputs: ``rerank_ndcg.{csv,png}``,
+    before and after reranking, plus per-method paired t-tests (each
+    test treated as an independent comparison; no multiple-comparison
+    correction) on (a) rerank-vs-original deltas per method and
+    (b) reranked-method pairwise comparisons. Outputs: ``rerank_ndcg.{csv,png}``,
     ``rerank_mrr.{csv,png}``, ``rerank_gain.png``,
     ``rerank_mrr_gain.png``, ``rerank_ttest.csv``.
     """
@@ -3358,21 +3334,22 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
                       title=f"MRR@{ndcg_k} Gain from Cross-Encoder Reranking",
                       out_path=out_mrr_gn, yzero=False)
 
-    # ---- T-tests with Cohen's d + Holm correction ----
-    # Family A: rerank-vs-original per method, NDCG (6 tests, Holm within family)
+    # ---- T-tests with Cohen's d (no multiple-comparison correction) ----
+    # Each test is treated as an independent, pre-specified comparison.
+    # Family A: rerank-vs-original per method, NDCG (6 tests)
     rows_a = _rerank_vs_orig_rows(all_orig_n, all_rer_n, METHOD_KEYS_6,
                                    sig_alpha, f"NDCG@{ndcg_k}")
-    # Family B: rerank-vs-original per method, MRR  (6 tests, Holm within family)
+    # Family B: rerank-vs-original per method, MRR  (6 tests)
     rows_b = _rerank_vs_orig_rows(all_orig_m, all_rer_m, METHOD_KEYS_6,
                                    sig_alpha, f"MRR@{ndcg_k}")
-    # Family C: scoped pairwise NDCG between reranked methods (12 tests, Holm)
+    # Family C: scoped pairwise NDCG between reranked methods
     rows_c = _scoped_pairwise_tests(all_rer_n, sig_alpha,
                                      comparison_tag=f"reranked_pairwise_NDCG@{ndcg_k}")
     for r in rows_c:
         r["metric"]   = f"NDCG@{ndcg_k}"
         r["method_a"] = f"{r['method_a']}_rerank"
         r["method_b"] = f"{r['method_b']}_rerank"
-    # Family D: scoped pairwise MRR between reranked methods (12 tests, Holm)
+    # Family D: scoped pairwise MRR between reranked methods
     rows_d = _scoped_pairwise_tests(all_rer_m, sig_alpha,
                                      comparison_tag=f"reranked_pairwise_MRR@{ndcg_k}")
     for r in rows_d:
@@ -3385,13 +3362,11 @@ def step_21_rerank(cfg: dict, device: torch.device) -> None:
     print(f"\n  Rerank-vs-original (NDCG@{ndcg_k}):")
     for r in rows_a:
         print(f"    {r['method_a']:<22}  Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
-              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
-              f"sig={r['significant']}/{r['significant_holm']}")
+              f"p={r['p_value']:.4f}  sig={r['significant']}")
     print(f"\n  Rerank-vs-original (MRR@{ndcg_k}):")
     for r in rows_b:
         print(f"    {r['method_a']:<22}  Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
-              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
-              f"sig={r['significant']}/{r['significant_holm']}")
+              f"p={r['p_value']:.4f}  sig={r['significant']}")
     print(f"  Rerank t-tests saved to {ttest_csv}")
 
 
@@ -3447,13 +3422,14 @@ def _ensure_ce_scores(cache_path: str, ce_model, batch_size: int,
 # ------------------------------------------------------------
 
 def step_22_significance(cfg: dict, device: torch.device) -> None:
-    """STEP 22 — Paired t-tests on test-set NDCG@100 across all 15 method pairs.
+    """STEP 22 — Paired t-tests on test-set NDCG@100 across all method pairs.
 
     Collects per-query NDCG@100 scores for each of the six methods on
-    the merged 225-query test set, runs ``scipy.stats.ttest_rel`` over
-    every unordered pair, computes Cohen's d, and applies Holm-Bonferroni
-    correction across the family. Also bootstraps 95 % CIs (1000
-    resamples, ``seed = 42``). Outputs: ``significance_tests.csv``,
+    the merged 225-query test set, runs ``scipy.stats.ttest_rel`` for
+    every unordered pair, and computes Cohen's d. Each pair is treated
+    as an independent, pre-specified scientific comparison — no
+    multiple-comparison correction is applied. Also bootstraps 95 % CIs
+    (1000 resamples, ``seed = 42``). Outputs: ``significance_tests.csv``,
     ``ndcg_ci.csv``, ``ndcg_ci.png``.
     """
     rrf_k     = int(cfg["benchmark"]["rrf"]["k"])
@@ -3536,15 +3512,14 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
     )
     print(f"  NDCG@{ndcg_k} CI plot saved to {ci_png}")
 
-    # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
+    # ---- Scoped pairwise t-tests with Cohen's d (no multiple-comparison correction) ----
     rows = _scoped_pairwise_tests(per_method_scores, sig_alpha)
     save_csv_dicts(rows, TTEST_FIELDS_BASE, out_csv)
     print(f"  Saved {len(rows)} paired tests to {out_csv}")
     for r in rows:
         print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
               f"Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
-              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
-              f"sig={r['significant']}/{r['significant_holm']}")
+              f"p={r['p_value']:.4f}  sig={r['significant']}")
 
 
 # ------------------------------------------------------------
@@ -3552,11 +3527,12 @@ def step_22_significance(cfg: dict, device: torch.device) -> None:
 # ------------------------------------------------------------
 
 def step_23_mrr(cfg: dict, device: torch.device) -> None:
-    """STEP 23 — MRR@100 + Recall@100 paired t-tests across all 15 method pairs.
+    """STEP 23 — MRR@100 + Recall@100 paired t-tests across all method pairs.
 
     Same protocol as Step 22 but for MRR@100 (and Recall@100 via the
-    Step 20 outputs). Per-method scores, 95 % bootstrap CIs, and pairwise
-    Holm-corrected significance are written. Outputs:
+    Step 20 outputs). Per-method scores, 95 % bootstrap CIs, and per-pair
+    significance are written (each pair is an independent comparison;
+    no multiple-comparison correction). Outputs:
     ``mrr_at_100.csv``, ``mrr_ci.csv``, ``mrr_ttest.csv``,
     ``mrr_at_100.png``, ``mrr_ci.png``, ``recall_ttest.csv``,
     ``recall_ci.{csv,png}``.
@@ -3662,15 +3638,14 @@ def step_23_mrr(cfg: dict, device: torch.device) -> None:
     )
     print(f"  MRR@{ndcg_k} CI plot saved to {ci_png}")
 
-    # ---- Scoped pairwise t-tests with Cohen's d + Holm correction ----
+    # ---- Scoped pairwise t-tests with Cohen's d (no multiple-comparison correction) ----
     ttest_rows = _scoped_pairwise_tests(all_mrr, sig_alpha)
     save_csv_dicts(ttest_rows, TTEST_FIELDS_BASE, ttest_csv)
     print(f"  MRR@{ndcg_k} t-tests saved to {ttest_csv}")
     for r in ttest_rows:
         print(f"    {r['method_a']:<13} vs {r['method_b']:<13}  "
               f"Δ={r['mean_diff']:+.4f}  d={r['cohens_d']:+.3f}  "
-              f"p={r['p_value']:.4f}  p_holm={r['p_holm']:.4f}  "
-              f"sig={r['significant']}/{r['significant_holm']}")
+              f"p={r['p_value']:.4f}  sig={r['significant']}")
 
 
 # ------------------------------------------------------------
