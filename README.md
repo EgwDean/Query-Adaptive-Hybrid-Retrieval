@@ -6,7 +6,7 @@
 > **Diploma Thesis — Computer Engineering and Informatics Department (CEID), University of Patras**
 >
 > **Author:** Konstantinos Anastasopoulos &lt;up1093320@ac.upatras.gr&gt;
-> **Supervisor:** Prof. Spyridon Sioutas &lt;ssioutas@ceid.upatras.gr&gt;, Computer Engineering and Informatics Department (CEID), University of Patras
+> **Supervisor:** Prof. Spyridon Sioutas &lt;ssioutas@upatras.gr&gt;, Computer Engineering and Informatics Department (CEID), University of Patras
 > **Year:** 2026
 
 A query-adaptive hybrid retrieval system that learns, per query, the
