@@ -19,13 +19,6 @@ authors:
     affiliation: "Computer Engineering and Informatics Department (CEID), University of Patras"
     email: "up1093320@ac.upatras.gr"
 
-# Supervisor
-contact:
-  - family-names: "Sioutas"
-    given-names: "Spyridon"
-    affiliation: "Computer Engineering and Informatics Department (CEID), University of Patras"
-    email: "ssioutas@upatras.gr"
-
 version: "1.0.0"                 
 date-released: "2026-05-07"       
 license: Apache-2.0
